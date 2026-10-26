@@ -1,0 +1,14 @@
+[package]
+name = "pii-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "WebAssembly bindings for pii-shield (Browser & Cloudflare Workers)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pii-core = { path = "../pii-core" }
+wasm-bindgen = "0.2"

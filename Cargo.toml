@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pii-core",
+    "crates/pii-wasm",
+    "crates/pii-ffi",
+    "crates/pii-mcp-proxy",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Jotara Lab <inquiries@jotaralab.com>"]
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/jotaralab/pii-shield"
+homepage = "https://jotaralab.com"
+description = "Sub-millisecond, stateful PII redaction & reversible pseudonymization engine for AI agents and edge runtimes."
+
+[workspace.dependencies]
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "dfa-build", "dfa-search", "hybrid"] }
+ahash = "0.8"
+zeroize = { version = "1.8", features = ["derive"] }
+hmac = "0.12"
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"

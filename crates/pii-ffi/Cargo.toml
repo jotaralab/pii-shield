@@ -1,0 +1,13 @@
+[package]
+name = "pii-ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "C-ABI FFI bindings for embedding pii-shield in Go, C, Ruby, and Elixir."
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+pii-core = { path = "../pii-core" }

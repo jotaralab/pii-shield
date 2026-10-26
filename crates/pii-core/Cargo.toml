@@ -1,0 +1,17 @@
+[package]
+name = "pii-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core DFA scanner, checksum validators, and session-scoped reversible vault for pii-shield."
+
+[dependencies]
+regex-automata.workspace = true
+ahash.workspace = true
+zeroize.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true

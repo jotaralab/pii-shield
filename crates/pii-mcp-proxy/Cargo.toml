@@ -1,0 +1,16 @@
+[package]
+name = "pii-mcp-proxy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Zero-trust STDIO JSON-RPC wrapper for Model Context Protocol (MCP) servers."
+
+[[bin]]
+name = "pii-mcp-proxy"
+path = "src/main.rs"
+
+[dependencies]
+pii-core = { path = "../pii-core" }
+serde.workspace = true
+serde_json.workspace = true
