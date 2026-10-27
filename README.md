@@ -98,9 +98,14 @@ fn main() {
 
 ---
 
-## 🌍 Contributing a New PII Rule (Declarative TOML)
+## 🌍 Contributing & Extending PII Rules
 
-To add support for a new country or entity, simply add a `[[rules]]` block to the appropriate file in `crates/pii-core/rules/*.toml` without modifying any Rust code:
+`pii-shield` supports both **built-in open-source locale contributions** and **runtime rule extension without modifying code**.
+
+For detailed step-by-step instructions and the full TOML schema reference, see [**docs/contributing-pii-rules.md**](docs/contributing-pii-rules.md).
+
+- **Option 1: Built-in Locale Contribution**: Add a declarative `crates/pii-core/rules/<locale>.toml` file with `valid_samples` and `invalid_samples` test cases.
+- **Option 2: Runtime Extension**: Call `PiiCatalog::merge_toml_str()` in Rust or pass `--locales` to `pii-mcp-proxy` to load custom regional rules dynamically.
 
 ```toml
 [[rules]]
