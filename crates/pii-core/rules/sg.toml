@@ -9,7 +9,7 @@ regex = '\b[STFGMstfgm][0-9]{7}[A-Za-z]\b'
 validator = "sg_nric"
 priority = 90
 context_keywords = ["nric", "fin", "singapore", "identity"]
-valid_samples = ["S1234567D", "T1234567J", "F1234567X"]
+valid_samples = ["S1234567D", "T1234567J", "F1234567N"]
 invalid_samples = ["S1234567A", "A1234567D", "1234567D"]
 
 [[rules]]

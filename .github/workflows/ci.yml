@@ -34,6 +34,12 @@ jobs:
         run: cargo test --workspace --benches
       - name: Verify Wasm Compilation
         run: cargo check -p pii-wasm --target wasm32-unknown-unknown
+      - name: Run Foreign-Language C-ABI & Python E2E Tests
+        run: |
+          cargo build -p pii-ffi
+          python3 tests/ffi_python_e2e.py
+          gcc -Wall -Werror tests/c_abi_e2e.c -Ltarget/debug -lpii_ffi -Icrates/pii-ffi/include -Wl,-rpath,'$ORIGIN/target/debug',-rpath,$PWD/target/debug -o /tmp/c_abi_test
+          /tmp/c_abi_test
 
   security-audit:
     name: Security & License Audit

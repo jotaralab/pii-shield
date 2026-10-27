@@ -104,8 +104,10 @@ pub fn validate_iban_mod97(input: &str) -> bool {
 }
 
 /// Generic E.164-compatible international phone validator for PHONE_US, PHONE_EU, PHONE_SG.
-/// - Starts and ends on an ASCII digit (or leading `+`)
-/// - Rejects consecutive hyphens/spaces
+/// - Starts with `+`, ASCII digit, or `(`
+/// - Ends on an ASCII digit
+/// - Rejects consecutive hyphens, dots, or spaces
+/// - Enforces balanced parentheses
 /// - 8 to 15 total digits
 #[inline]
 pub fn validate_e164_phone(input: &str) -> bool {
@@ -115,34 +117,48 @@ pub fn validate_e164_phone(input: &str) -> bool {
     }
 
     let mut digit_count = 0usize;
-    let mut last_was_sep = false;
+    let mut last_char = 0u8;
+    let mut open_paren = 0usize;
+    let mut close_paren = 0usize;
 
-    let (start_idx, starts_digit) = if bytes[0] == b'+' {
+    let (start_idx, starts_valid) = if bytes[0] == b'+' {
         (1, true)
-    } else if bytes[0].is_ascii_digit() {
+    } else if bytes[0].is_ascii_digit() || bytes[0] == b'(' {
         (0, true)
     } else {
         (0, false)
     };
 
-    if !starts_digit || start_idx >= bytes.len() || !bytes[bytes.len() - 1].is_ascii_digit() {
+    if !starts_valid || start_idx >= bytes.len() || !bytes[bytes.len() - 1].is_ascii_digit() {
         return false;
     }
 
     for &b in &bytes[start_idx..] {
-        if b == b' ' || b == b'-' || b == b'(' || b == b')' || b == b'.' {
-            if last_was_sep {
+        if b == b'-' || b == b'.' || b == b' ' {
+            if last_char == b'-' || last_char == b'.' || last_char == b' ' {
+                return false; // Consecutive punctuation/spaces not allowed
+            }
+            last_char = b;
+            continue;
+        } else if b == b'(' {
+            open_paren += 1;
+            last_char = b;
+            continue;
+        } else if b == b')' {
+            close_paren += 1;
+            if close_paren > open_paren {
                 return false;
             }
-            last_was_sep = true;
+            last_char = b;
             continue;
         }
-        last_was_sep = false;
+
+        last_char = b;
         if !b.is_ascii_digit() {
             return false;
         }
         digit_count += 1;
     }
 
-    (8..=15).contains(&digit_count)
+    open_paren == close_paren && open_paren <= 1 && (8..=15).contains(&digit_count)
 }
