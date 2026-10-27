@@ -30,9 +30,39 @@ impl WasmPiiSession {
         }
     }
 
+    #[wasm_bindgen(js_name = withLocalesAndKey)]
+    pub fn with_locales_and_key(locales: &str, key: &[u8]) -> Result<WasmPiiSession, JsValue> {
+        if key.len() != 32 {
+            return Err(JsValue::from_str("Session key must be exactly 32 bytes"));
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(key);
+
+        let loc_vec: Vec<&str> = locales.split(',').map(|s| s.trim()).collect();
+        let catalog = PiiCatalog::with_locales(&loc_vec).unwrap_or_default();
+        Ok(Self {
+            inner: PiiSessionVault::from_catalog_with_key(catalog, key_arr),
+        })
+    }
+
+    #[wasm_bindgen(js_name = setStatelessMode)]
+    pub fn set_stateless_mode(&mut self, enabled: bool) {
+        self.inner.set_stateless_mode(enabled);
+    }
+
+    #[wasm_bindgen(js_name = isStatelessMode)]
+    pub fn is_stateless_mode(&self) -> bool {
+        self.inner.is_stateless_mode()
+    }
+
     #[wasm_bindgen]
     pub fn redact(&mut self, text: &str) -> String {
         self.inner.redact(text)
+    }
+
+    #[wasm_bindgen(js_name = redactJson)]
+    pub fn redact_json(&mut self, payload: &str) -> String {
+        self.inner.redact_json(payload)
     }
 
     #[wasm_bindgen]

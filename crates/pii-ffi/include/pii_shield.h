@@ -26,9 +26,21 @@ struct PiiVaultHandle *pii_vault_new(void);
 
 struct PiiVaultHandle *pii_vault_new_with_locales(const char *locales);
 
+struct PiiVaultHandle *pii_vault_new_with_key(uint8_t policy_id,
+                                              const uint8_t *key,
+                                              uintptr_t key_len);
+
+struct PiiVaultHandle *pii_vault_new_with_locales_and_key(const char *locales,
+                                                          const uint8_t *key,
+                                                          uintptr_t key_len);
+
+void pii_vault_set_stateless_mode(struct PiiVaultHandle *ptr, bool enabled);
+
 void pii_vault_free(struct PiiVaultHandle *ptr);
 
 char *pii_vault_redact(struct PiiVaultHandle *ptr, const char *input);
+
+char *pii_vault_redact_json(struct PiiVaultHandle *ptr, const char *payload);
 
 char *pii_vault_rehydrate(const struct PiiVaultHandle *ptr, const char *input);
 

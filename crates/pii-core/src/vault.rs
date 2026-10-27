@@ -86,6 +86,25 @@ impl PiiSessionVault {
         }
     }
 
+    /// Creates a vault from an explicit PiiCatalog and explicit 32-byte key.
+    pub fn from_catalog_with_key(catalog: PiiCatalog, key: [u8; 32]) -> Self {
+        let scanner = PiiScanner::from_catalog(&catalog).expect("Scanner compilation valid");
+        Self {
+            scanner,
+            forward_map: AHashMap::new(),
+            reverse_map: AHashMap::new(),
+            counters: AHashMap::new(),
+            session_key: Zeroizing::new(key),
+            policy: SecurityPolicy::IndonesiaUuPdpStrict,
+            stateless_mode: false,
+        }
+    }
+
+    /// Checks whether stateless sealed-token mode is active.
+    pub fn is_stateless_mode(&self) -> bool {
+        self.stateless_mode
+    }
+
     /// Enables or disables stateless sealed-token mode.
     pub fn policy(&self) -> SecurityPolicy {
         self.policy
@@ -267,6 +286,52 @@ impl PiiSessionVault {
         }
         out.push_str(&input[last_idx..]);
         out
+    }
+
+    /// Recursively redacts all string leaves inside a serde_json::Value AST,
+    /// leaving JSON keys, numbers, booleans, and null untouched.
+    /// Also handles nested JSON-in-JSON string leaves.
+    pub fn redact_json_value(&mut self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (_k, v) in map {
+                    self.redact_json_value(v);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for elem in arr {
+                    self.redact_json_value(elem);
+                }
+            }
+            serde_json::Value::String(s) => {
+                // Check if string leaf itself is nested JSON
+                if (s.starts_with('{') && s.ends_with('}'))
+                    || (s.starts_with('[') && s.ends_with(']'))
+                {
+                    if let Ok(mut inner_val) = serde_json::from_str::<serde_json::Value>(s) {
+                        self.redact_json_value(&mut inner_val);
+                        if let Ok(serialized) = serde_json::to_string(&inner_val) {
+                            *s = serialized;
+                            return;
+                        }
+                    }
+                }
+                *s = self.redact(s);
+            }
+            _ => {}
+        }
+    }
+
+    /// Redacts raw PII in string leaves of a JSON payload without corrupting
+    /// unquoted numbers, object keys, or structural tokens.
+    /// If payload is not valid JSON, falls back to plain string redact.
+    pub fn redact_json(&mut self, payload: &str) -> String {
+        if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(payload) {
+            self.redact_json_value(&mut json_val);
+            serde_json::to_string(&json_val).unwrap_or_else(|_| self.redact(payload))
+        } else {
+            self.redact(payload)
+        }
     }
 
     /// Single-pass O(M) left-to-right lexical scan rehydrating tokens without secondary injection.
@@ -503,5 +568,41 @@ mod tests {
         let vault_b = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
         let unsealed = vault_b.rehydrate(&sealed);
         assert_eq!(unsealed, "User NIK 3573012203950001");
+    }
+
+    #[test]
+    fn test_redact_json_preserves_numeric_and_structural_fields() {
+        let mut vault = PiiSessionVault::new(SecurityPolicy::IndonesiaUuPdpStrict);
+        let json_input = r#"{"id":3573012203950001,"user":{"nik":"3573012203950001","email":"fitra@jotaralab.com","active":true,"count":42}}"#;
+
+        let redacted = vault.redact_json(json_input);
+        // "id": 3573012203950001 must stay an unquoted number!
+        assert!(redacted.contains(r#""id":3573012203950001"#));
+        // String fields must be redacted
+        assert!(redacted.contains(r#""nik":"<ID_NIK_1>""#));
+        assert!(redacted.contains(r#""email":"<EMAIL_1>""#));
+        assert!(redacted.contains(r#""active":true"#));
+
+        // Test nested JSON string
+        let nested_input = r#"{"content":"{\"nik\":\"3573012203950001\"}"}"#;
+        let nested_redacted = vault.redact_json(nested_input);
+        assert!(nested_redacted.contains("<ID_NIK_1>"));
+    }
+
+    #[test]
+    fn test_from_catalog_with_key() {
+        let catalog = PiiCatalog::with_locales(&["global", "id"]).unwrap();
+        let key = [99u8; 32];
+        let mut vault = PiiSessionVault::from_catalog_with_key(catalog, key);
+        vault.set_stateless_mode(true);
+        assert!(vault.is_stateless_mode());
+
+        let scrubbed = vault.redact("NIK: 3573012203950001");
+        assert!(scrubbed.starts_with("NIK: <PII:ID_NIK:"));
+
+        let catalog_b = PiiCatalog::with_locales(&["global", "id"]).unwrap();
+        let vault_b = PiiSessionVault::from_catalog_with_key(catalog_b, key);
+        let restored = vault_b.rehydrate(&scrubbed);
+        assert_eq!(restored, "NIK: 3573012203950001");
     }
 }

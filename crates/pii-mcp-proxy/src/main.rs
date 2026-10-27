@@ -121,31 +121,20 @@ pub fn process_outbound_line(line: &str, vault: &mut PiiSessionVault) -> String 
         return vault.redact(line);
     };
 
-    redact_json_leaves(&mut val, vault);
-    serde_json::to_string(&val).unwrap_or_else(|_| line.to_string())
-}
-
-fn redact_json_leaves(val: &mut Value, vault: &mut PiiSessionVault) {
-    match val {
+    match &mut val {
         Value::Object(map) => {
             for (k, v) in map {
                 // Keep structural fields untouched
                 if k == "jsonrpc" || k == "id" || k == "method" {
                     continue;
                 }
-                redact_json_leaves(v, vault);
+                vault.redact_json_value(v);
             }
         }
-        Value::Array(arr) => {
-            for elem in arr {
-                redact_json_leaves(elem, vault);
-            }
-        }
-        Value::String(s) => {
-            *s = vault.redact(s);
-        }
-        _ => {}
+        _ => vault.redact_json_value(&mut val),
     }
+
+    serde_json::to_string(&val).unwrap_or_else(|_| line.to_string())
 }
 
 fn main() {
