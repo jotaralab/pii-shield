@@ -1,11 +1,18 @@
+# cargo-deny v0.16+ configuration
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "wasm32-unknown-unknown" },
+]
+
 [advisories]
-vulnerability = "deny"
-unmaintained = "all"
+version = 2
 yanked = "warn"
-notice = "warn"
 
 [licenses]
-unlicensed = "deny"
+version = 2
+confidence-threshold = 0.8
 allow = [
     "MIT",
     "Apache-2.0",
@@ -13,7 +20,6 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
 ]
-confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"
