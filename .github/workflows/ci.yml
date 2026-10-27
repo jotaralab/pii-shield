@@ -26,5 +26,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run Unit Tests
         run: cargo test --workspace
+      - name: Run Benchmark Smoke Suite
+        run: cargo test --workspace --benches
       - name: Verify Wasm Compilation
         run: cargo check -p pii-wasm --target wasm32-unknown-unknown
