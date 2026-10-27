@@ -3,12 +3,12 @@
 > **Sub-millisecond, Stateful PII Redaction & Reversible Pseudonymization Engine for AI Agents, MCP Servers, and Edge Runtimes.**  
 > Built by [Jotara Lab](https://jotaralab.com) (`jotaralab/pii-shield`)
 
-[![License](https://img.shields.io/badge/license-Apache%202.0%20%2F%20MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0%20%2F%20MIT-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 [![Wasm Ready](https://img.shields.io/badge/wasm-%3C250KB-blueviolet.svg)](#wasm--cloudflare-workers)
-[![UU PDP Compliant](https://img.shields.io/badge/Indonesia-UU%20PDP%20Ready-emerald.svg)](#built-in-entity-recognizers)
+[![UU PDP & International](https://img.shields.io/badge/PII-UU%20PDP%20%7C%20GDPR%20%7C%20CCPA-emerald.svg)](#built-in-entity-recognizers)
 
-`pii-shield` is an embeddable, zero-backtracking PII firewall engineered in Rust. Unlike traditional regex scanners or heavy Python sidecars (like Microsoft Presidio), `pii-shield` uses a **3-Stage Cascading Sieve** and a **Session-Scoped Bi-Directional Vault** so AI agents can reason over sensitive user data, execute database/MCP tool calls, and stream responses—without a single byte of raw PII ever reaching the LLM provider.
+`pii-shield` is an embeddable, zero-backtracking PII firewall engineered in Rust. Unlike traditional regex scanners or heavy Python sidecars (like Microsoft Presidio), `pii-shield` uses a **Declarative i18n Rule Catalog**, a **3-Stage Cascading Sieve**, and a **Session-Scoped Bi-Directional Vault** so AI agents can reason over sensitive user data, execute database/MCP tool calls, and stream responses—without a single byte of raw PII ever reaching the LLM provider.
 
 ---
 
@@ -21,44 +21,46 @@
 | **Agent Tool Rehydration** | **Native (`PiiSessionVault`)** | Manual external DB | None | None |
 | **Streaming Token Support** | **Stateful Lookahead Buffer** | Full-text only | Full-text only | Full-text only |
 | **Indonesian / SEA PII (UU PDP)** | **Built-in Checksum Validation** | Custom plugins required | High false positives | Unreliable |
+| **International PII (US, EU, SG)** | **Declarative TOML Catalog** | Hardcoded logic | High false positives | Unreliable |
 | **Browser / Edge Wasm** | **Yes (`< 250KB` `.wasm`)** | No | JS-only | No |
 
 ---
 
-## 🏗️ Architecture: The 4 Agent Interception Boundaries
+## 🏗️ Architecture: The 3-Stage Cascading Sieve
 
 ```text
-[User] 
-  │  1. Prompt Scrub ("Cek pesanan Budi, NIK 3573012203950001")
-  ▼
+[Input Stream / Text]
+         │
+         ▼
 ┌─────────────────────────────────────────────────────────────┐
-│             PII SHIELD AGENT MIDDLEWARE (In-VPC)            │
-│  Session Vault: { "<ID_NIK_1>": "3573012203950001", ... }   │
-└───────┬──────────────────────────────▲──────────────────────┘
-        │ Sanitized ("Cek <PER_1>,     │ Tool Call:
-        │            NIK <ID_NIK_1>")  │ query_db(nik="<ID_NIK_1>")
-        ▼                              │
-   [LLM API] ──────────────────────────┘
-        ▲
-        │ 4. Sanitized Tool Output ("Status <ID_NIK_1>: Dikirim ke <EMAIL_1>")
-┌───────┴─────────────────────────────────────────────────────┐
-│                MCP / TOOL EXECUTION PROXY                   │
-│  2. Rehydrate Args: "<ID_NIK_1>" ──► "3573012203950001"     │
-│  3. Scrub DB/API Response before returning to LLM context   │
-└───────┬──────────────────────────────▲──────────────────────┘
-        │ Real Query                   │ Raw DB Row (contains address, phone)
-        ▼                              │
-  [Internal DB / ERP / External APIs / MCP Servers]
+│ Stage 1: Word-Boundary Multi-Pattern DFA Scan                │
+│ Fast O(N) candidate detection via regex-automata            │
+└───────┬─────────────────────────────────────────────────────┘
+        │ Candidate matches (start..end)
+        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Stage 2: UTF-8 Safe Context Keyword & Priority Scoring       │
+│ ±48 byte context window boosts confidence & disambiguates   │
+└───────┬─────────────────────────────────────────────────────┘
+        │ Scored candidate rules
+        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Stage 3: Algorithmic Checksum & Structural Verification      │
+│ Luhn, Kemendagri NIK (38 prov), NPWP, SSN, IBAN, SG NRIC   │
+└───────┬─────────────────────────────────────────────────────┘
+        │ Verified EntityMatch
+        ▼
+   [PiiSessionVault: Consistent Pseudonymization Token]
 ```
 
 ---
 
 ## 📦 Workspace Crates
 
-- **`crates/pii-core`**: Pure Rust engine. Multi-pattern DFA scanner, algorithmic checksum verifiers (Luhn, Indonesian NIK, NPWP), `PiiSessionVault` with `Zeroize` memory wiping, taint-tracking ACLs, and streaming lookahead rehydration.
+- **`crates/pii-core`**: Pure Rust engine. Declarative TOML locale catalogs (`rules/*.toml`), multi-pattern DFA scanner, algorithmic checksum verifiers (Luhn, Indonesian NIK/NPWP/Phone, US SSN, IBAN, SG NRIC), `PiiSessionVault` with `Zeroize` memory wiping, 3-layer taint-tracking ACLs, and streaming lookahead rehydration.
 - **`crates/pii-wasm`**: `wasm-bindgen` bindings for Browser demos, Cloudflare Workers, and Vercel Edge middleware.
-- **`crates/pii-ffi`**: C-ABI (`cbindgen`) exports for zero-overhead embedding in Go, C/C++, Ruby, and Elixir.
-- **`crates/pii-mcp-proxy`**: Drop-in STDIO wrapper for Model Context Protocol (MCP) servers that automatically rehydrates tool arguments and scrubs tool outputs.
+- **`crates/pii-ffi`**: C-ABI (`cbindgen`) thread-safe exports for zero-overhead embedding in Go, C/C++, Ruby, and Elixir.
+- **`crates/pii-mcp-proxy`**: Fail-closed bidirectional STDIO wrapper for Model Context Protocol (MCP) servers that automatically rehydrates tool arguments and scrubs tool outputs.
 
 ---
 
@@ -96,23 +98,47 @@ fn main() {
 
 ---
 
-## 🔍 Built-in Entity Recognizers & Checksum Validators
+## 🌍 Contributing a New PII Rule (Declarative TOML)
 
-1. **`ID_NIK` (Indonesian National ID / KTP)**: 16-digit structural validation checking valid province code prefixes (`11`–`94`), `DDMMYY` date of birth validation (including `+40` female day offset), and non-zero serial suffix.
-2. **`ID_NPWP` (Indonesian Tax ID)**: 15-digit and 16-digit formatted/unformatted tax identification numbers.
-3. **`CREDIT_CARD`**: 13–19 digit payment cards verified in-memory via the **Luhn algorithm** to eliminate false positives on arbitrary order/tracking numbers.
-4. **`EMAIL`**: RFC-5322 compliant deterministic automaton matcher.
-5. **`PHONE_ID`**: Indonesian mobile and landline numbers (`+62`, `62`, `08xx`) with carrier prefix verification.
+To add support for a new country or entity, simply add a `[[rules]]` block to the appropriate file in `crates/pii-core/rules/*.toml` without modifying any Rust code:
+
+```toml
+[[rules]]
+id = "BR_CPF"
+tag_prefix = "BR_CPF"
+description = "Brazilian Cadastro de Pessoas Físicas (CPF)"
+regex = '\b[0-9]{3}\.[0-9]{3}\.[0-9]{3}-[0-9]{2}\b'
+validator = "none" # or register a built-in checksum algorithm
+priority = 90
+context_keywords = ["cpf", "receita", "brasil"]
+valid_samples = ["123.456.789-00"]
+invalid_samples = ["12345678900"]
+```
+
+Run `cargo test --workspace` to automatically compile and verify the rules.
 
 ---
 
-## 🛠️ Publishing to GitHub (`jotaralab/pii-shield`)
+## 🔍 Built-in Entity Recognizers & Checksum Validators
 
-Run the included setup script with the GitHub CLI (`gh`):
+1. **`ID_NIK` (Indonesian National ID / KTP)**: 16-digit structural validation checking all 38 Kemendagri/BPS province codes (`11`–`96`), leap-year-aware `DDMMYY` date of birth (including `+40` female offset), and non-zero serial suffix.
+2. **`ID_NPWP` (Indonesian Tax ID)**: 15-digit and 16-digit (PMK 112/2022 NITKU) formatted and unformatted tax identification numbers.
+3. **`CREDIT_CARD`**: 13–19 digit payment cards (Visa, Mastercard, Amex, Discover) verified in-memory via the **Luhn algorithm** to eliminate false positives.
+4. **`EMAIL`**: Robust word-boundary email matcher with domain validation.
+5. **`PHONE_ID`**: Indonesian cellular and landline numbers (`+62`, `62`, `08xx`) verified against allocated operator prefixes and area codes.
+6. **`US_SSN`**: 9-digit United States Social Security Number excluding invalid area (`000`, `666`, `900`–`999`), group, and serial numbers.
+7. **`IBAN`**: International Bank Account Number verified via ISO 7064 Mod 97-10 checksum.
+8. **`SG_NRIC`**: Singapore National Registration Identity Card / FIN Mod-11 checksum.
+
+---
+
+## 🛠️ MCP Proxy Usage
+
+Run the zero-trust STDIO MCP proxy wrapper with a fail-closed tool ACL:
 
 ```bash
-chmod +x scripts/setup-github.sh
-./scripts/setup-github.sh
+# Allow only trusted internal query tools to rehydrate PII:
+pii-mcp-proxy --trusted-tools query_db,lookup_user -- npx -y @modelcontextprotocol/server-postgres postgresql://...
 ```
 
 ---

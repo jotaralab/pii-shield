@@ -1,0 +1,24 @@
+locale = "eu"
+name = "European Union"
+
+[[rules]]
+id = "IBAN"
+tag_prefix = "IBAN"
+description = "International Bank Account Number (ISO 13616)"
+regex = '\b[A-Z]{2}[0-9]{2}[A-Za-z0-9]{11,30}\b'
+validator = "iban_mod97"
+priority = 90
+context_keywords = ["iban", "bank", "account", "rekening", "sepa"]
+valid_samples = ["DE89370400440532013000", "FR1420041010050500013M02606"]
+invalid_samples = ["DE89370400440532013001", "1289370400440532013000"]
+
+[[rules]]
+id = "PHONE_EU"
+tag_prefix = "PHONE_EU"
+description = "European format telephone number"
+regex = '(?:\+3[0-9]|\+4[0-9])[ \.\-]?[0-9]{2,4}[ \.\-]?[0-9]{4,8}\b'
+validator = "e164_phone"
+priority = 75
+context_keywords = ["phone", "tel", "call", "mobil"]
+valid_samples = ["+49 30 12345678", "+33 1 42685500"]
+invalid_samples = ["+49 1", "phone"]
