@@ -36,6 +36,25 @@ struct PiiVaultHandle *pii_vault_new_with_locales_and_key(const char *locales,
 
 void pii_vault_set_stateless_mode(struct PiiVaultHandle *ptr, bool enabled);
 
+void pii_vault_set_token_format(struct PiiVaultHandle *ptr, uint8_t format_id);
+
+char *pii_vault_export_sealed_entries_json(const struct PiiVaultHandle *ptr,
+                                           const char *aad);
+
+char *pii_vault_drain_dirty_sealed_entries_json(struct PiiVaultHandle *ptr,
+                                                const char *aad);
+
+bool pii_vault_import_sealed_entries_json(struct PiiVaultHandle *ptr,
+                                          const char *json_map,
+                                          const char *aad);
+
+char *pii_vault_export_sealed_state(const struct PiiVaultHandle *ptr,
+                                    const char *aad);
+
+bool pii_vault_import_sealed_state(struct PiiVaultHandle *ptr,
+                                   const char *sealed,
+                                   const char *aad);
+
 void pii_vault_free(struct PiiVaultHandle *ptr);
 
 char *pii_vault_redact(struct PiiVaultHandle *ptr, const char *input);

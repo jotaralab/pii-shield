@@ -7,4 +7,7 @@ pub mod vault;
 pub use catalog::{CatalogError, LocaleCatalog, PiiCatalog, PiiRuleSpec};
 pub use scanner::{EntityMatch, EntityType, PiiScanner};
 pub use stream::StreamingRehydrator;
-pub use vault::{PiiSessionVault, SecurityError, SecurityPolicy, ToolTrustLevel};
+pub use vault::{
+    InMemoryVaultStore, PiiSessionVault, PiiVaultStore, SecurityError, SecurityPolicy, TokenFormat,
+    ToolTrustLevel,
+};

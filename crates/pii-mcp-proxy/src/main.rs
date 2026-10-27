@@ -102,6 +102,17 @@ fn process_single_inbound_request(
                         });
                         return Some(InboundAction::BlockWithError(err_resp.to_string()));
                     }
+                    Err(err) => {
+                        let err_resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id_val,
+                            "error": {
+                                "code": -32002,
+                                "message": err.to_string(),
+                            }
+                        });
+                        return Some(InboundAction::BlockWithError(err_resp.to_string()));
+                    }
                 }
             }
         }

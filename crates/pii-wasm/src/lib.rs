@@ -55,6 +55,45 @@ impl WasmPiiSession {
         self.inner.is_stateless_mode()
     }
 
+    #[wasm_bindgen(js_name = setTokenFormat)]
+    pub fn set_token_format(&mut self, format_id: u8) {
+        let format = match format_id {
+            1 => pii_core::TokenFormat::CompactHash,
+            2 => pii_core::TokenFormat::StatelessSealed,
+            _ => pii_core::TokenFormat::Sequential,
+        };
+        self.inner.set_token_format(format);
+    }
+
+    #[wasm_bindgen(js_name = exportSealedEntriesJson)]
+    pub fn export_sealed_entries_json(&self, aad: &str) -> String {
+        self.inner.export_sealed_entries_json(aad)
+    }
+
+    #[wasm_bindgen(js_name = drainDirtySealedEntriesJson)]
+    pub fn drain_dirty_sealed_entries_json(&mut self, aad: &str) -> String {
+        self.inner.drain_dirty_sealed_entries_json(aad)
+    }
+
+    #[wasm_bindgen(js_name = importSealedEntriesJson)]
+    pub fn import_sealed_entries_json(&mut self, json_map: &str, aad: &str) -> Result<(), JsValue> {
+        self.inner
+            .import_sealed_entries_json(json_map, aad)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = exportSealedState)]
+    pub fn export_sealed_state(&self, aad: &str) -> String {
+        self.inner.export_sealed_state(aad)
+    }
+
+    #[wasm_bindgen(js_name = importSealedState)]
+    pub fn import_sealed_state(&mut self, sealed: &str, aad: &str) -> Result<(), JsValue> {
+        self.inner
+            .import_sealed_state(sealed, aad)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     #[wasm_bindgen]
     pub fn redact(&mut self, text: &str) -> String {
         self.inner.redact(text)
@@ -83,6 +122,7 @@ impl WasmPiiSession {
                 pii_core::SecurityError::ExfiltrationBlocked { token } => {
                     JsValue::from_str(&format!("PII Exfiltration Blocked: {}", token))
                 }
+                other => JsValue::from_str(&other.to_string()),
             })
     }
 }

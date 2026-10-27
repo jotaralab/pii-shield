@@ -21,9 +21,61 @@ pub enum ToolTrustLevel {
     ExternalUntrusted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenFormat {
+    Sequential,
+    CompactHash,
+    StatelessSealed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecurityError {
     ExfiltrationBlocked { token: String },
+    InvalidStateBlob,
+    StateConflict { token: String },
+}
+
+impl std::fmt::Display for SecurityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecurityError::ExfiltrationBlocked { token } => {
+                write!(f, "PII exfiltration blocked: {}", token)
+            }
+            SecurityError::InvalidStateBlob => write!(f, "Invalid or corrupted state blob"),
+            SecurityError::StateConflict { token } => {
+                write!(f, "State conflict on token: {}", token)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SecurityError {}
+
+const BASE36_CHARS: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+fn encode_base36(mut val: u64, min_len: usize) -> String {
+    let mut buf = Vec::with_capacity(min_len.max(1));
+    while val > 0 {
+        buf.push(BASE36_CHARS[(val % 36) as usize]);
+        val /= 36;
+    }
+    while buf.len() < min_len {
+        buf.push(b'0');
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap_or_default()
+}
+
+#[inline]
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Session-scoped bi-directional pseudonymization vault.
@@ -31,11 +83,12 @@ pub enum SecurityError {
 pub struct PiiSessionVault {
     scanner: PiiScanner,
     forward_map: AHashMap<[u8; 32], String>,
-    reverse_map: AHashMap<String, Zeroizing<String>>,
+    reverse_map: AHashMap<String, (EntityType, Zeroizing<String>)>,
     counters: AHashMap<EntityType, u64>,
+    dirty_tokens: Vec<String>,
     session_key: Zeroizing<[u8; 32]>,
     policy: SecurityPolicy,
-    stateless_mode: bool,
+    token_format: TokenFormat,
 }
 
 impl PiiSessionVault {
@@ -64,9 +117,10 @@ impl PiiSessionVault {
             forward_map: AHashMap::new(),
             reverse_map: AHashMap::new(),
             counters: AHashMap::new(),
+            dirty_tokens: Vec::new(),
             session_key: Zeroizing::new(key),
             policy,
-            stateless_mode: false,
+            token_format: TokenFormat::Sequential,
         }
     }
 
@@ -80,9 +134,10 @@ impl PiiSessionVault {
             forward_map: AHashMap::new(),
             reverse_map: AHashMap::new(),
             counters: AHashMap::new(),
+            dirty_tokens: Vec::new(),
             session_key: Zeroizing::new(key_bytes),
             policy: SecurityPolicy::IndonesiaUuPdpStrict,
-            stateless_mode: false,
+            token_format: TokenFormat::Sequential,
         }
     }
 
@@ -94,25 +149,40 @@ impl PiiSessionVault {
             forward_map: AHashMap::new(),
             reverse_map: AHashMap::new(),
             counters: AHashMap::new(),
+            dirty_tokens: Vec::new(),
             session_key: Zeroizing::new(key),
             policy: SecurityPolicy::IndonesiaUuPdpStrict,
-            stateless_mode: false,
+            token_format: TokenFormat::Sequential,
         }
+    }
+
+    /// Returns the active token format.
+    pub fn token_format(&self) -> TokenFormat {
+        self.token_format
+    }
+
+    /// Sets the active token format (Sequential, CompactHash, StatelessSealed).
+    pub fn set_token_format(&mut self, format: TokenFormat) {
+        self.token_format = format;
     }
 
     /// Checks whether stateless sealed-token mode is active.
     pub fn is_stateless_mode(&self) -> bool {
-        self.stateless_mode
-    }
-
-    /// Enables or disables stateless sealed-token mode.
-    pub fn policy(&self) -> SecurityPolicy {
-        self.policy
+        self.token_format == TokenFormat::StatelessSealed
     }
 
     /// Enables or disables stateless sealed-token mode.
     pub fn set_stateless_mode(&mut self, enabled: bool) {
-        self.stateless_mode = enabled;
+        if enabled {
+            self.token_format = TokenFormat::StatelessSealed;
+        } else {
+            self.token_format = TokenFormat::Sequential;
+        }
+    }
+
+    /// Policy associated with this vault session.
+    pub fn policy(&self) -> SecurityPolicy {
+        self.policy
     }
 
     /// Derives HKDF-style subkeys from session_key: K_mac and K_enc.
@@ -230,7 +300,7 @@ impl PiiSessionVault {
         mac.update(&plaintext);
         let expected_siv_full = mac.finalize().into_bytes();
 
-        if siv != &expected_siv_full[..16] {
+        if !ct_eq(siv, &expected_siv_full[..16]) {
             return false; // Authentication failed
         }
 
@@ -244,7 +314,7 @@ impl PiiSessionVault {
 
     fn get_or_insert_token(&mut self, entity_type: EntityType, raw_pii: &str) -> String {
         let tag_prefix = entity_type.as_tag_prefix().to_string();
-        if self.stateless_mode {
+        if self.token_format == TokenFormat::StatelessSealed {
             return self.create_sealed_token(&tag_prefix, raw_pii);
         }
 
@@ -253,13 +323,33 @@ impl PiiSessionVault {
             return existing.clone();
         }
 
-        let count = self.counters.entry(entity_type.clone()).or_insert(0);
-        *count = count.saturating_add(1);
+        let token = match self.token_format {
+            TokenFormat::Sequential => {
+                let count = self.counters.entry(entity_type.clone()).or_insert(0);
+                *count = count.saturating_add(1);
+                format!("<{}_{}>", tag_prefix, count)
+            }
+            TokenFormat::CompactHash => {
+                let num = u64::from_be_bytes(digest[..8].try_into().unwrap());
+                let base_code = encode_base36(num % 2_176_782_336, 6);
+                let mut candidate = format!("<{}_{}>", tag_prefix, base_code);
+                if let Some((_, existing_raw)) = self.reverse_map.get(&candidate) {
+                    if existing_raw.as_str() != raw_pii.trim() {
+                        let ext_code = encode_base36(num % 2_821_109_907_456, 8);
+                        candidate = format!("<{}_{}>", tag_prefix, ext_code);
+                    }
+                }
+                candidate
+            }
+            TokenFormat::StatelessSealed => unreachable!(),
+        };
 
-        let token = format!("<{}_{}>", tag_prefix, count);
         self.forward_map.insert(digest, token.clone());
-        self.reverse_map
-            .insert(token.clone(), Zeroizing::new(raw_pii.trim().to_string()));
+        self.reverse_map.insert(
+            token.clone(),
+            (entity_type, Zeroizing::new(raw_pii.trim().to_string())),
+        );
+        self.dirty_tokens.push(token.clone());
 
         token
     }
@@ -375,7 +465,7 @@ impl PiiSessionVault {
     /// Looks up or decrypts a single token, appending the raw value into out.
     /// Returns true if the token was recognized and rehydrated.
     pub fn rehydrate_token_into(&self, token: &str, out: &mut String) -> bool {
-        if let Some(val) = self.reverse_map.get(token) {
+        if let Some((_, val)) = self.reverse_map.get(token) {
             out.push_str(val.as_str());
             return true;
         }
@@ -387,7 +477,7 @@ impl PiiSessionVault {
 
     /// O(1) stateful lookup for a token.
     pub fn rehydrate_token(&self, token: &str) -> Option<&str> {
-        self.reverse_map.get(token).map(|z| z.as_str())
+        self.reverse_map.get(token).map(|(_, z)| z.as_str())
     }
 
     /// Recursively rehydrates all string leaves inside a serde_json::Value AST,
@@ -452,7 +542,7 @@ impl PiiSessionVault {
         }
 
         // Layer 2: Known session PII in reverse_map
-        for (token, raw_val) in &self.reverse_map {
+        for (token, (_, raw_val)) in &self.reverse_map {
             let val = raw_val.as_str();
             if val.len() >= 4 && payload.contains(val) {
                 return Err(SecurityError::ExfiltrationBlocked {
@@ -491,6 +581,481 @@ impl PiiSessionVault {
         } else {
             Ok(self.rehydrate(payload))
         }
+    }
+
+    fn derive_state_subkeys(&self) -> ([u8; 32], [u8; 32]) {
+        let mut mac = HmacSha256::new_from_slice(&*self.session_key).expect("Key valid");
+        mac.update(b"pii-shield-state-mac-v1");
+        let k_mac = mac.finalize().into_bytes().into();
+
+        let mut enc = HmacSha256::new_from_slice(&*self.session_key).expect("Key valid");
+        enc.update(b"pii-shield-state-enc-v1");
+        let k_enc = enc.finalize().into_bytes().into();
+
+        (k_mac, k_enc)
+    }
+
+    fn seal_entry_bytes(
+        &self,
+        entity_prefix: &str,
+        raw_pii: &str,
+        token: &str,
+        aad: &str,
+    ) -> String {
+        let (k_mac, k_enc) = self.derive_state_subkeys();
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce).expect("OS CSPRNG unavailable");
+
+        let trimmed = raw_pii.trim();
+        let mut plaintext = Vec::with_capacity(entity_prefix.len() + 1 + trimmed.len());
+        plaintext.extend_from_slice(entity_prefix.as_bytes());
+        plaintext.push(0x00);
+        plaintext.extend_from_slice(trimmed.as_bytes());
+
+        // SIV = HMAC(K_state_mac, "PIIE1" || nonce || aad_len || aad || token_len || token || plaintext)[0..16]
+        let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
+        mac.update(b"PIIE1");
+        mac.update(&nonce);
+        mac.update(&(aad.len() as u64).to_be_bytes());
+        mac.update(aad.as_bytes());
+        mac.update(&(token.len() as u64).to_be_bytes());
+        mac.update(token.as_bytes());
+        mac.update(&plaintext);
+        let siv_full = mac.finalize().into_bytes();
+        let mut siv = [0u8; 16];
+        siv.copy_from_slice(&siv_full[..16]);
+
+        let mut ciphertext = Vec::with_capacity(plaintext.len());
+        let mut block_idx = 0u32;
+        while ciphertext.len() < plaintext.len() {
+            let mut ctr_mac = HmacSha256::new_from_slice(&k_enc).expect("HMAC key valid");
+            ctr_mac.update(&siv);
+            ctr_mac.update(&nonce);
+            ctr_mac.update(&block_idx.to_be_bytes());
+            let ks = ctr_mac.finalize().into_bytes();
+
+            for &b in ks.iter() {
+                if ciphertext.len() == plaintext.len() {
+                    break;
+                }
+                let pt = plaintext[ciphertext.len()];
+                ciphertext.push(pt ^ b);
+            }
+            block_idx += 1;
+        }
+
+        let mut payload = Vec::with_capacity(32 + ciphertext.len());
+        payload.extend_from_slice(&nonce);
+        payload.extend_from_slice(&siv);
+        payload.extend_from_slice(&ciphertext);
+        format!("PIIE1:{}", hex::encode_upper(payload))
+    }
+
+    fn unseal_entry_bytes(
+        &self,
+        sealed: &str,
+        token: &str,
+        aad: &str,
+    ) -> Result<(EntityType, Zeroizing<String>), SecurityError> {
+        if !sealed.starts_with("PIIE1:") {
+            return Err(SecurityError::InvalidStateBlob);
+        }
+        let hex_str = &sealed[6..];
+        let Ok(payload) = hex::decode(hex_str) else {
+            return Err(SecurityError::InvalidStateBlob);
+        };
+        if payload.len() < 33 {
+            return Err(SecurityError::InvalidStateBlob);
+        }
+
+        let (k_mac, k_enc) = self.derive_state_subkeys();
+        let nonce = &payload[..16];
+        let siv = &payload[16..32];
+        let ciphertext = &payload[32..];
+
+        let mut plaintext = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
+        let mut block_idx = 0u32;
+        while plaintext.len() < ciphertext.len() {
+            let mut ctr_mac = HmacSha256::new_from_slice(&k_enc).expect("HMAC key valid");
+            ctr_mac.update(siv);
+            ctr_mac.update(nonce);
+            ctr_mac.update(&block_idx.to_be_bytes());
+            let ks = ctr_mac.finalize().into_bytes();
+
+            for &b in ks.iter() {
+                if plaintext.len() == ciphertext.len() {
+                    break;
+                }
+                let ct = ciphertext[plaintext.len()];
+                plaintext.push(ct ^ b);
+            }
+            block_idx += 1;
+        }
+
+        let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
+        mac.update(b"PIIE1");
+        mac.update(nonce);
+        mac.update(&(aad.len() as u64).to_be_bytes());
+        mac.update(aad.as_bytes());
+        mac.update(&(token.len() as u64).to_be_bytes());
+        mac.update(token.as_bytes());
+        mac.update(&plaintext);
+        let expected_siv_full = mac.finalize().into_bytes();
+
+        if !ct_eq(siv, &expected_siv_full[..16]) {
+            return Err(SecurityError::InvalidStateBlob);
+        }
+
+        let Some(sep_idx) = plaintext.iter().position(|&b| b == 0x00) else {
+            return Err(SecurityError::InvalidStateBlob);
+        };
+        let prefix_str = std::str::from_utf8(&plaintext[..sep_idx])
+            .map_err(|_| SecurityError::InvalidStateBlob)?;
+        let raw_str = std::str::from_utf8(&plaintext[sep_idx + 1..])
+            .map_err(|_| SecurityError::InvalidStateBlob)?;
+
+        let entity_type = EntityType::from_tag_prefix(prefix_str);
+        Ok((entity_type, Zeroizing::new(raw_str.to_string())))
+    }
+
+    /// Exports all current session entries sealed with the session key and bound to aad.
+    pub fn export_sealed_entries(&self, aad: &str) -> AHashMap<String, String> {
+        let mut map = AHashMap::with_capacity(self.reverse_map.len());
+        for (token, (entity_type, raw_pii)) in &self.reverse_map {
+            let sealed =
+                self.seal_entry_bytes(entity_type.as_tag_prefix(), raw_pii.as_str(), token, aad);
+            map.insert(token.clone(), sealed);
+        }
+        map
+    }
+
+    /// Drains and exports newly created entries since the last sync.
+    pub fn drain_dirty_sealed_entries(&mut self, aad: &str) -> AHashMap<String, String> {
+        let dirty = std::mem::take(&mut self.dirty_tokens);
+        let mut map = AHashMap::with_capacity(dirty.len());
+        for token in dirty {
+            if let Some((entity_type, raw_pii)) = self.reverse_map.get(&token) {
+                let sealed = self.seal_entry_bytes(
+                    entity_type.as_tag_prefix(),
+                    raw_pii.as_str(),
+                    &token,
+                    aad,
+                );
+                map.insert(token, sealed);
+            }
+        }
+        map
+    }
+
+    /// Imports and decrypts sealed entries from an iterator of (token, sealed_value).
+    /// Enforces conflict detection before applying any mutations.
+    pub fn import_sealed_entries<'a, I>(
+        &mut self,
+        entries: I,
+        aad: &str,
+    ) -> Result<(), SecurityError>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let mut decrypted = Vec::new();
+        for (token, sealed) in entries {
+            let (entity_type, raw_val) = self.unseal_entry_bytes(sealed, token, aad)?;
+            if let Some((_, existing_raw)) = self.reverse_map.get(token) {
+                if existing_raw.as_str() != raw_val.as_str() {
+                    return Err(SecurityError::StateConflict {
+                        token: token.to_string(),
+                    });
+                }
+            }
+            decrypted.push((token.to_string(), entity_type, raw_val));
+        }
+
+        for (token, entity_type, raw_val) in decrypted {
+            let digest = self.compute_hmac(entity_type.as_tag_prefix(), raw_val.as_str());
+            self.forward_map.insert(digest, token.clone());
+
+            if let Some(inner) = token.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+                if let Some(last_us) = inner.rfind('_') {
+                    if let Ok(seq_num) = inner[last_us + 1..].parse::<u64>() {
+                        let cur = self.counters.entry(entity_type.clone()).or_insert(0);
+                        *cur = (*cur).max(seq_num);
+                    }
+                }
+            }
+
+            self.reverse_map.insert(token, (entity_type, raw_val));
+        }
+
+        Ok(())
+    }
+
+    /// Exports all current session entries as a JSON map of token -> sealed_value.
+    pub fn export_sealed_entries_json(&self, aad: &str) -> String {
+        let map: std::collections::BTreeMap<String, String> =
+            self.export_sealed_entries(aad).into_iter().collect();
+        serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Drains and exports newly created entries as a JSON map of token -> sealed_value.
+    pub fn drain_dirty_sealed_entries_json(&mut self, aad: &str) -> String {
+        let map: std::collections::BTreeMap<String, String> =
+            self.drain_dirty_sealed_entries(aad).into_iter().collect();
+        serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Imports sealed entries from a JSON map string of {"token": "sealed_value"}.
+    pub fn import_sealed_entries_json(
+        &mut self,
+        json_map: &str,
+        aad: &str,
+    ) -> Result<(), SecurityError> {
+        let map: std::collections::HashMap<String, String> =
+            serde_json::from_str(json_map).map_err(|_| SecurityError::InvalidStateBlob)?;
+        let entries: Vec<(&str, &str)> =
+            map.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        self.import_sealed_entries(entries, aad)
+    }
+
+    /// Exports full session state into a single encrypted envelope (PIIS1).
+    pub fn export_sealed_state(&self, aad: &str) -> String {
+        let (k_mac, k_enc) = self.derive_state_subkeys();
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce).expect("OS CSPRNG unavailable");
+
+        let entries: Vec<VaultSnapshotEntry> = self
+            .reverse_map
+            .iter()
+            .map(|(token, (entity, raw))| VaultSnapshotEntry {
+                entity: entity.as_tag_prefix().to_string(),
+                token: token.clone(),
+                raw: raw.as_str().to_string(),
+            })
+            .collect();
+
+        let counters: Vec<(String, u64)> = self
+            .counters
+            .iter()
+            .map(|(entity, count)| (entity.as_tag_prefix().to_string(), *count))
+            .collect();
+
+        let snapshot = VaultSnapshotV1 {
+            v: 1,
+            entries,
+            counters,
+        };
+
+        let plaintext = serde_json::to_vec(&snapshot).expect("Snapshot serializable");
+
+        let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
+        mac.update(b"PIIS1");
+        mac.update(&nonce);
+        mac.update(&(aad.len() as u64).to_be_bytes());
+        mac.update(aad.as_bytes());
+        mac.update(&plaintext);
+        let siv_full = mac.finalize().into_bytes();
+        let mut siv = [0u8; 16];
+        siv.copy_from_slice(&siv_full[..16]);
+
+        let mut ciphertext = Vec::with_capacity(plaintext.len());
+        let mut block_idx = 0u32;
+        while ciphertext.len() < plaintext.len() {
+            let mut ctr_mac = HmacSha256::new_from_slice(&k_enc).expect("HMAC key valid");
+            ctr_mac.update(&siv);
+            ctr_mac.update(&nonce);
+            ctr_mac.update(&block_idx.to_be_bytes());
+            let ks = ctr_mac.finalize().into_bytes();
+
+            for &b in ks.iter() {
+                if ciphertext.len() == plaintext.len() {
+                    break;
+                }
+                let pt = plaintext[ciphertext.len()];
+                ciphertext.push(pt ^ b);
+            }
+            block_idx += 1;
+        }
+
+        let mut payload = Vec::with_capacity(32 + ciphertext.len());
+        payload.extend_from_slice(&nonce);
+        payload.extend_from_slice(&siv);
+        payload.extend_from_slice(&ciphertext);
+        format!("PIIS1:{}", hex::encode_upper(payload))
+    }
+
+    /// Restores full session state from an encrypted envelope (PIIS1).
+    pub fn import_sealed_state(&mut self, sealed: &str, aad: &str) -> Result<(), SecurityError> {
+        if !sealed.starts_with("PIIS1:") {
+            return Err(SecurityError::InvalidStateBlob);
+        }
+        let hex_str = &sealed[6..];
+        let Ok(payload) = hex::decode(hex_str) else {
+            return Err(SecurityError::InvalidStateBlob);
+        };
+        if payload.len() < 33 {
+            return Err(SecurityError::InvalidStateBlob);
+        }
+
+        let (k_mac, k_enc) = self.derive_state_subkeys();
+        let nonce = &payload[..16];
+        let siv = &payload[16..32];
+        let ciphertext = &payload[32..];
+
+        let mut plaintext = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
+        let mut block_idx = 0u32;
+        while plaintext.len() < ciphertext.len() {
+            let mut ctr_mac = HmacSha256::new_from_slice(&k_enc).expect("HMAC key valid");
+            ctr_mac.update(siv);
+            ctr_mac.update(nonce);
+            ctr_mac.update(&block_idx.to_be_bytes());
+            let ks = ctr_mac.finalize().into_bytes();
+
+            for &b in ks.iter() {
+                if plaintext.len() == ciphertext.len() {
+                    break;
+                }
+                let ct = ciphertext[plaintext.len()];
+                plaintext.push(ct ^ b);
+            }
+            block_idx += 1;
+        }
+
+        let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
+        mac.update(b"PIIS1");
+        mac.update(nonce);
+        mac.update(&(aad.len() as u64).to_be_bytes());
+        mac.update(aad.as_bytes());
+        mac.update(&plaintext);
+        let expected_siv_full = mac.finalize().into_bytes();
+
+        if !ct_eq(siv, &expected_siv_full[..16]) {
+            return Err(SecurityError::InvalidStateBlob);
+        }
+
+        let snapshot: VaultSnapshotV1 =
+            serde_json::from_slice(&plaintext).map_err(|_| SecurityError::InvalidStateBlob)?;
+        if snapshot.v != 1 {
+            return Err(SecurityError::InvalidStateBlob);
+        }
+
+        for entry in &snapshot.entries {
+            if let Some((_, existing_raw)) = self.reverse_map.get(&entry.token) {
+                if existing_raw.as_str() != entry.raw.as_str() {
+                    return Err(SecurityError::StateConflict {
+                        token: entry.token.clone(),
+                    });
+                }
+            }
+        }
+
+        for entry in snapshot.entries {
+            let entity_type = EntityType::from_tag_prefix(&entry.entity);
+            let digest = self.compute_hmac(&entry.entity, &entry.raw);
+            self.forward_map.insert(digest, entry.token.clone());
+            self.reverse_map
+                .insert(entry.token, (entity_type, Zeroizing::new(entry.raw)));
+        }
+
+        for (entity_prefix, remote_count) in snapshot.counters {
+            let entity_type = EntityType::from_tag_prefix(&entity_prefix);
+            let cur = self.counters.entry(entity_type).or_insert(0);
+            *cur = (*cur).max(remote_count);
+        }
+
+        Ok(())
+    }
+
+    /// Loads entries from any generic Key-Value or document storage backend.
+    pub fn load_from_store<S: PiiVaultStore>(
+        &mut self,
+        store: &S,
+        session_id: &str,
+    ) -> Result<(), SecurityError> {
+        let entries = store
+            .get_entries(session_id)
+            .map_err(|_| SecurityError::InvalidStateBlob)?;
+        let entry_refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        self.import_sealed_entries(entry_refs, session_id)
+    }
+
+    /// Flushes all dirty entries created during the current turn to a Key-Value storage backend.
+    pub fn flush_to_store<S: PiiVaultStore>(
+        &mut self,
+        store: &mut S,
+        session_id: &str,
+    ) -> Result<usize, SecurityError> {
+        let dirty = self.drain_dirty_sealed_entries(session_id);
+        let count = dirty.len();
+        if count > 0 {
+            let entries: Vec<(String, String)> = dirty.into_iter().collect();
+            store
+                .put_entries(session_id, entries)
+                .map_err(|_| SecurityError::InvalidStateBlob)?;
+        }
+        Ok(count)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VaultSnapshotEntry {
+    entity: String,
+    token: String,
+    raw: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VaultSnapshotV1 {
+    v: u8,
+    entries: Vec<VaultSnapshotEntry>,
+    counters: Vec<(String, u64)>,
+}
+
+/// Pluggable storage trait for persisting sealed PII entries across distributed workers.
+pub trait PiiVaultStore {
+    type Error: std::fmt::Debug;
+    fn get_entries(&self, session_id: &str) -> Result<Vec<(String, String)>, Self::Error>;
+    fn put_entries(
+        &mut self,
+        session_id: &str,
+        entries: Vec<(String, String)>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// In-memory reference store for testing or process-level cache sharing.
+#[derive(Default, Debug, Clone)]
+pub struct InMemoryVaultStore {
+    storage: AHashMap<String, AHashMap<String, String>>,
+}
+
+impl InMemoryVaultStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl PiiVaultStore for InMemoryVaultStore {
+    type Error = std::convert::Infallible;
+
+    fn get_entries(&self, session_id: &str) -> Result<Vec<(String, String)>, Self::Error> {
+        let entries = match self.storage.get(session_id) {
+            Some(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            None => Vec::new(),
+        };
+        Ok(entries)
+    }
+
+    fn put_entries(
+        &mut self,
+        session_id: &str,
+        entries: Vec<(String, String)>,
+    ) -> Result<(), Self::Error> {
+        let map = self.storage.entry(session_id.to_string()).or_default();
+        for (k, v) in entries {
+            map.insert(k, v);
+        }
+        Ok(())
     }
 }
 
@@ -543,15 +1108,140 @@ mod tests {
         let mut vault = PiiSessionVault::new(SecurityPolicy::IndonesiaUuPdpStrict);
         vault.reverse_map.insert(
             "<EMAIL_1>".to_string(),
-            Zeroizing::new("user+<ID_NIK_1>@example.com".to_string()),
+            (
+                EntityType::Email,
+                Zeroizing::new("user+<ID_NIK_1>@example.com".to_string()),
+            ),
         );
         vault.reverse_map.insert(
             "<ID_NIK_1>".to_string(),
-            Zeroizing::new("3573012203950001".to_string()),
+            (
+                EntityType::IdNik,
+                Zeroizing::new("3573012203950001".to_string()),
+            ),
         );
 
         let rehydrated = vault.rehydrate("Send to <EMAIL_1>");
         assert_eq!(rehydrated, "Send to user+<ID_NIK_1>@example.com");
+    }
+
+    #[test]
+    fn test_compact_hash_format() {
+        let key = [11u8; 32];
+        let mut vault = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        vault.set_token_format(TokenFormat::CompactHash);
+
+        let masked = vault.redact("NIK: 3573012203950001 dan 081234567890");
+        assert!(masked.contains("<ID_NIK_"));
+        assert!(masked.contains("<PHONE_ID_"));
+
+        // Extract token
+        let rehydrated = vault.rehydrate(&masked);
+        assert_eq!(rehydrated, "NIK: 3573012203950001 dan 081234567890");
+
+        // Verify determinism: fresh vault with same key generates identical token
+        let mut vault2 = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        vault2.set_token_format(TokenFormat::CompactHash);
+        let masked2 = vault2.redact("NIK: 3573012203950001");
+        assert_eq!(masked.split(' ').nth(1), masked2.split(' ').nth(1));
+    }
+
+    #[test]
+    fn test_distributed_kv_concurrent_pods_lock_free() {
+        let cluster_key = [88u8; 32];
+        let session_id = "session:order_99";
+        let mut shared_store = InMemoryVaultStore::new();
+
+        // Pod A starts in CompactHash mode and redacts Alice's NIK
+        let mut pod_a =
+            PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, cluster_key);
+        pod_a.set_token_format(TokenFormat::CompactHash);
+        let masked_a = pod_a.redact("Customer Alice NIK 3573012203950001");
+        assert!(masked_a.contains("<ID_NIK_"));
+
+        // Pod B starts concurrently and redacts Bob's Phone
+        let mut pod_b =
+            PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, cluster_key);
+        pod_b.set_token_format(TokenFormat::CompactHash);
+        let masked_b = pod_b.redact("Customer Bob Phone 081234567890");
+        assert!(masked_b.contains("<PHONE_ID_"));
+
+        // Both pods flush their dirty entries to shared store (commutative HSET)
+        let flushed_a = pod_a.flush_to_store(&mut shared_store, session_id).unwrap();
+        assert_eq!(flushed_a, 1);
+        let flushed_b = pod_b.flush_to_store(&mut shared_store, session_id).unwrap();
+        assert_eq!(flushed_b, 1);
+
+        // Pod C (egress / tool runner) starts fresh and loads all entries
+        let mut pod_c =
+            PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, cluster_key);
+        pod_c.load_from_store(&shared_store, session_id).unwrap();
+
+        // Pod C cleanly rehydrates both Alice and Bob without conflicts
+        let restored_a = pod_c.rehydrate(&masked_a);
+        assert_eq!(restored_a, "Customer Alice NIK 3573012203950001");
+        let restored_b = pod_c.rehydrate(&masked_b);
+        assert_eq!(restored_b, "Customer Bob Phone 081234567890");
+    }
+
+    #[test]
+    fn test_aad_and_token_binding_tamper_defense() {
+        let key = [55u8; 32];
+        let mut vault_a = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        let masked = vault_a.redact("NIK 3573012203950001");
+        let token = masked.strip_prefix("NIK ").unwrap();
+
+        let entries = vault_a.export_sealed_entries("session:alice");
+        let sealed_val = entries.get(token).unwrap();
+
+        // 1. Importing under wrong AAD (session:bob) must fail
+        let mut vault_b = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        let bad_import =
+            vault_b.import_sealed_entries(vec![(token, sealed_val.as_str())], "session:bob");
+        assert_eq!(bad_import, Err(SecurityError::InvalidStateBlob));
+
+        // 2. Importing with swapped token key must fail
+        let swapped_token = "<EMAIL_1>";
+        let bad_swap = vault_b
+            .import_sealed_entries(vec![(swapped_token, sealed_val.as_str())], "session:alice");
+        assert_eq!(bad_swap, Err(SecurityError::InvalidStateBlob));
+
+        // 3. Importing with correct AAD and token succeeds
+        let good_import =
+            vault_b.import_sealed_entries(vec![(token, sealed_val.as_str())], "session:alice");
+        assert!(good_import.is_ok());
+        assert_eq!(vault_b.rehydrate(token), "3573012203950001");
+    }
+
+    #[test]
+    fn test_sealed_state_snapshot_full() {
+        let key = [33u8; 32];
+        let mut vault_a = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        let _ = vault_a.redact("NIK 3573012203950001");
+        let _ = vault_a.redact("Email fitra@jotaralab.com");
+
+        let blob = vault_a.export_sealed_state("session:99");
+        assert!(blob.starts_with("PIIS1:"));
+
+        // Import into fresh vault_b
+        let mut vault_b = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        vault_b.import_sealed_state(&blob, "session:99").unwrap();
+        assert_eq!(vault_b.rehydrate("<ID_NIK_1>"), "3573012203950001");
+        assert_eq!(vault_b.rehydrate("<EMAIL_1>"), "fitra@jotaralab.com");
+
+        // Next redacted NIK becomes <ID_NIK_2> because counter was preserved
+        let next_nik = vault_b.redact("NIK 3573012902960001");
+        assert!(next_nik.contains("<ID_NIK_2>"));
+
+        // Conflict detection: import snapshot with conflicting token mapping
+        let mut conflicting_vault =
+            PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        let _ = conflicting_vault.redact("NIK 3573012902960001"); // Gets <ID_NIK_1> for a DIFFERENT NIK
+        let conflict_err = conflicting_vault.import_sealed_state(&blob, "session:99");
+        assert!(matches!(
+            conflict_err,
+            Err(SecurityError::StateConflict { .. })
+        ));
     }
 
     #[test]

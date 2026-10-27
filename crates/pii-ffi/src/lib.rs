@@ -93,6 +93,24 @@ pub unsafe extern "C" fn pii_vault_new_with_locales_and_key(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pii_vault_set_token_format(ptr: *mut PiiVaultHandle, format_id: u8) {
+    if ptr.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let handle = &*ptr;
+        if let Ok(mut vault) = handle.0.lock() {
+            let format = match format_id {
+                1 => pii_core::TokenFormat::CompactHash,
+                2 => pii_core::TokenFormat::StatelessSealed,
+                _ => pii_core::TokenFormat::Sequential,
+            };
+            vault.set_token_format(format);
+        }
+    }));
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pii_vault_set_stateless_mode(ptr: *mut PiiVaultHandle, enabled: bool) {
     if ptr.is_null() {
         return;
@@ -103,6 +121,163 @@ pub unsafe extern "C" fn pii_vault_set_stateless_mode(ptr: *mut PiiVaultHandle, 
             vault.set_stateless_mode(enabled);
         }
     }));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pii_vault_export_sealed_entries_json(
+    ptr: *const PiiVaultHandle,
+    aad: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        if ptr.is_null() {
+            return ptr::null_mut();
+        }
+        let aad_str = if aad.is_null() {
+            ""
+        } else {
+            match CStr::from_ptr(aad).to_str() {
+                Ok(s) => s,
+                Err(_) => return ptr::null_mut(),
+            }
+        };
+        let handle = &*ptr;
+        let vault = match handle.0.lock() {
+            Ok(g) => g,
+            Err(_) => return ptr::null_mut(),
+        };
+        let json_str = vault.export_sealed_entries_json(aad_str);
+        match CString::new(json_str) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pii_vault_drain_dirty_sealed_entries_json(
+    ptr: *mut PiiVaultHandle,
+    aad: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        if ptr.is_null() {
+            return ptr::null_mut();
+        }
+        let aad_str = if aad.is_null() {
+            ""
+        } else {
+            match CStr::from_ptr(aad).to_str() {
+                Ok(s) => s,
+                Err(_) => return ptr::null_mut(),
+            }
+        };
+        let handle = &*ptr;
+        let mut vault = match handle.0.lock() {
+            Ok(g) => g,
+            Err(_) => return ptr::null_mut(),
+        };
+        let json_str = vault.drain_dirty_sealed_entries_json(aad_str);
+        match CString::new(json_str) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pii_vault_import_sealed_entries_json(
+    ptr: *mut PiiVaultHandle,
+    json_map: *const c_char,
+    aad: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if ptr.is_null() || json_map.is_null() {
+            return false;
+        }
+        let map_str = match CStr::from_ptr(json_map).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let aad_str = if aad.is_null() {
+            ""
+        } else {
+            match CStr::from_ptr(aad).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+        let handle = &*ptr;
+        let mut vault = match handle.0.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        vault.import_sealed_entries_json(map_str, aad_str).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pii_vault_export_sealed_state(
+    ptr: *const PiiVaultHandle,
+    aad: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        if ptr.is_null() {
+            return ptr::null_mut();
+        }
+        let aad_str = if aad.is_null() {
+            ""
+        } else {
+            match CStr::from_ptr(aad).to_str() {
+                Ok(s) => s,
+                Err(_) => return ptr::null_mut(),
+            }
+        };
+        let handle = &*ptr;
+        let vault = match handle.0.lock() {
+            Ok(g) => g,
+            Err(_) => return ptr::null_mut(),
+        };
+        let blob = vault.export_sealed_state(aad_str);
+        match CString::new(blob) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pii_vault_import_sealed_state(
+    ptr: *mut PiiVaultHandle,
+    sealed: *const c_char,
+    aad: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if ptr.is_null() || sealed.is_null() {
+            return false;
+        }
+        let sealed_str = match CStr::from_ptr(sealed).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let aad_str = if aad.is_null() {
+            ""
+        } else {
+            match CStr::from_ptr(aad).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+        let handle = &*ptr;
+        let mut vault = match handle.0.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        vault.import_sealed_state(sealed_str, aad_str).is_ok()
+    }))
+    .unwrap_or(false)
 }
 
 #[no_mangle]
@@ -352,6 +527,45 @@ mod tests {
             let rehydrated_str = CStr::from_ptr(rehydrated_ptr).to_str().unwrap().to_string();
             pii_string_free(rehydrated_ptr);
             assert!(rehydrated_str.contains("3573012203950001"));
+
+            pii_vault_free(v1);
+            pii_vault_free(v2);
+        }
+    }
+
+    #[test]
+    fn test_ffi_compact_hash_and_sealed_entries() {
+        unsafe {
+            let key = [44u8; 32];
+            let v1 = pii_vault_new_with_key(0, key.as_ptr(), key.len());
+            pii_vault_set_token_format(v1, 1); // CompactHash
+
+            let input = CString::new("NIK 3573012203950001").unwrap();
+            let redacted_ptr = pii_vault_redact(v1, input.as_ptr());
+            let redacted_str = CStr::from_ptr(redacted_ptr).to_str().unwrap().to_string();
+            pii_string_free(redacted_ptr);
+            assert!(redacted_str.contains("<ID_NIK_"));
+
+            // Drain dirty entries
+            let aad = CString::new("session:test_order").unwrap();
+            let dirty_ptr = pii_vault_drain_dirty_sealed_entries_json(v1, aad.as_ptr());
+            assert!(!dirty_ptr.is_null());
+            let dirty_str = CStr::from_ptr(dirty_ptr).to_str().unwrap().to_string();
+            pii_string_free(dirty_ptr);
+            assert!(dirty_str.contains("PIIE1:"));
+
+            // Second vault imports the dirty entries
+            let v2 = pii_vault_new_with_key(0, key.as_ptr(), key.len());
+            let json_map_c = CString::new(dirty_str).unwrap();
+            let import_ok =
+                pii_vault_import_sealed_entries_json(v2, json_map_c.as_ptr(), aad.as_ptr());
+            assert!(import_ok);
+
+            let to_rehydrate = CString::new(redacted_str).unwrap();
+            let rehydrated_ptr = pii_vault_rehydrate(v2, to_rehydrate.as_ptr());
+            let rehydrated_str = CStr::from_ptr(rehydrated_ptr).to_str().unwrap().to_string();
+            pii_string_free(rehydrated_ptr);
+            assert_eq!(rehydrated_str, "NIK 3573012203950001");
 
             pii_vault_free(v1);
             pii_vault_free(v2);
