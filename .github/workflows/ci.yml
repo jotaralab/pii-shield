@@ -11,7 +11,7 @@ env:
 
 jobs:
   test-and-lint:
-    name: Rust Test & Clippy
+    name: Rust Test, Lint & Benchmarks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,7 +26,18 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run Unit Tests
         run: cargo test --workspace
+      - name: Run Documentation Tests
+        run: cargo test --doc
+      - name: Build Documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
       - name: Run Benchmark Smoke Suite
         run: cargo test --workspace --benches
       - name: Verify Wasm Compilation
         run: cargo check -p pii-wasm --target wasm32-unknown-unknown
+
+  security-audit:
+    name: Security & License Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
