@@ -1,0 +1,24 @@
+locale = "sg"
+name = "Singapore (PDPA)"
+
+[[rules]]
+id = "SG_NRIC"
+tag_prefix = "SG_NRIC"
+description = "Singapore National Registration Identity Card / FIN"
+regex = '\b[STFGMstfgm][0-9]{7}[A-Za-z]\b'
+validator = "sg_nric"
+priority = 90
+context_keywords = ["nric", "fin", "singapore", "identity"]
+valid_samples = ["S1234567D", "T1234567J", "F1234567X"]
+invalid_samples = ["S1234567A", "A1234567D", "1234567D"]
+
+[[rules]]
+id = "PHONE_SG"
+tag_prefix = "PHONE_SG"
+description = "Singapore telephone number"
+regex = '(?:\+65\s*)?[3689][0-9]{3}[ \-]?[0-9]{4}\b'
+validator = "e164_phone"
+priority = 75
+context_keywords = ["phone", "tel", "call", "hp"]
+valid_samples = ["+65 8123 4567", "61234567", "91234567"]
+invalid_samples = ["12345678", "+65 12345678"]
