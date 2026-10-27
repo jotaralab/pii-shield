@@ -53,7 +53,8 @@ impl PiiSessionVault {
                 PiiCatalog::with_locales(&["global", "id"]).expect("Builtin catalogs valid")
             }
             SecurityPolicy::StandardGlobal => {
-                PiiCatalog::with_locales(&["global", "us", "eu", "sg"]).expect("Builtin catalogs valid")
+                PiiCatalog::with_locales(&["global", "us", "eu", "sg"])
+                    .expect("Builtin catalogs valid")
             }
         };
         let scanner = PiiScanner::from_catalog(&catalog).expect("Scanner compilation valid");
@@ -86,6 +87,11 @@ impl PiiSessionVault {
     }
 
     /// Enables or disables stateless sealed-token mode.
+    pub fn policy(&self) -> SecurityPolicy {
+        self.policy
+    }
+
+    /// Enables or disables stateless sealed-token mode.
     pub fn set_stateless_mode(&mut self, enabled: bool) {
         self.stateless_mode = enabled;
     }
@@ -105,7 +111,8 @@ impl PiiSessionVault {
 
     /// Domain-separated HMAC calculation without allocating intermediate strings.
     fn compute_hmac(&self, tag_prefix: &str, raw_pii: &str) -> [u8; 32] {
-        let mut mac = HmacSha256::new_from_slice(&*self.session_key).expect("HMAC key length valid");
+        let mut mac =
+            HmacSha256::new_from_slice(&*self.session_key).expect("HMAC key length valid");
         mac.update(tag_prefix.as_bytes());
         mac.update(&[0u8]);
         for b in raw_pii.trim().bytes() {
@@ -273,8 +280,7 @@ impl PiiSessionVault {
                 // Potential token start
                 let start = i;
                 let mut end = None;
-                for j in (start + 1)..bytes.len() {
-                    let b = bytes[j];
+                for (j, &b) in bytes.iter().enumerate().skip(start + 1) {
                     if b == b'>' {
                         end = Some(j);
                         break;
@@ -332,7 +338,9 @@ impl PiiSessionVault {
                     self.check_exfiltration(s)?;
                 } else {
                     // Check if string leaf itself is nested JSON
-                    if (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']')) {
+                    if (s.starts_with('{') && s.ends_with('}'))
+                        || (s.starts_with('[') && s.ends_with(']'))
+                    {
                         if let Ok(mut inner_val) = serde_json::from_str::<serde_json::Value>(s) {
                             self.rehydrate_json_value(&mut inner_val, trust_level)?;
                             if let Ok(serialized) = serde_json::to_string(&inner_val) {

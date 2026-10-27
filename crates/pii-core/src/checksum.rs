@@ -2,16 +2,12 @@
 /// 11-19 (Sumatra), 21 (Kep. Riau), 31-36 (Java), 51-53 (Bali/Nusa Tenggara),
 /// 61-65 (Kalimantan), 71-76 (Sulawesi), 81-82 (Maluku), 91-96 (Papua).
 pub const VALID_INDONESIAN_PROVINCES: [u8; 38] = [
-    11, 12, 13, 14, 15, 16, 17, 18, 19, 21,
-    31, 32, 33, 34, 35, 36,
-    51, 52, 53,
-    61, 62, 63, 64, 65,
-    71, 72, 73, 74, 75, 76,
-    81, 82,
-    91, 92, 93, 94, 95, 96,
+    11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 31, 32, 33, 34, 35, 36, 51, 52, 53, 61, 62, 63, 64, 65,
+    71, 72, 73, 74, 75, 76, 81, 82, 91, 92, 93, 94, 95, 96,
 ];
 
 /// Validates credit card numbers using the Luhn algorithm (mod 10).
+///
 /// Enforces:
 /// - First and last bytes must be ASCII digits (no leading/trailing separators)
 /// - Rejects consecutive spaces or hyphens (`--`, `  `)
@@ -60,7 +56,7 @@ pub fn validate_luhn(input: &str) -> bool {
         double = !double;
     }
 
-    (13..=19).contains(&digit_count) && sum > 0 && sum % 10 == 0
+    (13..=19).contains(&digit_count) && sum > 0 && sum.is_multiple_of(10)
 }
 
 /// Validates an Indonesian 16-digit NIK (Nomor Induk Kependudukan).
@@ -106,7 +102,11 @@ pub fn validate_indonesian_nik(input: &str) -> bool {
         4 | 6 | 9 | 11 => 30,
         2 => {
             // NIK YY represents either 19YY or 20YY. A 2-digit year YY is a leap year if YY % 4 == 0.
-            if year % 4 == 0 { 29 } else { 28 }
+            if year.is_multiple_of(4) {
+                29
+            } else {
+                28
+            }
         }
         _ => return false,
     };
@@ -125,6 +125,7 @@ pub fn validate_indonesian_nik(input: &str) -> bool {
 /// - 15-digit unformatted (`012345678123000`)
 /// - 16-digit unformatted (`0012345678123000` under PMK 112/2022 NITKU)
 /// - Formatted (`01.234.567.8-123.000`)
+///
 /// Enforces:
 /// - Valid taxpayer category prefix (01..=09)
 /// - Non-zero 6-digit taxpayer serial
@@ -156,7 +157,11 @@ pub fn validate_indonesian_npwp(input: &str) -> bool {
     // Offset for 16-digit format with leading 0
     let offset = if count == 16 {
         // If 16 digits, first digit is typically 0, and digits 1..3 form the 01-09 category
-        if digits[0] == 0 { 1 } else { 0 }
+        if digits[0] == 0 {
+            1
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -167,19 +172,26 @@ pub fn validate_indonesian_npwp(input: &str) -> bool {
     }
 
     // Taxpayer serial (digits 2..8)
-    let serial_sum: u32 = digits[offset + 2..offset + 8].iter().map(|&d| d as u32).sum();
+    let serial_sum: u32 = digits[offset + 2..offset + 8]
+        .iter()
+        .map(|&d| d as u32)
+        .sum();
     if serial_sum == 0 {
         return false;
     }
 
     // KPP code (digits 9..12)
-    let kpp = digits[offset + 9] as u32 * 100 + digits[offset + 10] as u32 * 10 + digits[offset + 11] as u32;
+    let kpp = digits[offset + 9] as u32 * 100
+        + digits[offset + 10] as u32 * 10
+        + digits[offset + 11] as u32;
     if kpp == 0 {
         return false;
     }
 
     // Branch code (digits 12..15)
-    let branch = digits[offset + 12] as u32 * 100 + digits[offset + 13] as u32 * 10 + digits[offset + 14] as u32;
+    let branch = digits[offset + 12] as u32 * 100
+        + digits[offset + 13] as u32 * 10
+        + digits[offset + 14] as u32;
     if branch > 999 {
         return false;
     }
@@ -241,7 +253,7 @@ pub fn validate_indonesian_phone(input: &str) -> bool {
         }
         let pfx2 = digits[start_idx + 1];
         let pfx3 = digits[start_idx + 2];
-        let pfx = pfx2 * 10 + pfx3;
+        let _pfx = pfx2 * 10 + pfx3;
         // Valid Indonesian mobile prefixes (81x, 82x, 83x, 85x, 87x, 88x, 89x)
         match pfx2 {
             1 => (1..=9).contains(&pfx3),
@@ -261,7 +273,12 @@ pub fn validate_indonesian_phone(input: &str) -> bool {
         let a1 = digits[start_idx];
         let a2 = digits[start_idx + 1];
         let area2 = a1 * 10 + a2;
-        matches!(area2, 21 | 22 | 24 | 31 | 61 | 71 | 75 | 77) || a1 == 2 || a1 == 3 || a1 == 4 || a1 == 5 || a1 == 9
+        matches!(area2, 21 | 22 | 24 | 31 | 61 | 71 | 75 | 77)
+            || a1 == 2
+            || a1 == 3
+            || a1 == 4
+            || a1 == 5
+            || a1 == 9
     }
 }
 
@@ -303,7 +320,8 @@ pub fn validate_us_ssn(input: &str) -> bool {
         return false;
     }
 
-    let serial = digits[5] as u32 * 1000 + digits[6] as u32 * 100 + digits[7] as u32 * 10 + digits[8] as u32;
+    let serial =
+        digits[5] as u32 * 1000 + digits[6] as u32 * 100 + digits[7] as u32 * 10 + digits[8] as u32;
     if serial == 0 {
         return false;
     }
@@ -454,7 +472,15 @@ pub fn validate_e164_phone(input: &str) -> bool {
 pub fn is_known_validator(name: &str) -> bool {
     matches!(
         name,
-        "" | "none" | "luhn" | "id_nik" | "id_npwp" | "id_phone" | "us_ssn" | "iban_mod97" | "sg_nric" | "e164_phone"
+        "" | "none"
+            | "luhn"
+            | "id_nik"
+            | "id_npwp"
+            | "id_phone"
+            | "us_ssn"
+            | "iban_mod97"
+            | "sg_nric"
+            | "e164_phone"
     )
 }
 

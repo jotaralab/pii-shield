@@ -42,7 +42,8 @@ impl StreamingRehydrator {
                 self.in_tag = false;
             } else if self.in_tag {
                 // Validate uppercase token alphabet: A-Z, 0-9, _, :
-                let is_valid_char = ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_' || ch == ':';
+                let is_valid_char =
+                    ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_' || ch == ':';
 
                 if !is_valid_char || self.buffer.len() > 160 {
                     // Not a valid token character, immediately flush buffer + ch
@@ -91,7 +92,10 @@ mod tests {
         let c2 = stream.push_chunk("AIL_", &vault);
         let c3 = stream.push_chunk("1> sekarang.", &vault);
 
-        assert_eq!(format!("{}{}{}", c1, c2, c3), " Dikirim ke budi@jotaralab.com sekarang.");
+        assert_eq!(
+            format!("{}{}{}", c1, c2, c3),
+            " Dikirim ke budi@jotaralab.com sekarang."
+        );
     }
 
     #[test]

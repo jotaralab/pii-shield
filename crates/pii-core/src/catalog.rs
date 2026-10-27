@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 pub const GLOBAL_TOML: &str = include_str!("../rules/global.toml");
 pub const ID_TOML: &str = include_str!("../rules/id.toml");
@@ -6,16 +7,46 @@ pub const US_TOML: &str = include_str!("../rules/us.toml");
 pub const EU_TOML: &str = include_str!("../rules/eu.toml");
 pub const SG_TOML: &str = include_str!("../rules/sg.toml");
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum CatalogError {
-    #[error("TOML parse error: {0}")]
-    ParseError(#[from] toml::de::Error),
-    #[error("Rule limit exceeded: maximum {0} rules allowed")]
+    ParseError(toml::de::Error),
     RuleLimitExceeded(usize),
-    #[error("Regex pattern length limit exceeded for rule {0}: maximum {1} bytes allowed")]
     PatternTooLong(String, usize),
-    #[error("Unknown validator '{0}' in rule '{1}'")]
     UnknownValidator(String, String),
+}
+
+impl fmt::Display for CatalogError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CatalogError::ParseError(e) => write!(f, "TOML parse error: {}", e),
+            CatalogError::RuleLimitExceeded(max) => {
+                write!(f, "Rule limit exceeded: maximum {} rules allowed", max)
+            }
+            CatalogError::PatternTooLong(id, max) => write!(
+                f,
+                "Regex pattern length limit exceeded for rule {}: maximum {} bytes allowed",
+                id, max
+            ),
+            CatalogError::UnknownValidator(val, id) => {
+                write!(f, "Unknown validator '{}' in rule '{}'", val, id)
+            }
+        }
+    }
+}
+
+impl std::error::Error for CatalogError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CatalogError::ParseError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<toml::de::Error> for CatalogError {
+    fn from(err: toml::de::Error) -> Self {
+        CatalogError::ParseError(err)
+    }
 }
 
 /// A declarative PII rule specification.

@@ -85,7 +85,8 @@ impl Default for PiiScanner {
 impl PiiScanner {
     /// Creates a scanner with default global and Indonesian rules.
     pub fn new() -> Self {
-        let catalog = PiiCatalog::with_locales(&["global", "id"]).expect("Failed to load default catalogs");
+        let catalog =
+            PiiCatalog::with_locales(&["global", "id"]).expect("Failed to load default catalogs");
         Self::from_catalog(&catalog).expect("Failed to compile default rules")
     }
 
@@ -103,7 +104,7 @@ impl PiiScanner {
             let rule_regex = Regex::builder()
                 .configure(meta_config.clone())
                 .build(&rule.regex)
-                .map_err(|e| format!("Invalid regex for rule {}: {}", rule.id, e))?;
+                .map_err(|e| format!("Invalid regex for rule {}: {:?}", rule.id, e))?;
 
             compiled_rules.push(CompiledRule {
                 entity_type: EntityType::from_tag_prefix(&rule.tag_prefix),
@@ -211,6 +212,9 @@ fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     haystack.windows(needle.len()).any(|window| {
-        window.iter().zip(needle.iter()).all(|(&h, &n)| h.to_ascii_lowercase() == n.to_ascii_lowercase())
+        window
+            .iter()
+            .zip(needle.iter())
+            .all(|(&h, &n)| h.eq_ignore_ascii_case(&n))
     })
 }

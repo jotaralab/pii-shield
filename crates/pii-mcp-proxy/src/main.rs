@@ -170,7 +170,10 @@ fn main() {
             }
             "--locales" => {
                 if i + 1 < args.len() {
-                    locales = args[i + 1].split(',').map(|s| s.trim().to_string()).collect();
+                    locales = args[i + 1]
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect();
                     i += 1;
                 }
             }
@@ -205,7 +208,8 @@ fn main() {
             if key_bytes.len() == 32 {
                 let mut k = [0u8; 32];
                 k.copy_from_slice(&key_bytes);
-                vault = PiiSessionVault::with_key(pii_core::SecurityPolicy::IndonesiaUuPdpStrict, k);
+                vault =
+                    PiiSessionVault::with_key(pii_core::SecurityPolicy::IndonesiaUuPdpStrict, k);
             }
         }
     }

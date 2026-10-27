@@ -1,3 +1,5 @@
+#![allow(clippy::missing_safety_doc)]
+
 use pii_core::{PiiCatalog, PiiSessionVault, SecurityPolicy, StreamingRehydrator, ToolTrustLevel};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -149,7 +151,9 @@ pub unsafe extern "C" fn pii_string_free(s: *mut c_char) {
 #[no_mangle]
 pub extern "C" fn pii_stream_new() -> *mut PiiStreamHandle {
     catch_unwind(AssertUnwindSafe(|| {
-        Box::into_raw(Box::new(PiiStreamHandle(Mutex::new(StreamingRehydrator::new()))))
+        Box::into_raw(Box::new(PiiStreamHandle(Mutex::new(
+            StreamingRehydrator::new(),
+        ))))
     }))
     .unwrap_or(ptr::null_mut())
 }

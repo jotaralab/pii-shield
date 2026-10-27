@@ -17,7 +17,7 @@ homepage = "https://jotaralab.com"
 description = "Sub-millisecond, stateful PII redaction & reversible pseudonymization engine for AI agents and edge runtimes."
 
 [workspace.dependencies]
-regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "dfa-build", "dfa-search", "hybrid", "meta", "nfa-pikevm"] }
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "dfa-build", "dfa-search", "hybrid", "meta", "nfa-pikevm", "unicode-word-boundary"] }
 ahash = { version = "0.8", default-features = false, features = ["std", "compile-time-rng"] }
 zeroize = { version = "1.8", features = ["derive"] }
 hmac = "0.12"

@@ -5,7 +5,8 @@ use std::time::Instant;
 fn main() {
     println!("=== PII-SHIELD LATENCY BENCHMARKS ===");
 
-    let catalog = PiiCatalog::with_locales(&["global", "id", "us", "eu", "sg"]).expect("Catalog load");
+    let catalog =
+        PiiCatalog::with_locales(&["global", "id", "us", "eu", "sg"]).expect("Catalog load");
     let scanner = PiiScanner::from_catalog(&catalog).expect("Scanner build");
     let mut vault = PiiSessionVault::new(SecurityPolicy::IndonesiaUuPdpStrict);
 
