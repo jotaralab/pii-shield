@@ -13,6 +13,9 @@ pub enum CatalogError {
     RuleLimitExceeded(usize),
     PatternTooLong(String, usize),
     UnknownValidator(String, String),
+    UnknownLocale(String),
+    InvalidTagPrefix(String),
+    InvalidRegex { id: String, err: String },
 }
 
 impl fmt::Display for CatalogError {
@@ -29,6 +32,19 @@ impl fmt::Display for CatalogError {
             ),
             CatalogError::UnknownValidator(val, id) => {
                 write!(f, "Unknown validator '{}' in rule '{}'", val, id)
+            }
+            CatalogError::UnknownLocale(loc) => write!(
+                f,
+                "Unknown locale '{}': expected one of global, id, us, eu, sg, 'none', or a .toml rules file path",
+                loc
+            ),
+            CatalogError::InvalidTagPrefix(prefix) => write!(
+                f,
+                "Invalid tag_prefix '{}': must be non-empty and contain only ASCII uppercase letters, digits, and underscores",
+                prefix
+            ),
+            CatalogError::InvalidRegex { id, err } => {
+                write!(f, "Invalid regex for rule {}: {}", id, err)
             }
         }
     }
@@ -107,7 +123,7 @@ impl PiiCatalog {
                 "us" => catalog.merge_toml_str(US_TOML)?,
                 "eu" => catalog.merge_toml_str(EU_TOML)?,
                 "sg" => catalog.merge_toml_str(SG_TOML)?,
-                _ => {}
+                other => return Err(CatalogError::UnknownLocale(other.to_string())),
             }
         }
         Ok(catalog)
@@ -126,6 +142,24 @@ impl PiiCatalog {
             if !crate::checksum::is_known_validator(&rule.validator) {
                 return Err(CatalogError::UnknownValidator(rule.validator, rule.id));
             }
+            if rule.tag_prefix.is_empty()
+                || !rule
+                    .tag_prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            {
+                return Err(CatalogError::InvalidTagPrefix(rule.tag_prefix));
+            }
+            // Fail fast on regexes that `PiiScanner` cannot compile.
+            let probe_catalog = PiiCatalog {
+                rules: vec![rule.clone()],
+            };
+            if let Err(err) = crate::scanner::PiiScanner::from_catalog(&probe_catalog) {
+                return Err(CatalogError::InvalidRegex {
+                    id: rule.id.clone(),
+                    err,
+                });
+            }
             // Overwrite existing rule if same ID, or append
             if let Some(pos) = self.rules.iter().position(|r| r.id == rule.id) {
                 self.rules[pos] = rule;
@@ -141,5 +175,69 @@ impl PiiCatalog {
         let mut catalog = Self::new();
         catalog.merge_toml_str(toml_str)?;
         Ok(catalog)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_with_locales_rejects_unknown_locale() {
+        assert!(matches!(
+            PiiCatalog::with_locales(&["global_typo"]),
+            Err(CatalogError::UnknownLocale(_))
+        ));
+        assert!(PiiCatalog::with_locales(&["global", "id"]).is_ok());
+    }
+
+    #[test]
+    fn test_merge_rejects_bad_tag_prefix() {
+        let mut catalog = PiiCatalog::new();
+        let err = catalog.merge_toml_str(
+            r#"
+locale = "x"
+name = "X"
+
+[[rules]]
+id = "X1"
+tag_prefix = "br_cpf"
+regex = "\\d+"
+"#,
+        );
+        assert!(matches!(err, Err(CatalogError::InvalidTagPrefix(_))));
+
+        let mut catalog = PiiCatalog::new();
+        let err = catalog.merge_toml_str(
+            r#"
+locale = "x"
+name = "X"
+
+[[rules]]
+id = "X1"
+tag_prefix = ""
+regex = "\\d+"
+"#,
+        );
+        assert!(matches!(err, Err(CatalogError::InvalidTagPrefix(_))));
+    }
+
+    #[test]
+    fn test_merge_rejects_invalid_regex() {
+        let mut catalog = PiiCatalog::new();
+        let err = catalog.merge_toml_str(
+            r#"
+locale = "x"
+name = "X"
+
+[[rules]]
+id = "BAD"
+tag_prefix = "BAD"
+regex = '(unbalanced['
+"#,
+        );
+        assert!(
+            matches!(err, Err(CatalogError::InvalidRegex { ref id, .. }) if id == "BAD")
+        );
     }
 }

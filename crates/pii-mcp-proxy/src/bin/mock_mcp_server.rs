@@ -51,14 +51,17 @@ fn main() {
                     let resp = match tool_name {
                         "query_customer" => {
                             let nik = args.get("nik").and_then(|n| n.as_str()).unwrap_or("");
+                            let cpf = args.get("cpf").and_then(|n| n.as_str()).unwrap_or("");
+                            let has_token = args.to_string().contains('<');
                             serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
                                 "result": {
+                                    "child_saw_token": has_token,
                                     "content": [
                                         {
                                             "type": "text",
-                                            "text": format!("Customer found with NIK: {}, Mobile: 081234567890", nik)
+                                            "text": format!("Customer found with NIK: {}, CPF: {}, Mobile: 081234567890", nik, cpf)
                                         }
                                     ]
                                 }

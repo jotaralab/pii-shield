@@ -128,23 +128,32 @@ impl PiiSessionVault {
     pub fn from_catalog(catalog: PiiCatalog) -> Self {
         let mut key_bytes = [0u8; 32];
         getrandom::getrandom(&mut key_bytes).expect("OS CSPRNG unavailable");
-        let scanner = PiiScanner::from_catalog(&catalog).expect("Scanner compilation valid");
-        Self {
-            scanner,
-            forward_map: AHashMap::new(),
-            reverse_map: AHashMap::new(),
-            counters: AHashMap::new(),
-            dirty_tokens: Vec::new(),
-            session_key: Zeroizing::new(key_bytes),
-            policy: SecurityPolicy::IndonesiaUuPdpStrict,
-            token_format: TokenFormat::Sequential,
-        }
+        Self::try_from_catalog(catalog)
+            .map(|v| v.adopt_key(key_bytes))
+            .expect("Scanner compilation valid")
     }
 
     /// Creates a vault from an explicit PiiCatalog and explicit 32-byte key.
     pub fn from_catalog_with_key(catalog: PiiCatalog, key: [u8; 32]) -> Self {
-        let scanner = PiiScanner::from_catalog(&catalog).expect("Scanner compilation valid");
-        Self {
+        Self::try_from_catalog_with_key(catalog, key).expect("Scanner compilation valid")
+    }
+
+    /// Fallibly creates a vault from an explicit PiiCatalog and OS CSPRNG key,
+    /// returning an error instead of panicking when the catalog fails to compile.
+    pub fn try_from_catalog(catalog: PiiCatalog) -> Result<Self, String> {
+        let mut key_bytes = [0u8; 32];
+        getrandom::getrandom(&mut key_bytes).expect("OS CSPRNG unavailable");
+        Self::try_from_catalog_with_key(catalog, key_bytes)
+    }
+
+    /// Fallibly creates a vault from an explicit PiiCatalog and explicit 32-byte key,
+    /// returning an error instead of panicking when the catalog fails to compile.
+    pub fn try_from_catalog_with_key(
+        catalog: PiiCatalog,
+        key: [u8; 32],
+    ) -> Result<Self, String> {
+        let scanner = PiiScanner::from_catalog(&catalog)?;
+        Ok(Self {
             scanner,
             forward_map: AHashMap::new(),
             reverse_map: AHashMap::new(),
@@ -153,8 +162,15 @@ impl PiiSessionVault {
             session_key: Zeroizing::new(key),
             policy: SecurityPolicy::IndonesiaUuPdpStrict,
             token_format: TokenFormat::Sequential,
-        }
+        })
     }
+
+    /// Replaces the internal session key (internal helper used by fallible constructors).
+    fn adopt_key(mut self, key: [u8; 32]) -> Self {
+        self.session_key = Zeroizing::new(key);
+        self
+    }
+
 
     /// Returns the active token format.
     pub fn token_format(&self) -> TokenFormat {
@@ -1295,4 +1311,23 @@ mod tests {
         let restored = vault_b.rehydrate(&scrubbed);
         assert_eq!(restored, "NIK: 3573012203950001");
     }
+}
+
+#[test]
+fn test_try_from_catalog_fails_on_invalid_regex() {
+    // Bypass merge_toml_str's own regex validation to exercise the scanner path.
+    let catalog = crate::catalog::PiiCatalog {
+        rules: vec![crate::catalog::PiiRuleSpec {
+            id: "BAD".to_string(),
+            tag_prefix: "BAD".to_string(),
+            description: String::new(),
+            regex: "(unbalanced[".to_string(),
+            validator: "none".to_string(),
+            priority: 50,
+            context_keywords: vec![],
+            valid_samples: vec![],
+            invalid_samples: vec![],
+        }],
+    };
+    let res = PiiSessionVault::try_from_catalog(catalog);
 }
