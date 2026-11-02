@@ -307,18 +307,29 @@ fn test_untrusted_exfiltration_blocking_on_custom_rules() {
     let mut reader = BufReader::new(proxy_proc.stdout.take().expect("stdout"));
     let mut buf = String::new();
 
-    // 1. Outbound redaction: --locales none must not disable custom rules.
+    // 1. Outbound redaction: --locales none must activate ONLY the custom
+    //    rule while leaving built-in NIK/PHONE rules unloaded.
     //    (Trusted tool so inbound raw PII rehydration passes through; the raw
     //    echo back is redacted outbound into sequential tokens.)
     let _ = writeln!(
         stdin,
-        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"query_customer","arguments":{{"cpf":"123.456.789-00"}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"query_customer","arguments":{{"nik":"3573012203950001","cpf":"123.456.789-00"}}}}}}"#
     );
     stdin.flush().unwrap();
     reader.read_line(&mut buf).unwrap();
     assert!(
-        buf.contains("<BR_CPF_1>"),
+        buf.contains("<BR_CPF_1>") && !buf.contains("123.456.789-00"),
         "--locales none + --rules-file must isolate to custom rules and still redact: {}",
+        buf
+    );
+    assert!(
+        buf.contains("3573012203950001") && !buf.contains("<ID_NIK"),
+        "-locale none must suppress built-in NIK redaction while keeping the custom rule: {}",
+        buf
+    );
+    assert!(
+        buf.contains("081234567890") && !buf.contains("<PHONE_ID"),
+        "--locales none must leave built-in PHONE_ID rules unloaded: {}",
         buf
     );
 
@@ -430,13 +441,18 @@ fn test_fail_closed_exit_code_2() {
     assert!(stderr.contains("Unknown locale"), "stderr: {}", stderr);
     assert!(!stderr.contains("running"), "stderr: {}", stderr);
 
-    // 'none' with no rules file -> 0 rules fail-closed
-    let (stderr, code) = spawn_err_proxy(&["--locales", "none"], vec![]);
+    // 'none' with no rules file -> 0 rules fail-closed (reaches build_vault
+    // by passing a child command; otherwise implicit filter mode rejects first)
+    let mock_bin = env!("CARGO_BIN_EXE_mock_mcp_server");
+    let (stderr, code) = spawn_err_proxy(&["--locales", "none", "--", mock_bin], vec![]);
     assert_eq!(code, 2, "empty catalog must exit 2 (stderr: {})", stderr);
     assert!(stderr.contains("0 rules"), "stderr: {}", stderr);
 
-    // Missing rules file
-    let (stderr, code) = spawn_err_proxy(&["--rules-file", "/nonexistent/rules.toml"], vec![]);
+    // Missing rules file (child command needed to pass filter-mode validation)
+    let (stderr, code) = spawn_err_proxy(
+        &["--rules-file", "/nonexistent/rules.toml", "--", mock_bin],
+        vec![],
+    );
     assert_eq!(code, 2);
     assert!(
         stderr.contains("Cannot read rules file"),
@@ -446,7 +462,10 @@ fn test_fail_closed_exit_code_2() {
 
     // Malformed regex in rules file
     let bad_path = write_temp_rules_file(BAD_REGEX_TOML, "bad_regex");
-    let (stderr, code) = spawn_err_proxy(&["--rules-file", bad_path.to_str().unwrap()], vec![]);
+    let (stderr, code) = spawn_err_proxy(
+        &["--rules-file", bad_path.to_str().unwrap(), "--", mock_bin],
+        vec![],
+    );
     assert_eq!(code, 2, "invalid regex must exit 2 (stderr: {})", stderr);
     assert!(
         stderr.contains("Invalid regex for rule BAD_RE"),
@@ -555,4 +574,22 @@ fn test_fail_closed_exit_code_2() {
     assert_eq!(code, 0);
     let (_stderr, code) = spawn_err_proxy(&["--version"], vec![]);
     assert_eq!(code, 0);
+
+    // Implicit filter mode (no child command, no stateless config) is rejected
+    let (stderr, code) = spawn_err_proxy(&[], vec![]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("stateless-sealed"),
+        "Implicit filter mode must require stateless-sealed tokens: {}",
+        stderr
+    );
+
+    // Stateless-sealed still requires the env key in implicit filter mode
+    let (stderr, code) = spawn_err_proxy(&["--token-format", "stateless-sealed"], vec![]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("PII_SHIELD_SESSION_KEY"),
+        "stderr: {}",
+        stderr
+    );
 }

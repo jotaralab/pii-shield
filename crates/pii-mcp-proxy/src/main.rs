@@ -344,24 +344,22 @@ pub fn parse_cli_and_env(
             token_format = Some(parse_token_format(fmt.trim())?);
         }
     }
-    if token_format.is_none()
-        && env_vars.get("PII_SHIELD_STATELESS").map(|s| s.as_str()) == Some("1")
-    {
-        token_format = Some(ProxyTokenFormat::StatelessSealed);
-    }
-
-    // PII_SHIELD_STATELESS: strictly validated boolean-style alias.
-    if token_format.is_none() {
-        if let Some(stateless) = env_vars.get("PII_SHIELD_STATELESS") {
-            match stateless.trim() {
-                "1" | "true" => token_format = Some(ProxyTokenFormat::StatelessSealed),
-                "0" | "false" | "" => {}
-                other => {
-                    return Err(format!(
+    // PII_SHIELD_STATELESS: validated unconditionally (fail closed on
+    // invalid values even when --token-format / PII_SHIELD_TOKEN_FORMAT is
+    // also present); applied only when no other token format was set.
+    if let Some(stateless) = env_vars.get("PII_SHIELD_STATELESS") {
+        match stateless.trim() {
+            "1" | "true" => {
+                if token_format.is_none() {
+                    token_format = Some(ProxyTokenFormat::StatelessSealed);
+                }
+            }
+            "0" | "false" | "" => {}
+            other => {
+                return Err(format!(
                     "Invalid PII_SHIELD_STATELESS value '{}': expected 1, true, 0, false, or empty",
                     other
                 ))
-                }
             }
         }
     }
@@ -392,37 +390,34 @@ pub fn parse_cli_and_env(
     }
     let locales = if none_requested { Vec::new() } else { builtins };
 
-    // Fail closed: explicitly-requested --stdio-filter mode performs no
-    // outbound redaction, so stateful tokens (sequential / compact-hash) can
-    // never be generated there, and stateless-sealed tokens cannot decrypt
-    // cross-invocation without a persistent key.
-    if stdio_filter {
-        if child_cmd_start.is_some() {
-            return Err(
-                "--stdio-filter cannot be combined with a child command; remove '--' or drop --stdio-filter"
-                    .to_string(),
-            );
-        }
+    // Fail closed: STDIO filter mode (explicit --stdio-filter, or implicit
+    // when no child command is given) performs no outbound redaction, so
+    // stateful tokens (sequential / compact-hash) can never be generated
+    // there, and stateless-sealed tokens cannot decrypt cross-invocation
+    // without a persistent key.
+    if stdio_filter && child_cmd_start.is_some() {
+        return Err(
+            "--stdio-filter cannot be combined with a child command; remove '--' or drop --stdio-filter"
+                .to_string(),
+        );
+    }
+    if stdio_filter || child_cmd_start.is_none() {
+        let mode_name = if stdio_filter {
+            "--stdio-filter"
+        } else {
+            "STDIO filter mode (no child command)"
+        };
         if token_format != Some(ProxyTokenFormat::StatelessSealed) {
-            return Err(
-                "--stdio-filter requires --token-format stateless-sealed (stateful tokens cannot be generated in filter mode)"
-                    .to_string(),
-            );
+            return Err(format!(
+                "{} requires --token-format stateless-sealed (stateful tokens cannot be generated in filter mode)",
+                mode_name
+            ));
         }
         if session_key.is_none() {
-            return Err(
-                "--stdio-filter with stateless-sealed tokens requires PII_SHIELD_SESSION_KEY"
-                    .to_string(),
-            );
-        }
-    } else if child_cmd_start.is_none() && token_format == Some(ProxyTokenFormat::StatelessSealed) {
-        // Implicit filter mode (no child command): stateless-sealed without a
-        // key cannot decrypt tokens across invocations.
-        if session_key.is_none() {
-            return Err(
-                "stateless-sealed token format without a child command requires PII_SHIELD_SESSION_KEY"
-                    .to_string(),
-            );
+            return Err(format!(
+                "{} with stateless-sealed tokens requires PII_SHIELD_SESSION_KEY",
+                mode_name
+            ));
         }
     }
 
@@ -484,7 +479,8 @@ OPTIONS:
     --locales <list>           Comma-separated built-in locales (global, id, us, eu, sg),
                                'none', or .toml rules file paths [default: global,id]
     --rules-file <path>        External TOML rules file (repeatable or comma-separated)
-    --stdio-filter             Run in pure STDIO filtering mode (no child command)
+    --stdio-filter             Run in pure STDIO filtering mode (no child command);
+                               requires stateless-sealed tokens + PII_SHIELD_SESSION_KEY
     --token-format <fmt>       sequential | compact-hash | stateless-sealed
     -h, --help                 Show this help
     -V, --version              Show version
@@ -495,7 +491,8 @@ ENVIRONMENT:
     PII_SHIELD_STATELESS=1     Alias for --token-format stateless-sealed
 
 Fail-closed: unknown flags, invalid rules, unknown locales, or an empty catalog
-exits with status code 2.
+exits with status code 2. Running without a child command enters STDIO filter
+mode, which requires --token-format stateless-sealed and PII_SHIELD_SESSION_KEY.
 ";
 
 fn main() {
@@ -636,16 +633,18 @@ fn main() {
         }
     });
 
-    let _ = t1.join();
+    // Join the child->host reader first (it stops on child EOF), reap the
+    // child, and propagate a non-zero child exit code immediately — this
+    // avoids blocking on t1 if the child died while host stdin is still open.
     let _ = t2.join();
-    // Propagate the child's exit code so hosts observe child failures.
-    let status = match child.wait() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+    match child.wait() {
+        Ok(status) if !status.success() => {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Ok(_) => {}
+        Err(_) => {}
     }
+    let _ = t1.join();
 }
 
 #[cfg(test)]

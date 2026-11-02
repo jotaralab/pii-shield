@@ -22,27 +22,25 @@ impl WasmPiiSession {
     }
 
     #[wasm_bindgen]
-    pub fn with_locales(locales: &str) -> Self {
+    pub fn with_locales(locales: &str) -> Result<WasmPiiSession, JsValue> {
+        // Fail closed: empty locale lists and unknown locale names are
+        // rejected instead of silently producing a 0-rule (fail-open) vault
+        // or substituting the default catalog.
         let loc_vec: Vec<&str> = locales
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
-        // Fail closed: on an unknown locale fall back to the strict default
-        // policy rather than an empty (0-rule) catalog that redacts nothing.
-        let fallback = PiiCatalog::with_locales(&["global", "id"]);
-        let catalog = if loc_vec.is_empty() {
-            fallback
-        } else {
-            PiiCatalog::with_locales(&loc_vec).or(fallback)
-        };
-        let catalog = match catalog {
-            Ok(c) => c,
-            Err(_) => panic!("pii-wasm: built-in fallback catalogs failed to load"),
-        };
-        Self {
-            inner: PiiSessionVault::from_catalog(catalog),
+        if loc_vec.is_empty() {
+            return Err(JsValue::from_str(
+                "No valid locales specified: expected comma-separated names like 'global,id'",
+            ));
         }
+        let catalog = PiiCatalog::with_locales(&loc_vec)
+            .map_err(|e| JsValue::from_str(&format!("Invalid locales '{}': {}", locales, e)))?;
+        Ok(Self {
+            inner: PiiSessionVault::from_catalog(catalog),
+        })
     }
 
     #[wasm_bindgen(js_name = withLocalesAndKey)]
@@ -58,8 +56,13 @@ impl WasmPiiSession {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
+        if loc_vec.is_empty() {
+            return Err(JsValue::from_str(
+                "No valid locales specified: expected comma-separated names like 'global,id'",
+            ));
+        }
         let catalog = PiiCatalog::with_locales(&loc_vec)
-            .map_err(|e| JsValue::from_str(&format!("Invalid locales '{}': {:?}", locales, e)))?;
+            .map_err(|e| JsValue::from_str(&format!("Invalid locales '{}': {}", locales, e)))?;
         Ok(Self {
             inner: PiiSessionVault::from_catalog_with_key(catalog, key_arr),
         })

@@ -15,7 +15,7 @@ pub enum CatalogError {
     UnknownValidator(String, String),
     UnknownLocale(String),
     InvalidTagPrefix(String),
-    InvalidRegex { id: String, err: String },
+    InvalidRegex(String),
 }
 
 impl fmt::Display for CatalogError {
@@ -43,8 +43,8 @@ impl fmt::Display for CatalogError {
                 "Invalid tag_prefix '{}': must be non-empty and contain only ASCII uppercase letters, digits, and underscores",
                 prefix
             ),
-            CatalogError::InvalidRegex { id, err } => {
-                write!(f, "Invalid regex for rule {}: {}", id, err)
+            CatalogError::InvalidRegex(err) => {
+                write!(f, "PII catalog rule regex invalid: {}", err)
             }
         }
     }
@@ -155,32 +155,30 @@ impl PiiCatalog {
             }
         }
 
-        // Phase 2: stage the merged rule set. The 256-rule cap only applies to
-        // *new* rule IDs; in-place overrides of an existing rule are exempt.
+        // Phase 2: stage the merged rule set directly. Existing IDs (both
+        // built-in and intra-TOML duplicates) are overridden in place by an
+        // earlier position match, so the *last* definition of an ID wins. The
+        // 256-rule cap only applies to genuinely new IDs.
         let mut staged = self.rules.clone();
-        let mut to_append = Vec::new();
         for rule in parsed.rules {
-            match staged.iter_mut().position(|r| r.id == rule.id) {
-                Some(pos) => staged[pos] = rule,
-                None => to_append.push(rule),
+            if let Some(pos) = staged.iter().position(|r| r.id == rule.id) {
+                staged[pos] = rule;
+            } else {
+                if staged.len() >= 256 {
+                    return Err(CatalogError::RuleLimitExceeded(256));
+                }
+                staged.push(rule);
             }
         }
-        if staged.len() + to_append.len() > 256 {
-            return Err(CatalogError::RuleLimitExceeded(256));
-        }
-        staged.extend(to_append);
 
         // Phase 3: fail fast on regexes the combined catalog cannot compile
-        // (also enforces combined multi-pattern NFA/DFA size limits).
+        // (also enforces combined multi-pattern NFA/DFA size limits). The
+        // error string already identifies the offending rule id.
         let staged_catalog = PiiCatalog {
             rules: staged.clone(),
         };
         if let Err(err) = crate::scanner::PiiScanner::from_catalog(&staged_catalog) {
-            let id = err
-                .strip_prefix("Invalid regex for rule ")
-                .and_then(|rest| rest.find(':').map(|idx| rest[..idx].to_string()))
-                .unwrap_or_else(|| "<combined>".to_string());
-            return Err(CatalogError::InvalidRegex { id, err });
+            return Err(CatalogError::InvalidRegex(err));
         }
 
         // Phase 4: atomic commit.
@@ -254,6 +252,6 @@ tag_prefix = "BAD"
 regex = '(unbalanced['
 "#,
         );
-        assert!(matches!(err, Err(CatalogError::InvalidRegex { ref id, .. }) if id == "BAD"));
+        assert!(matches!(err, Err(CatalogError::InvalidRegex(ref msg)) if msg.contains("BAD")));
     }
 }

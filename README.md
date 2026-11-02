@@ -188,7 +188,10 @@ PII_SHIELD_STATELESS=1   # env alias for stateless-sealed when --token-format is
 non-empty uppercase `[A-Z0-9_]+`, the regex must compile with the scanner's
 syntax config (bounded NFA/DFA sizes), and `pii-mcp-proxy` refuses to start if
 the merged catalog would contain no rules — invalid configuration can never
-silently disable PII redaction.
+silently disable PII redaction. STDIO filter mode (`--stdio-filter`, or running
+without a child command) requires `--token-format stateless-sealed` plus
+`PII_SHIELD_SESSION_KEY`, since stateful tokens cannot be generated in
+a redaction-less filter pass.
 
 Run `pii-mcp-proxy --help` / `--version` for the full CLI reference.
 
