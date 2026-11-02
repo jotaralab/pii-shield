@@ -5,3 +5,4 @@ pkg/
 dist/
 .DS_Store
 .env
+.plans/
