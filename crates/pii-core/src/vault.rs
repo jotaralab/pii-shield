@@ -1326,4 +1326,9 @@ fn test_try_from_catalog_fails_on_invalid_regex() {
         }],
     };
     let res = PiiSessionVault::try_from_catalog(catalog);
+    let msg = match res {
+        Ok(_) => panic!("try_from_catalog must fail closed on bad regex"),
+        Err(e) => e,
+    };
+    assert!(msg.contains("BAD"), "Error must identify the rule: {}", msg);
 }
