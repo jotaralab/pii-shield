@@ -236,8 +236,6 @@ tag_prefix = "BAD"
 regex = '(unbalanced['
 "#,
         );
-        assert!(
-            matches!(err, Err(CatalogError::InvalidRegex { ref id, .. }) if id == "BAD")
-        );
+        assert!(matches!(err, Err(CatalogError::InvalidRegex { ref id, .. }) if id == "BAD"));
     }
 }

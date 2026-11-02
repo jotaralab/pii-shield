@@ -148,10 +148,7 @@ impl PiiSessionVault {
 
     /// Fallibly creates a vault from an explicit PiiCatalog and explicit 32-byte key,
     /// returning an error instead of panicking when the catalog fails to compile.
-    pub fn try_from_catalog_with_key(
-        catalog: PiiCatalog,
-        key: [u8; 32],
-    ) -> Result<Self, String> {
+    pub fn try_from_catalog_with_key(catalog: PiiCatalog, key: [u8; 32]) -> Result<Self, String> {
         let scanner = PiiScanner::from_catalog(&catalog)?;
         Ok(Self {
             scanner,
@@ -170,7 +167,6 @@ impl PiiSessionVault {
         self.session_key = Zeroizing::new(key);
         self
     }
-
 
     /// Returns the active token format.
     pub fn token_format(&self) -> TokenFormat {

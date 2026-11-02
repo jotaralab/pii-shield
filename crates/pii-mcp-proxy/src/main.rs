@@ -258,7 +258,10 @@ pub fn parse_cli_and_env(
                 for seg in raw.split(',') {
                     let seg = seg.trim();
                     if seg.is_empty() {
-                        return Err(format!("Empty rules file segment in --rules-file '{}'", raw));
+                        return Err(format!(
+                            "Empty rules file segment in --rules-file '{}'",
+                            raw
+                        ));
                     }
                     rules_files.push(seg.to_string());
                 }
@@ -297,8 +300,8 @@ pub fn parse_cli_and_env(
         if key_hex.is_empty() {
             return Err("PII_SHIELD_SESSION_KEY is set but empty".to_string());
         }
-        let bytes = hex::decode(key_hex)
-            .map_err(|e| format!("Invalid PII_SHIELD_SESSION_KEY: {}", e))?;
+        let bytes =
+            hex::decode(key_hex).map_err(|e| format!("Invalid PII_SHIELD_SESSION_KEY: {}", e))?;
         if bytes.len() != 32 {
             return Err(format!(
                 "Invalid PII_SHIELD_SESSION_KEY: expected 32 bytes of hex (64 chars), got {} bytes",
@@ -316,7 +319,8 @@ pub fn parse_cli_and_env(
             token_format = Some(parse_token_format(fmt.trim())?);
         }
     }
-    if token_format.is_none() && env_vars.get("PII_SHIELD_STATELESS").map(|s| s.as_str()) == Some("1")
+    if token_format.is_none()
+        && env_vars.get("PII_SHIELD_STATELESS").map(|s| s.as_str()) == Some("1")
     {
         token_format = Some(ProxyTokenFormat::StatelessSealed);
     }
@@ -332,9 +336,7 @@ pub fn parse_cli_and_env(
             // Explicit opt-out of built-in locales.
             builtins.clear();
             if locales.len() > 1 {
-                return Err(
-                    "'none' must not be combined with other locales".to_string(),
-                );
+                return Err("'none' must not be combined with other locales".to_string());
             }
         } else {
             if !BUILTIN_LOCALES.contains(&loc.as_str()) {
@@ -363,12 +365,7 @@ pub fn parse_cli_and_env(
         );
     }
 
-    let child_cmd = child_cmd_start.map(|idx| {
-        (
-            args[idx].clone(),
-            args[idx + 1..].to_vec(),
-        )
-    });
+    let child_cmd = child_cmd_start.map(|idx| (args[idx].clone(), args[idx + 1..].to_vec()));
 
     Ok(ProxyAction::Run(ProxyConfig {
         trusted_tools,
@@ -388,13 +385,12 @@ pub fn build_vault(config: &ProxyConfig) -> Result<PiiSessionVault, String> {
     let mut catalog = if loc_refs.is_empty() {
         PiiCatalog::new()
     } else {
-        PiiCatalog::with_locales(&loc_refs)
-            .map_err(|e| format!("Failed to load locales: {}", e))?
+        PiiCatalog::with_locales(&loc_refs).map_err(|e| format!("Failed to load locales: {}", e))?
     };
 
     for path in &config.rules_files {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("Cannot read rules file '{}': {}", path, e))?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Cannot read rules file '{}': {}", path, e))?;
         catalog
             .merge_toml_str(&content)
             .map_err(|e| format!("Invalid rules file '{}': {}", path, e))?;
@@ -402,8 +398,7 @@ pub fn build_vault(config: &ProxyConfig) -> Result<PiiSessionVault, String> {
 
     if catalog.rules.is_empty() {
         return Err(
-            "Fail-closed: merged PII catalog contains 0 rules; refusing to start proxy"
-                .to_string(),
+            "Fail-closed: merged PII catalog contains 0 rules; refusing to start proxy".to_string(),
         );
     }
 

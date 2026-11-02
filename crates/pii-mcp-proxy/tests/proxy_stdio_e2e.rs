@@ -129,7 +129,9 @@ fn spawn_err_proxy(args: &[&str], envs: Vec<(&str, &str)>) -> (String, i32) {
     for (k, v) in &envs {
         cmd.env(k, v);
     }
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut proc = cmd.spawn().expect("Spawn proxy");
     drop(proc.stdin.take());
     let mut stderr = String::new();
@@ -255,10 +257,17 @@ fn test_token_format_compact_hash() {
     // suffix, not the sequential "<ID_NIK_1>").
     let idx = buf.find("<ID_NIK_").expect("Token must exist");
     let token_start = idx;
-    let token_end = buf[idx..].find('>').map(|e| idx + e).expect("Token terminator");
+    let token_end = buf[idx..]
+        .find('>')
+        .map(|e| idx + e)
+        .expect("Token terminator");
     let token_full = &buf[token_start..=token_end];
     let body = &token_full["<ID_NIK_".len()..token_full.len() - 1];
-    assert_ne!(body, "1", "Compact-hash must not be sequential: {}", token_full);
+    assert_ne!(
+        body, "1",
+        "Compact-hash must not be sequential: {}",
+        token_full
+    );
     assert!(
         body.len() >= 6 && body.bytes().all(|b| b.is_ascii_alphanumeric()),
         "Compact-hash body must be base36 >=6 chars, got <ID_NIK_{}>",
@@ -304,12 +313,13 @@ fn test_fail_closed_exit_code_2() {
     assert!(stderr.contains("0 rules"), "stderr: {}", stderr);
 
     // Missing rules file
-    let (stderr, code) = spawn_err_proxy(
-        &["--rules-file", "/nonexistent/rules.toml"],
-        vec![],
-    );
+    let (stderr, code) = spawn_err_proxy(&["--rules-file", "/nonexistent/rules.toml"], vec![]);
     assert_eq!(code, 2);
-    assert!(stderr.contains("Cannot read rules file"), "stderr: {}", stderr);
+    assert!(
+        stderr.contains("Cannot read rules file"),
+        "stderr: {}",
+        stderr
+    );
 
     // Malformed regex in rules file
     let bad_path = write_temp_rules_file(BAD_REGEX_TOML, "bad_regex");
@@ -325,7 +335,11 @@ fn test_fail_closed_exit_code_2() {
     // Invalid hex session key
     let (stderr, code) = spawn_err_proxy(&[], vec![("PII_SHIELD_SESSION_KEY", "not-hex!")]);
     assert_eq!(code, 2, "invalid key must exit 2 (stderr: {})", stderr);
-    assert!(stderr.contains("PII_SHIELD_SESSION_KEY"), "stderr: {}", stderr);
+    assert!(
+        stderr.contains("PII_SHIELD_SESSION_KEY"),
+        "stderr: {}",
+        stderr
+    );
 
     // Invalid 64-hex but wrong length session key
     let (code, _) = {
@@ -354,11 +368,7 @@ fn test_fail_closed_exit_code_2() {
         vec![],
     );
     assert_eq!(code, 2);
-    assert!(
-        stderr.contains("stateless-sealed"),
-        "stderr: {}",
-        stderr
-    );
+    assert!(stderr.contains("stateless-sealed"), "stderr: {}", stderr);
 
     // Invalid --token-format value
     let (_, code) = spawn_err_proxy(&["--token-format", "bogus"], vec![]);
