@@ -105,7 +105,7 @@ fn main() {
 For detailed step-by-step instructions and the full TOML schema reference, see [**docs/contributing-pii-rules.md**](docs/contributing-pii-rules.md).
 
 - **Option 1: Built-in Locale Contribution**: Add a declarative `crates/pii-core/rules/<locale>.toml` file with `valid_samples` and `invalid_samples` test cases.
-- **Option 2: Runtime Extension**: Call `PiiCatalog::merge_toml_str()` in Rust or pass `--locales` to `pii-mcp-proxy` to load custom regional rules dynamically.
+- **Option 2: Runtime Extension**: Call `PiiCatalog::merge_toml_str()` in Rust, or pass `--rules-file ./rules/<locale>.toml` to `pii-mcp-proxy` to load custom regional rules dynamically.
 
 ```toml
 [[rules]]
@@ -145,6 +145,55 @@ Run the zero-trust STDIO MCP proxy wrapper with a fail-closed tool ACL:
 # Allow only trusted internal query tools to rehydrate PII:
 pii-mcp-proxy --trusted-tools query_db,lookup_user -- npx -y @modelcontextprotocol/server-postgres postgresql://...
 ```
+
+### Built-in locales & dynamic custom rules
+
+The proxy fails closed: unknown flags, unknown locales, unreadable/invalid rule
+files, invalid regexes, or a merged catalog with 0 rules all exit with status
+code `2` and an error on `stderr`.
+
+```bash
+# Built-in locales (default: global,id). Other built-ins: us, eu, sg, none
+pii-mcp-proxy --locales global,id -- npx .../server
+
+# Load external TOML rule files via --rules-file (repeatable or comma-separated).
+# Built-ins load first, then each rules file in order; custom rules with an
+# existing rule id replace that rule, new ids compete by `priority`.
+pii-mcp-proxy \
+    --rules-file ./rules/br.toml,./rules/de.toml \
+    --trusted-tools query_db \
+    -- npx .../server
+
+# Rule file paths are also accepted inline in --locales:
+pii-mcp-proxy --locales "global,./rules/br.toml" -- npx .../server
+
+# Only custom rules, no built-in locales:
+pii-mcp-proxy --locales none --rules-file ./rules/br.toml -- npx .../server
+```
+
+### Token formats & explicit session key
+
+```bash
+--token-format sequential        # <EMAIL_1> (default)
+--token-format compact-hash      # <EMAIL_4F7Q01>, deterministic per session key
+--token-format stateless-sealed  # <PII:EMAIL:HEX>, self-contained encrypted token
+
+PII_SHIELD_SESSION_KEY=  # 64-char hex (32 bytes); required for cross-process
+                         # sealed-token decryption (--stdio-filter always needs it)
+PII_SHIELD_TOKEN_FORMAT= # env alias for --token-format
+PII_SHIELD_STATELESS=1   # env alias for stateless-sealed when --token-format is omitted
+```
+
+`PiiCatalog::merge_toml_str()` validates every rule: `tag_prefix` must be
+non-empty uppercase `[A-Z0-9_]+`, the regex must compile with the scanner's
+syntax config (bounded NFA/DFA sizes), and `pii-mcp-proxy` refuses to start if
+the merged catalog would contain no rules — invalid configuration can never
+silently disable PII redaction. STDIO filter mode (`--stdio-filter`, or running
+without a child command) requires `--token-format stateless-sealed` plus
+`PII_SHIELD_SESSION_KEY`, since stateful tokens cannot be generated in
+a redaction-less filter pass.
+
+Run `pii-mcp-proxy --help` / `--version` for the full CLI reference.
 
 ---
 

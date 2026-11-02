@@ -13,6 +13,9 @@ pub enum CatalogError {
     RuleLimitExceeded(usize),
     PatternTooLong(String, usize),
     UnknownValidator(String, String),
+    UnknownLocale(String),
+    InvalidTagPrefix(String),
+    InvalidRegex(String),
 }
 
 impl fmt::Display for CatalogError {
@@ -29,6 +32,19 @@ impl fmt::Display for CatalogError {
             ),
             CatalogError::UnknownValidator(val, id) => {
                 write!(f, "Unknown validator '{}' in rule '{}'", val, id)
+            }
+            CatalogError::UnknownLocale(loc) => write!(
+                f,
+                "Unknown locale '{}': expected one of global, id, us, eu, sg",
+                loc
+            ),
+            CatalogError::InvalidTagPrefix(prefix) => write!(
+                f,
+                "Invalid tag_prefix '{}': must be non-empty and contain only ASCII uppercase letters, digits, and underscores",
+                prefix
+            ),
+            CatalogError::InvalidRegex(err) => {
+                write!(f, "PII catalog rule regex invalid: {}", err)
             }
         }
     }
@@ -107,32 +123,66 @@ impl PiiCatalog {
                 "us" => catalog.merge_toml_str(US_TOML)?,
                 "eu" => catalog.merge_toml_str(EU_TOML)?,
                 "sg" => catalog.merge_toml_str(SG_TOML)?,
-                _ => {}
+                other => return Err(CatalogError::UnknownLocale(other.to_string())),
             }
         }
         Ok(catalog)
     }
 
     /// Merges rules from a TOML string into the catalog, enforcing sanity limits.
+    /// Atomic: on any validation error the catalog is left untouched.
     pub fn merge_toml_str(&mut self, toml_str: &str) -> Result<(), CatalogError> {
         let parsed: LocaleCatalog = toml::from_str(toml_str)?;
-        for rule in parsed.rules {
-            if self.rules.len() >= 256 {
-                return Err(CatalogError::RuleLimitExceeded(256));
-            }
+
+        // Phase 1: validate every incoming spec before mutating anything.
+        for rule in &parsed.rules {
             if rule.regex.len() > 1024 {
-                return Err(CatalogError::PatternTooLong(rule.id, 1024));
+                return Err(CatalogError::PatternTooLong(rule.id.clone(), 1024));
             }
             if !crate::checksum::is_known_validator(&rule.validator) {
-                return Err(CatalogError::UnknownValidator(rule.validator, rule.id));
+                return Err(CatalogError::UnknownValidator(
+                    rule.validator.clone(),
+                    rule.id.clone(),
+                ));
             }
-            // Overwrite existing rule if same ID, or append
-            if let Some(pos) = self.rules.iter().position(|r| r.id == rule.id) {
-                self.rules[pos] = rule;
-            } else {
-                self.rules.push(rule);
+            if rule.tag_prefix.is_empty()
+                || !rule
+                    .tag_prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            {
+                return Err(CatalogError::InvalidTagPrefix(rule.tag_prefix.clone()));
             }
         }
+
+        // Phase 2: stage the merged rule set directly. Existing IDs (both
+        // built-in and intra-TOML duplicates) are overridden in place by an
+        // earlier position match, so the *last* definition of an ID wins. The
+        // 256-rule cap only applies to genuinely new IDs.
+        let mut staged = self.rules.clone();
+        for rule in parsed.rules {
+            if let Some(pos) = staged.iter().position(|r| r.id == rule.id) {
+                staged[pos] = rule;
+            } else {
+                if staged.len() >= 256 {
+                    return Err(CatalogError::RuleLimitExceeded(256));
+                }
+                staged.push(rule);
+            }
+        }
+
+        // Phase 3: fail fast on regexes the combined catalog cannot compile
+        // (also enforces combined multi-pattern NFA/DFA size limits). The
+        // error string already identifies the offending rule id.
+        let staged_catalog = PiiCatalog {
+            rules: staged.clone(),
+        };
+        if let Err(err) = crate::scanner::PiiScanner::from_catalog(&staged_catalog) {
+            return Err(CatalogError::InvalidRegex(err));
+        }
+
+        // Phase 4: atomic commit.
+        self.rules = staged;
         Ok(())
     }
 
@@ -141,5 +191,67 @@ impl PiiCatalog {
         let mut catalog = Self::new();
         catalog.merge_toml_str(toml_str)?;
         Ok(catalog)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_with_locales_rejects_unknown_locale() {
+        assert!(matches!(
+            PiiCatalog::with_locales(&["global_typo"]),
+            Err(CatalogError::UnknownLocale(_))
+        ));
+        assert!(PiiCatalog::with_locales(&["global", "id"]).is_ok());
+    }
+
+    #[test]
+    fn test_merge_rejects_bad_tag_prefix() {
+        let mut catalog = PiiCatalog::new();
+        let err = catalog.merge_toml_str(
+            r#"
+locale = "x"
+name = "X"
+
+[[rules]]
+id = "X1"
+tag_prefix = "br_cpf"
+regex = "\\d+"
+"#,
+        );
+        assert!(matches!(err, Err(CatalogError::InvalidTagPrefix(_))));
+
+        let mut catalog = PiiCatalog::new();
+        let err = catalog.merge_toml_str(
+            r#"
+locale = "x"
+name = "X"
+
+[[rules]]
+id = "X1"
+tag_prefix = ""
+regex = "\\d+"
+"#,
+        );
+        assert!(matches!(err, Err(CatalogError::InvalidTagPrefix(_))));
+    }
+
+    #[test]
+    fn test_merge_rejects_invalid_regex() {
+        let mut catalog = PiiCatalog::new();
+        let err = catalog.merge_toml_str(
+            r#"
+locale = "x"
+name = "X"
+
+[[rules]]
+id = "BAD"
+tag_prefix = "BAD"
+regex = '(unbalanced['
+"#,
+        );
+        assert!(matches!(err, Err(CatalogError::InvalidRegex(ref msg)) if msg.contains("BAD")));
     }
 }
