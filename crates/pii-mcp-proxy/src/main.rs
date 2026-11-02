@@ -143,6 +143,21 @@ pub fn process_outbound_line(line: &str, vault: &mut PiiSessionVault) -> String 
                 vault.redact_json_value(v);
             }
         }
+        Value::Array(arr) => {
+            // Batch arrays: redact each element but keep structural keys untouched.
+            for elem in arr {
+                if let Value::Object(map) = elem {
+                    for (k, v) in map {
+                        if k == "jsonrpc" || k == "id" || k == "method" {
+                            continue;
+                        }
+                        vault.redact_json_value(v);
+                    }
+                } else {
+                    vault.redact_json_value(elem);
+                }
+            }
+        }
         _ => vault.redact_json_value(&mut val),
     }
 
@@ -215,9 +230,12 @@ pub fn parse_cli_and_env(
     let mut child_cmd_start: Option<usize> = None;
 
     fn next_value(args: &[String], i: usize) -> Result<&str, String> {
-        args.get(i + 1)
-            .map(|s| s.as_str())
-            .ok_or_else(|| format!("Missing value for flag '{}'", args[i]))
+        match args.get(i + 1).map(|s| s.as_str()) {
+            // A value that looks like another flag means the argument was
+            // omitted; never swallow it.
+            Some(val) if !val.starts_with('-') => Ok(val),
+            _ => Err(format!("Missing value for flag '{}'", args[i])),
+        }
     }
 
     let mut i = 1;
@@ -249,8 +267,13 @@ pub fn parse_cli_and_env(
                     }
                     parsed_locales.push(seg.to_string());
                 }
-                locales = parsed_locales;
-                locales_explicit = true;
+                // Repeated --locales accumulate; the first occurrence drops
+                // the built-in ["global", "id"] default.
+                if !locales_explicit {
+                    locales.clear();
+                    locales_explicit = true;
+                }
+                locales.extend(parsed_locales);
                 i += 1;
             }
             "--rules-file" => {
@@ -280,6 +303,8 @@ pub fn parse_cli_and_env(
             "--" => {
                 if i + 1 < args.len() {
                     child_cmd_start = Some(i + 1);
+                } else {
+                    return Err("Missing child command after '--'".to_string());
                 }
                 break;
             }
@@ -325,19 +350,33 @@ pub fn parse_cli_and_env(
         token_format = Some(ProxyTokenFormat::StatelessSealed);
     }
 
+    // PII_SHIELD_STATELESS: strictly validated boolean-style alias.
+    if token_format.is_none() {
+        if let Some(stateless) = env_vars.get("PII_SHIELD_STATELESS") {
+            match stateless.trim() {
+                "1" | "true" => token_format = Some(ProxyTokenFormat::StatelessSealed),
+                "0" | "false" | "" => {}
+                other => {
+                    return Err(format!(
+                    "Invalid PII_SHIELD_STATELESS value '{}': expected 1, true, 0, false, or empty",
+                    other
+                ))
+                }
+            }
+        }
+    }
+
     // Locale / rules-file path split: items ending in .toml or containing a
     // path separator are treated as external rule files.
     let mut builtins = Vec::new();
+    let mut none_requested = false;
     for loc in &locales {
         let looks_like_path = loc.ends_with(".toml") || loc.contains('/') || loc.contains('\\');
         if looks_like_path {
             rules_files.push(loc.clone());
         } else if loc == "none" {
             // Explicit opt-out of built-in locales.
-            builtins.clear();
-            if locales.len() > 1 {
-                return Err("'none' must not be combined with other locales".to_string());
-            }
+            none_requested = true;
         } else {
             if !BUILTIN_LOCALES.contains(&loc.as_str()) {
                 return Err(format!(
@@ -348,21 +387,43 @@ pub fn parse_cli_and_env(
             builtins.push(loc.clone());
         }
     }
-    let _ = locales_explicit;
-    let locales = builtins;
+    if none_requested && !builtins.is_empty() {
+        return Err("'none' must not be combined with other built-in locale names".to_string());
+    }
+    let locales = if none_requested { Vec::new() } else { builtins };
 
-    // Fail closed: stateless sealed mode with --stdio-filter is unusable
-    // without a persistent session key (tokens could not decrypt across
-    // invocations).
-    if stdio_filter
-        && token_format == Some(ProxyTokenFormat::StatelessSealed)
-        && session_key.is_none()
-        && child_cmd_start.is_none()
-    {
-        return Err(
-            "--stdio-filter with stateless-sealed tokens requires PII_SHIELD_SESSION_KEY"
-                .to_string(),
-        );
+    // Fail closed: explicitly-requested --stdio-filter mode performs no
+    // outbound redaction, so stateful tokens (sequential / compact-hash) can
+    // never be generated there, and stateless-sealed tokens cannot decrypt
+    // cross-invocation without a persistent key.
+    if stdio_filter {
+        if child_cmd_start.is_some() {
+            return Err(
+                "--stdio-filter cannot be combined with a child command; remove '--' or drop --stdio-filter"
+                    .to_string(),
+            );
+        }
+        if token_format != Some(ProxyTokenFormat::StatelessSealed) {
+            return Err(
+                "--stdio-filter requires --token-format stateless-sealed (stateful tokens cannot be generated in filter mode)"
+                    .to_string(),
+            );
+        }
+        if session_key.is_none() {
+            return Err(
+                "--stdio-filter with stateless-sealed tokens requires PII_SHIELD_SESSION_KEY"
+                    .to_string(),
+            );
+        }
+    } else if child_cmd_start.is_none() && token_format == Some(ProxyTokenFormat::StatelessSealed) {
+        // Implicit filter mode (no child command): stateless-sealed without a
+        // key cannot decrypt tokens across invocations.
+        if session_key.is_none() {
+            return Err(
+                "stateless-sealed token format without a child command requires PII_SHIELD_SESSION_KEY"
+                    .to_string(),
+            );
+        }
     }
 
     let child_cmd = child_cmd_start.map(|idx| (args[idx].clone(), args[idx + 1..].to_vec()));
@@ -502,13 +563,22 @@ fn main() {
 
     let (prog, prog_args) = config.child_cmd.expect("Child command present");
 
-    let mut child = Command::new(&prog)
+    let mut child = match Command::new(&prog)
         .args(&prog_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn child MCP server '{}': {}", prog, e));
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "pii-mcp-proxy error: failed to spawn child MCP server '{}': {}",
+                prog, e
+            );
+            std::process::exit(2);
+        }
+    };
 
     let child_stdin = child.stdin.take().expect("Child stdin piped");
     let child_stdout = child.stdout.take().expect("Child stdout piped");
@@ -568,7 +638,14 @@ fn main() {
 
     let _ = t1.join();
     let _ = t2.join();
-    let _ = child.wait();
+    // Propagate the child's exit code so hosts observe child failures.
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 #[cfg(test)]

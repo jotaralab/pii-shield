@@ -179,7 +179,7 @@ pii-mcp-proxy --locales none --rules-file ./rules/br.toml -- npx .../server
 --token-format stateless-sealed  # <PII:EMAIL:HEX>, self-contained encrypted token
 
 PII_SHIELD_SESSION_KEY=  # 64-char hex (32 bytes); required for cross-process
-                         # rehydration, and for --stdio-filter + stateless-sealed
+                         # sealed-token decryption (--stdio-filter always needs it)
 PII_SHIELD_TOKEN_FORMAT= # env alias for --token-format
 PII_SHIELD_STATELESS=1   # env alias for stateless-sealed when --token-format is omitted
 ```

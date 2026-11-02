@@ -108,6 +108,10 @@ When wrapping Model Context Protocol (MCP) servers, specify which locale packs t
 ```bash
 # Enable Global, US, EU, and Singapore rules with a fail-closed tool ACL
 pii-mcp-proxy --locales global,us,eu,sg --trusted-tools query_db -- <mcp-server-command>
+
+# Or load external TOML rule files dynamically (built-ins load first, custom
+# rules may override built-in rule IDs by ID, new IDs compete by priority)
+pii-mcp-proxy --locales global --rules-file ./rules/br.toml --trusted-tools query_db -- <mcp-server-command>
 ```
 
 ### In WebAssembly (JavaScript / TypeScript)

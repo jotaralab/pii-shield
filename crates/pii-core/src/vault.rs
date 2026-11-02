@@ -128,9 +128,7 @@ impl PiiSessionVault {
     pub fn from_catalog(catalog: PiiCatalog) -> Self {
         let mut key_bytes = [0u8; 32];
         getrandom::getrandom(&mut key_bytes).expect("OS CSPRNG unavailable");
-        Self::try_from_catalog(catalog)
-            .map(|v| v.adopt_key(key_bytes))
-            .expect("Scanner compilation valid")
+        Self::try_from_catalog_with_key(catalog, key_bytes).expect("Scanner compilation valid")
     }
 
     /// Creates a vault from an explicit PiiCatalog and explicit 32-byte key.
@@ -160,12 +158,6 @@ impl PiiSessionVault {
             policy: SecurityPolicy::IndonesiaUuPdpStrict,
             token_format: TokenFormat::Sequential,
         })
-    }
-
-    /// Replaces the internal session key (internal helper used by fallible constructors).
-    fn adopt_key(mut self, key: [u8; 32]) -> Self {
-        self.session_key = Zeroizing::new(key);
-        self
     }
 
     /// Returns the active token format.

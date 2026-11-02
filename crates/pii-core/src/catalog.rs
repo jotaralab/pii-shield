@@ -35,7 +35,7 @@ impl fmt::Display for CatalogError {
             }
             CatalogError::UnknownLocale(loc) => write!(
                 f,
-                "Unknown locale '{}': expected one of global, id, us, eu, sg, 'none', or a .toml rules file path",
+                "Unknown locale '{}': expected one of global, id, us, eu, sg",
                 loc
             ),
             CatalogError::InvalidTagPrefix(prefix) => write!(
@@ -130,17 +130,20 @@ impl PiiCatalog {
     }
 
     /// Merges rules from a TOML string into the catalog, enforcing sanity limits.
+    /// Atomic: on any validation error the catalog is left untouched.
     pub fn merge_toml_str(&mut self, toml_str: &str) -> Result<(), CatalogError> {
         let parsed: LocaleCatalog = toml::from_str(toml_str)?;
-        for rule in parsed.rules {
-            if self.rules.len() >= 256 {
-                return Err(CatalogError::RuleLimitExceeded(256));
-            }
+
+        // Phase 1: validate every incoming spec before mutating anything.
+        for rule in &parsed.rules {
             if rule.regex.len() > 1024 {
-                return Err(CatalogError::PatternTooLong(rule.id, 1024));
+                return Err(CatalogError::PatternTooLong(rule.id.clone(), 1024));
             }
             if !crate::checksum::is_known_validator(&rule.validator) {
-                return Err(CatalogError::UnknownValidator(rule.validator, rule.id));
+                return Err(CatalogError::UnknownValidator(
+                    rule.validator.clone(),
+                    rule.id.clone(),
+                ));
             }
             if rule.tag_prefix.is_empty()
                 || !rule
@@ -148,25 +151,40 @@ impl PiiCatalog {
                     .bytes()
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
             {
-                return Err(CatalogError::InvalidTagPrefix(rule.tag_prefix));
-            }
-            // Fail fast on regexes that `PiiScanner` cannot compile.
-            let probe_catalog = PiiCatalog {
-                rules: vec![rule.clone()],
-            };
-            if let Err(err) = crate::scanner::PiiScanner::from_catalog(&probe_catalog) {
-                return Err(CatalogError::InvalidRegex {
-                    id: rule.id.clone(),
-                    err,
-                });
-            }
-            // Overwrite existing rule if same ID, or append
-            if let Some(pos) = self.rules.iter().position(|r| r.id == rule.id) {
-                self.rules[pos] = rule;
-            } else {
-                self.rules.push(rule);
+                return Err(CatalogError::InvalidTagPrefix(rule.tag_prefix.clone()));
             }
         }
+
+        // Phase 2: stage the merged rule set. The 256-rule cap only applies to
+        // *new* rule IDs; in-place overrides of an existing rule are exempt.
+        let mut staged = self.rules.clone();
+        let mut to_append = Vec::new();
+        for rule in parsed.rules {
+            match staged.iter_mut().position(|r| r.id == rule.id) {
+                Some(pos) => staged[pos] = rule,
+                None => to_append.push(rule),
+            }
+        }
+        if staged.len() + to_append.len() > 256 {
+            return Err(CatalogError::RuleLimitExceeded(256));
+        }
+        staged.extend(to_append);
+
+        // Phase 3: fail fast on regexes the combined catalog cannot compile
+        // (also enforces combined multi-pattern NFA/DFA size limits).
+        let staged_catalog = PiiCatalog {
+            rules: staged.clone(),
+        };
+        if let Err(err) = crate::scanner::PiiScanner::from_catalog(&staged_catalog) {
+            let id = err
+                .strip_prefix("Invalid regex for rule ")
+                .and_then(|rest| rest.find(':').map(|idx| rest[..idx].to_string()))
+                .unwrap_or_else(|| "<combined>".to_string());
+            return Err(CatalogError::InvalidRegex { id, err });
+        }
+
+        // Phase 4: atomic commit.
+        self.rules = staged;
         Ok(())
     }
 

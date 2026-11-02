@@ -85,15 +85,40 @@ fn test_mcp_proxy_stdio_process_lifecycle_e2e() {
     assert!(status.success(), "Proxy process must exit with code 0");
 }
 
-fn write_temp_rules_file(content: &str, name: &str) -> std::path::PathBuf {
+fn write_temp_rules_file(content: &str, name: &str) -> TempRulesFile {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir();
     let path = dir.join(format!(
-        "pii_shield_test_{}_{}.toml",
+        "pii_shield_test_{}_{}_{}_{}.toml",
         name,
-        std::process::id()
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
     ));
     std::fs::write(&path, content).expect("Write temp rules file");
-    path
+    TempRulesFile { path }
+}
+
+/// RAII guard deleting the temp .toml on drop (even on assertion panic).
+struct TempRulesFile {
+    path: std::path::PathBuf,
+}
+
+impl std::ops::Deref for TempRulesFile {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempRulesFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 const CPF_TOML: &str = r#"
@@ -150,12 +175,124 @@ fn test_rules_file_custom_toml_redaction_and_rehydration_with_session_key() {
     let rules_path = write_temp_rules_file(CPF_TOML, "cpf_valid");
     let key_hex = "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb";
 
-    let mut proxy_proc = Command::new(proxy_bin)
+    // Cross-process session-key + custom-rule adoption proof:
+    // Proxy A (child mode, stateless-sealed + key) redacts raw PII into
+    // self-contained sealed tokens; proxy B (--stdio-filter, same key) must
+    // decrypt them. If either process ignored PII_SHIELD_SESSION_KEY, token
+    // generation/decryption would use an OS-random key and this test fails.
+    let mut proxy_a = Command::new(proxy_bin)
         .arg("--locales")
         .arg("global,id")
         .arg("--rules-file")
-        .arg(&rules_path)
+        .arg(rules_path.to_str().unwrap())
+        .arg("--token-format")
+        .arg("stateless-sealed")
+        .arg("--trusted-tools")
+        .arg("query_customer")
+        .arg("--")
+        .arg(mock_bin)
         .env("PII_SHIELD_SESSION_KEY", key_hex)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Spawn proxy A");
+
+    let mut stdin = proxy_a.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(proxy_a.stdout.take().expect("stdout"));
+
+    let _ = writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"query_customer","arguments":{{"nik":"3573012203950001","cpf":"123.456.789-00"}}}}}}"#
+    );
+    stdin.flush().unwrap();
+
+    let mut buf = String::new();
+    reader.read_line(&mut buf).unwrap();
+    assert!(
+        !buf.contains("3573012203950001") && !buf.contains("123.456.789-00"),
+        "Raw PII must not leak externally: {}",
+        buf
+    );
+    let nik_sealed = extract_sealed(&buf, "ID_NIK");
+    let cpf_sealed = extract_sealed(&buf, "BR_CPF");
+    assert!(
+        nik_sealed.is_some() && cpf_sealed.is_some(),
+        "Built-in + custom rules must both seal under the env session key: {}",
+        buf
+    );
+
+    drop(stdin);
+    let status = proxy_a.wait().unwrap();
+    assert!(status.success());
+
+    // Proxy B: filter mode, --locales none + only the custom rules file
+    // (isolated catalog), same key. Sliding sealed tokens in through a
+    // trusted tool must decrypt across the process boundary.
+    let mut proxy_b = Command::new(proxy_bin)
+        .arg("--stdio-filter")
+        .arg("--token-format")
+        .arg("stateless-sealed")
+        .arg("--locales")
+        .arg(format!("none,{}", rules_path.to_str().unwrap()))
+        .arg("--trusted-tools")
+        .arg("query_nik")
+        .env("PII_SHIELD_SESSION_KEY", key_hex)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Spawn proxy B");
+
+    let mut stdin_b = proxy_b.stdin.take().expect("stdin");
+    let mut reader_b = BufReader::new(proxy_b.stdout.take().expect("stdout"));
+
+    let _ = writeln!(
+        stdin_b,
+        r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"query_nik","arguments":{{"nik":"{}","cpf":"{}"}}}}}}"#,
+        nik_sealed.unwrap(),
+        cpf_sealed.unwrap()
+    );
+    stdin_b.flush().unwrap();
+
+    buf.clear();
+    reader_b.read_line(&mut buf).unwrap();
+    assert!(
+        buf.contains("3573012203950001"),
+        "Proxy B must decrypt sealed NIK token cross-process (key ignored?): {}",
+        buf
+    );
+    let _ = &reader_b;
+    assert!(
+        buf.contains("123.456.789-00"),
+        "Proxy B must decrypt sealed custom-rule token cross-process: {}",
+        buf
+    );
+
+    drop(stdin_b);
+    let status = proxy_b.wait().unwrap();
+    assert!(status.success());
+}
+
+/// Extracts the first <PII:{prefix}:HEX> sealed token from a line.
+fn extract_sealed(buf: &str, prefix: &str) -> Option<String> {
+    let needle = format!("<PII:{}:", prefix);
+    let start = buf.find(&needle)?;
+    let end = buf[start..].find('>')? + start;
+    Some(buf[start..=end].to_string())
+}
+
+#[test]
+fn test_untrusted_exfiltration_blocking_on_custom_rules() {
+    let proxy_bin = env!("CARGO_BIN_EXE_pii-mcp-proxy");
+    let mock_bin = env!("CARGO_BIN_EXE_mock_mcp_server");
+    let rules_path = write_temp_rules_file(CPF_TOML, "cpf_exfil");
+
+    let mut proxy_proc = Command::new(proxy_bin)
+        .arg("--locales")
+        .arg("none")
+        .arg("--rules-file")
+        .arg(rules_path.to_str().unwrap())
         .arg("--trusted-tools")
         .arg("query_customer")
         .arg("--")
@@ -168,60 +305,40 @@ fn test_rules_file_custom_toml_redaction_and_rehydration_with_session_key() {
 
     let mut stdin = proxy_proc.stdin.take().expect("stdin");
     let mut reader = BufReader::new(proxy_proc.stdout.take().expect("stdout"));
+    let mut buf = String::new();
 
-    // 1. Observed tool call with raw values: outbound must redact both the
-    //    built-in NIK rule and the custom BR_CPF TOML rule.
+    // 1. Outbound redaction: --locales none must not disable custom rules.
+    //    (Trusted tool so inbound raw PII rehydration passes through; the raw
+    //    echo back is redacted outbound into sequential tokens.)
     let _ = writeln!(
         stdin,
-        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"query_customer","arguments":{{"nik":"3573012203950001","cpf":"123.456.789-00"}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"query_customer","arguments":{{"cpf":"123.456.789-00"}}}}}}"#
     );
     stdin.flush().unwrap();
-
-    let mut buf = String::new();
     reader.read_line(&mut buf).unwrap();
     assert!(
-        buf.contains("<ID_NIK_1>") && buf.contains("<BR_CPF_1>"),
-        "Built-in and custom TOML rules must both redact, got: {}",
-        buf
-    );
-    assert!(
-        !buf.contains("3573012203950001") && !buf.contains("123.456.789-00"),
-        "Raw PII must not leak externally: {}",
+        buf.contains("<BR_CPF_1>"),
+        "--locales none + --rules-file must isolate to custom rules and still redact: {}",
         buf
     );
 
-    // 2. Trusted tool call with tokens: proxy must rehydrate them for the
-    //    child (child_saw_token=false proves real values reached the child),
-    //    then re-redact the echo with token continuity.
+    // 2. Untrusted tool call replaying <BR_CPF_1> must be blocked (-32001).
     let _ = writeln!(
         stdin,
-        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"query_customer","arguments":{{"nik":"<ID_NIK_1>","cpf":"<BR_CPF_1>"}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"untrusted_search","arguments":{{"q":"<BR_CPF_1>"}}}}}}"#
     );
     stdin.flush().unwrap();
-
     buf.clear();
     reader.read_line(&mut buf).unwrap();
     assert!(
-        !buf.contains(r#""child_saw_token":true"#),
-        "Session key + custom rules vault must rehydrate tokens for trusted tools: {}",
-        buf
-    );
-    assert!(
-        buf.contains("<ID_NIK_1>") && buf.contains("<BR_CPF_1>"),
-        "Re-redacted outbound must preserve token continuity: {}",
-        buf
-    );
-    assert!(
-        !buf.contains("3573012203950001") && !buf.contains("123.456.789-00"),
-        "Raw PII must not leak back to the host: {}",
+        buf.contains("-32001") && buf.contains("PII exfiltration blocked"),
+        "Untrusted replay of custom-rule token must be blocked: {}",
         buf
     );
 
     drop(stdin);
     let status = proxy_proc.wait().unwrap();
     assert!(status.success());
-
-    let _ = std::fs::remove_file(&rules_path);
 }
 
 #[test]
@@ -261,7 +378,7 @@ fn test_token_format_compact_hash() {
         .find('>')
         .map(|e| idx + e)
         .expect("Token terminator");
-    let token_full = &buf[token_start..=token_end];
+    let token_full = buf[token_start..=token_end].to_string();
     let body = &token_full["<ID_NIK_".len()..token_full.len() - 1];
     assert_ne!(
         body, "1",
@@ -290,13 +407,19 @@ fn test_token_format_compact_hash() {
     buf.clear();
     reader.read_line(&mut buf).unwrap();
     assert!(
-        !buf.contains(r#""child_saw_token":true"#),
+        buf.contains(r#""child_saw_token":false"#),
         "Compact-hash tokens must rehydrate in trusted calls: {}",
+        buf
+    );
+    assert!(
+        buf.contains(token_full.as_str()),
+        "Token continuity must be preserved outbound: {}",
         buf
     );
 
     drop(stdin);
-    let _ = proxy_proc.wait().unwrap();
+    let status = proxy_proc.wait().unwrap();
+    assert!(status.success(), "Proxy must exit cleanly");
 }
 
 #[test]
@@ -330,7 +453,6 @@ fn test_fail_closed_exit_code_2() {
         "stderr: {}",
         stderr
     );
-    let _ = std::fs::remove_file(&bad_path);
 
     // Invalid hex session key
     let (stderr, code) = spawn_err_proxy(&[], vec![("PII_SHIELD_SESSION_KEY", "not-hex!")]);
@@ -369,6 +491,56 @@ fn test_fail_closed_exit_code_2() {
     );
     assert_eq!(code, 2);
     assert!(stderr.contains("stateless-sealed"), "stderr: {}", stderr);
+
+    // stdio-filter without stateless-sealed (stateful tokens unusable there)
+    let (stderr, code) = spawn_err_proxy(&["--stdio-filter"], vec![]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("stateless-sealed"), "stderr: {}", stderr);
+
+    // stdio-filter combined with a child command
+    let (_, code) = spawn_err_proxy(
+        &[
+            "--stdio-filter",
+            "--token-format",
+            "stateless-sealed",
+            "true",
+            "/bin/true",
+        ],
+        vec![],
+    );
+    assert_eq!(code, 2);
+
+    // Bare trailing '--' with no child command
+    let (stderr, code) = spawn_err_proxy(&["--"], vec![]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("child command"), "stderr: {}", stderr);
+
+    // Missing flag value: next flag must not be swallowed as the value
+    let (stderr, code) = spawn_err_proxy(&["--trusted-tools", "--stdio-filter"], vec![]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("Missing value for flag '--trusted-tools'"),
+        "stderr: {}",
+        stderr
+    );
+
+    // stateless-sealed without a child command and without a key
+    let (stderr, code) = spawn_err_proxy(&["--token-format", "stateless-sealed"], vec![]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("PII_SHIELD_SESSION_KEY"),
+        "stderr: {}",
+        stderr
+    );
+
+    // Invalid PII_SHIELD_STATELESS value
+    let (stderr, code) = spawn_err_proxy(&[], vec![("PII_SHIELD_STATELESS", "bogus")]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("PII_SHIELD_STATELESS"),
+        "stderr: {}",
+        stderr
+    );
 
     // Invalid --token-format value
     let (_, code) = spawn_err_proxy(&["--token-format", "bogus"], vec![]);

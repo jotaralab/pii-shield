@@ -32,8 +32,20 @@ pub unsafe extern "C" fn pii_vault_new_with_locales(locales: *const c_char) -> *
             Ok(s) => s,
             Err(_) => return ptr::null_mut(),
         };
-        let loc_vec: Vec<&str> = loc_str.split(',').map(|s| s.trim()).collect();
-        let catalog = PiiCatalog::with_locales(&loc_vec).unwrap_or_default();
+        let loc_vec: Vec<&str> = loc_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if loc_vec.is_empty() {
+            return pii_vault_new();
+        }
+        // Fail closed: an unknown locale must not silently produce an
+        // empty (0-rule) catalog that redacts nothing.
+        let catalog = match PiiCatalog::with_locales(&loc_vec) {
+            Ok(c) => c,
+            Err(_) => return ptr::null_mut(),
+        };
         let vault = PiiSessionVault::from_catalog(catalog);
         Box::into_raw(Box::new(PiiVaultHandle(Mutex::new(vault))))
     }))
@@ -77,14 +89,29 @@ pub unsafe extern "C" fn pii_vault_new_with_locales_and_key(
         ptr::copy_nonoverlapping(key, key_bytes.as_mut_ptr(), 32);
 
         let catalog = if locales.is_null() {
-            PiiCatalog::with_locales(&["global", "id"]).unwrap_or_default()
+            match PiiCatalog::with_locales(&["global", "id"]) {
+                Ok(c) => c,
+                Err(_) => return ptr::null_mut(),
+            }
         } else {
             let loc_str = match CStr::from_ptr(locales).to_str() {
                 Ok(s) => s,
                 Err(_) => return ptr::null_mut(),
             };
-            let loc_vec: Vec<&str> = loc_str.split(',').map(|s| s.trim()).collect();
-            PiiCatalog::with_locales(&loc_vec).unwrap_or_default()
+            let loc_vec: Vec<&str> = loc_str
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let catalog = if loc_vec.is_empty() {
+                PiiCatalog::with_locales(&["global", "id"])
+            } else {
+                PiiCatalog::with_locales(&loc_vec)
+            };
+            match catalog {
+                Ok(c) => c,
+                Err(_) => return ptr::null_mut(),
+            }
         };
         let vault = PiiSessionVault::from_catalog_with_key(catalog, key_bytes);
         Box::into_raw(Box::new(PiiVaultHandle(Mutex::new(vault))))
