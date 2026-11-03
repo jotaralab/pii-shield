@@ -79,6 +79,12 @@ pub struct PiiRuleSpec {
     pub priority: u16,
     #[serde(default)]
     pub context_keywords: Vec<String>,
+    /// When true, a candidate match is accepted only if at least one
+    /// `context_keywords` entry is found within the ±48-byte window around
+    /// the match. Used for low-entropy rules without checksums (e.g. CA
+    /// driver's license) to prevent false positives like product SKUs.
+    #[serde(default)]
+    pub require_context: bool,
     #[serde(default)]
     pub valid_samples: Vec<String>,
     #[serde(default)]

@@ -1,9 +1,11 @@
 pub mod common;
+pub mod eu;
 pub mod id;
 pub mod sg;
 pub mod us;
 
 pub use common::*;
+pub use eu::*;
 pub use id::*;
 pub use sg::*;
 pub use us::*;
@@ -18,9 +20,19 @@ pub fn is_known_validator(name: &str) -> bool {
             | "id_npwp"
             | "id_phone"
             | "us_ssn"
+            | "us_itin"
+            | "us_aba_routing"
             | "iban_mod97"
             | "sg_nric"
             | "e164_phone"
+            | "de_steuer_id"
+            | "fr_nir"
+            | "es_dni"
+            | "it_codice_fiscale"
+            | "nl_bsn"
+            | "pl_pesel"
+            | "uk_nhs"
+            | "uk_nino"
     )
 }
 
@@ -36,9 +48,19 @@ pub fn validate_by_name(validator: &str, slice: &str) -> bool {
         "id_npwp" => validate_indonesian_npwp(slice),
         "id_phone" => validate_indonesian_phone(slice),
         "us_ssn" => validate_us_ssn(slice),
+        "us_itin" => validate_us_itin(slice),
+        "us_aba_routing" => validate_us_aba_routing(slice),
         "iban_mod97" => validate_iban_mod97(slice),
         "sg_nric" => validate_sg_nric(slice),
         "e164_phone" => validate_e164_phone(slice),
+        "de_steuer_id" => validate_de_steuer_id(slice),
+        "fr_nir" => validate_fr_nir(slice),
+        "es_dni" => validate_es_dni(slice),
+        "it_codice_fiscale" => validate_it_codice_fiscale(slice),
+        "nl_bsn" => validate_nl_bsn(slice),
+        "pl_pesel" => validate_pl_pesel(slice),
+        "uk_nhs" => validate_uk_nhs(slice),
+        "uk_nino" => validate_uk_nino(slice),
         _ => false,
     }
 }

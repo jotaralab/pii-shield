@@ -1,3 +1,67 @@
+/// Strips single ASCII separators between digit characters while enforcing
+/// strict separator discipline (R2): the input must start and end on a digit,
+/// never contain two separators in a row ("--", "  ", ".."), and never start
+/// or end with a separator. Returns `None` on any violation.
+#[inline]
+pub(crate) fn strict_digits(input: &str, seps: &[u8]) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let is_sep = |b: u8| seps.contains(&b);
+    if is_sep(bytes[0]) || is_sep(bytes[bytes.len() - 1]) {
+        return None;
+    }
+    let mut digits = Vec::with_capacity(bytes.len());
+    let mut last_sep = false;
+    for &b in bytes {
+        if is_sep(b) {
+            if last_sep {
+                return None;
+            }
+            last_sep = true;
+            continue;
+        }
+        last_sep = false;
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        digits.push(b - b'0');
+    }
+    Some(digits)
+}
+
+/// Same strict separator discipline, but keeps ASCII alphanumeric bytes
+/// (uppercased) instead of digits only; used by UK NINO and FR NIR.
+#[inline]
+pub(crate) fn strict_alnum(input: &str, seps: &[u8]) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let is_sep = |b: u8| seps.contains(&b);
+    if is_sep(bytes[0]) || is_sep(bytes[bytes.len() - 1]) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut last_sep = false;
+    for &b in bytes {
+        if is_sep(b) {
+            if last_sep {
+                return None;
+            }
+            last_sep = true;
+            continue;
+        }
+        last_sep = false;
+        if !b.is_ascii_alphanumeric() {
+            return None;
+        }
+        out.push(b.to_ascii_uppercase());
+    }
+    Some(out)
+}
+
 /// Validates credit card numbers using the Luhn algorithm (mod 10).
 ///
 /// Enforces:

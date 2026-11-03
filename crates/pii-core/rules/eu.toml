@@ -13,6 +13,94 @@ valid_samples = ["DE89370400440532013000", "FR1420041010050500013M02606"]
 invalid_samples = ["DE89370400440532013001", "1289370400440532013000"]
 
 [[rules]]
+id = "DE_STEUER_ID"
+tag_prefix = "DE_STEUER_ID"
+description = "German Steuer-Identifikationsnummer (11 digits, ISO 7064 Mod 11,10)"
+regex = '\b[1-9](?:[ ]?[0-9]){10}\b'
+validator = "de_steuer_id"
+priority = 88
+context_keywords = ["steuer", "steuerid", "steuer-id", "finanzamt", "tax"]
+valid_samples = ["51928327648", "51 928327648"]
+invalid_samples = ["51928327649", "01928327648", "51112227648", "51  928327648"]
+
+[[rules]]
+id = "FR_NIR"
+tag_prefix = "FR_NIR"
+description = "French NIR / social security number (15 chars, Mod 97 key)"
+regex = '\b[1-478][ \-]?[0-9]{2}[ \-]?[0-9]{2}[ \-]?(?:[0-9]{2}|2[AB])[ \-]?[0-9]{3}[ \-]?[0-9]{3}[ \-]?[0-9]{2}\b'
+validator = "fr_nir"
+priority = 92
+context_keywords = ["nir", "securite sociale", "social security", "insee"]
+valid_samples = ["195024610200145", "181022A10200402", "195099710200141"]
+invalid_samples = ["195024610200146", "195013610200145", "195099791200188", "195099610200104"]
+
+[[rules]]
+id = "ES_DNI"
+tag_prefix = "ES_DNI"
+description = "Spanish DNI/NIE (9 chars, Mod 23 letter check)"
+regex = '\b(?:[0-9]{8}|[XYZ][0-9]{7})[ \-]?[A-Z]\b'
+validator = "es_dni"
+priority = 90
+context_keywords = ["dni", "nie", "documento", "identificacion"]
+valid_samples = ["12345678Z", "12345678-Z", "Y2345678Z"]
+invalid_samples = ["12345678A", "Y2345678A", "1234-5678Z", "12345678z", "1234-5678-Z"]
+
+[[rules]]
+id = "IT_CODICE_FISCALE"
+tag_prefix = "IT_CODICE_FISCALE"
+description = "Italian fiscal code (16 chars, Mod 26 check char + omocodia day)"
+regex = '\b[A-Z]{6}[0-9LMNPQRSTUV]{2}[ABCDEHLMPRST][0-9LMNPQRSTUV]{2}[A-Z][0-9LMNPQRSTUV]{3}[A-Z]\b'
+validator = "it_codice_fiscale"
+priority = 92
+context_keywords = ["codice fiscale", "cf", "fiscale"]
+valid_samples = ["RSSMRA85M01H501E", "MLNBBA65T51F205W"]
+invalid_samples = ["RSSMRA85M01H501A", "RSSMRA85M99H501E", "rssmra85m01h501e"]
+
+[[rules]]
+id = "NL_BSN"
+tag_prefix = "NL_BSN"
+description = "Dutch Burgerservicenummer (9 digits, 11-proef)"
+regex = '\b(?:[0-9]{9}|[0-9]{4}\.[0-9]{2}\.[0-9]{3})\b'
+validator = "nl_bsn"
+priority = 85
+context_keywords = ["bsn", "burgerservicenummer", "sofi"]
+valid_samples = ["835030568", "8350.30.568"]
+invalid_samples = ["835030569", "8350-30-568", "000135053"]
+
+[[rules]]
+id = "PL_PESEL"
+tag_prefix = "PL_PESEL"
+description = "Polish PESEL (11 digits, date-encoded checksum)"
+regex = '\b[0-9]{11}\b'
+validator = "pl_pesel"
+priority = 86
+context_keywords = ["pesel", "poland", "polski"]
+valid_samples = ["95022812342", "95011556347"]
+invalid_samples = ["95022812343", "95022912349", "95132812342", "9502281234 2", "95-02-28-1234-2"]
+
+[[rules]]
+id = "UK_NHS"
+tag_prefix = "UK_NHS"
+description = "UK National Health Service number (10 digits, Mod 11)"
+regex = '\b(?:[0-9]{10}|[0-9]{3}[ \-][0-9]{3}[ \-][0-9]{4})\b'
+validator = "uk_nhs"
+priority = 85
+context_keywords = ["nhs", "health", "gp"]
+valid_samples = ["4139537671", "413 953 7671", "413-953-7671"]
+invalid_samples = ["4139537672", "5555555555", "413  953 7671"]
+
+[[rules]]
+id = "UK_NINO"
+tag_prefix = "UK_NINO"
+description = "UK National Insurance number (prefix + 6 digits + D-letter suffix)"
+regex = '\b[A-Z]{2}[ \-]?[0-9]{2}[ \-]?[0-9]{2}[ \-]?[0-9]{2}[ \-]?[A-D]\b'
+validator = "uk_nino"
+priority = 90
+context_keywords = ["nino", "ni number", "national insurance", "hmrc"]
+valid_samples = ["AA123456A", "AA 12 34 56 A", "JL-12-34-56-C"]
+invalid_samples = ["DG123456A", "AO123456A", "BG123456A", "AA123456E", "aa123456a"]
+
+[[rules]]
 id = "PHONE_EU"
 tag_prefix = "PHONE_EU"
 description = "European format telephone number"
@@ -22,3 +110,4 @@ priority = 75
 context_keywords = ["phone", "tel", "call", "mobil"]
 valid_samples = ["+49 30 12345678", "+33 1 42685500"]
 invalid_samples = ["+49 1", "phone"]
+

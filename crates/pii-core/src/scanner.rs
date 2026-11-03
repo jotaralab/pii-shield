@@ -68,6 +68,7 @@ struct CompiledRule {
     validator: String,
     priority: u16,
     context_keywords: Vec<String>,
+    require_context: bool,
     regex: Regex,
 }
 
@@ -111,6 +112,7 @@ impl PiiScanner {
                 validator: rule.validator.clone(),
                 priority: rule.priority,
                 context_keywords: rule.context_keywords.clone(),
+                require_context: rule.require_context,
                 regex: rule_regex,
             });
         }
@@ -154,19 +156,29 @@ impl PiiScanner {
 
                     // Stage 3 Checksum Verification
                     if validate_by_name(&rule.validator, slice) {
-                        // Stage 2: Context Keyword & Priority Scoring
-                        let mut score = rule.priority as i32;
-
-                        // Check ±48 bytes window safely on bytes for ASCII context keywords
+                        // Check ±48 bytes window safely on bytes for ASCII
+                        // context keywords
                         let win_start = match_start.saturating_sub(48);
                         let win_end = (r_mat.end() + 48).min(text_bytes.len());
                         let context_slice = &text_bytes[win_start..win_end];
 
-                        for kw in &rule.context_keywords {
-                            if contains_ignore_ascii_case(context_slice, kw.as_bytes()) {
-                                score += 25;
-                                break;
-                            }
+                        let keyword_hit = rule
+                            .context_keywords
+                            .iter()
+                            .any(|kw| contains_ignore_ascii_case(context_slice, kw.as_bytes()));
+
+                        // Stage 2 hard gate: rules flagged require_context are
+                        // rejected outright when no context keyword is present
+                        // (prevents SKU/SHA false positives on low-entropy,
+                        // checksum-less patterns).
+                        if rule.require_context && !keyword_hit {
+                            continue;
+                        }
+
+                        // Stage 2: Context Keyword & Priority Scoring
+                        let mut score = rule.priority as i32;
+                        if keyword_hit {
+                            score += 25;
                         }
 
                         // Specificity bonus: longer span preferred as tiebreaker

@@ -54,6 +54,7 @@ invalid_samples = ["123-45", "000-0000"]
 | `validator` | `String` | No | Algorithmic Stage-3 verifier (`"none"`, `"luhn"`, `"iban_mod97"`, `"e164_phone"`, etc.). Defaults to `"none"`. |
 | `priority` | `u16` | No | Disambiguation priority score (default `50`). Higher scores take precedence when candidate spans overlap. |
 | `context_keywords`| `Vec<String>`| No | Words within a $\pm 48$-byte window that boost match confidence score by `+25`. |
+| `require_context`| `bool`| No (default `false`) | When `true`, a candidate match is **rejected outright** unless at least one `context_keywords` entry appears within the ±48-byte window. Use this for low-entropy patterns without checksums (e.g. `US_CA_DL`) to prevent SKU/commit-SHA false positives. |
 | `valid_samples` | `Vec<String>`| No | Test samples that **must** match during automated test verification. |
 | `invalid_samples` | `Vec<String>`| No | Test samples that **must be rejected** during automated test verification. |
 

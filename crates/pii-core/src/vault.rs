@@ -1313,6 +1313,7 @@ fn test_try_from_catalog_fails_on_invalid_regex() {
             validator: "none".to_string(),
             priority: 50,
             context_keywords: vec![],
+            require_context: false,
             valid_samples: vec![],
             invalid_samples: vec![],
         }],
