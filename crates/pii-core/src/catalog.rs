@@ -16,6 +16,7 @@ pub enum CatalogError {
     UnknownLocale(String),
     InvalidTagPrefix(String),
     InvalidRegex(String),
+    RequireContextNoKeywords(String),
 }
 
 impl fmt::Display for CatalogError {
@@ -46,6 +47,11 @@ impl fmt::Display for CatalogError {
             CatalogError::InvalidRegex(err) => {
                 write!(f, "PII catalog rule regex invalid: {}", err)
             }
+            CatalogError::RequireContextNoKeywords(id) => write!(
+                f,
+                "Rule '{}' sets require_context = true but defines no usable context_keywords; the rule could never fire",
+                id
+            ),
         }
     }
 }
@@ -159,6 +165,14 @@ impl PiiCatalog {
             {
                 return Err(CatalogError::InvalidTagPrefix(rule.tag_prefix.clone()));
             }
+            // A require_context rule with no usable keywords can never fire —
+            // that is a silent fail-open dead rule. Reject it at load time.
+            if rule.require_context
+                && (rule.context_keywords.is_empty()
+                    || rule.context_keywords.iter().any(|kw| kw.trim().is_empty()))
+            {
+                return Err(CatalogError::RequireContextNoKeywords(rule.id.clone()));
+            }
         }
 
         // Phase 2: stage the merged rule set directly. Existing IDs (both
@@ -259,5 +273,62 @@ regex = '(unbalanced['
 "#,
         );
         assert!(matches!(err, Err(CatalogError::InvalidRegex(ref msg)) if msg.contains("BAD")));
+    }
+
+    #[test]
+    fn test_merge_rejects_require_context_without_keywords() {
+        // No keywords at all: the rule could never fire, so it is dead.
+        let mut catalog = PiiCatalog::new();
+        let err = catalog.merge_toml_str(
+            r#"
+locale = "x"
+name = "X"
+
+[[rules]]
+id = "DEAD"
+tag_prefix = "DEAD"
+regex = '\b[A-Z][0-9]{7}\b'
+require_context = true
+context_keywords = []
+"#,
+        );
+        assert!(matches!(err, Err(CatalogError::RequireContextNoKeywords(ref id)) if id == "DEAD"));
+
+        // A blank keyword satisfies `is_empty()` but is equally unusable.
+        let mut catalog = PiiCatalog::new();
+        let err = catalog.merge_toml_str(
+            r#"
+locale = "x"
+name = "X"
+
+[[rules]]
+id = "BLANK"
+tag_prefix = "BLANK"
+regex = '\b[A-Z][0-9]{7}\b'
+require_context = true
+context_keywords = ["   "]
+"#,
+        );
+        assert!(
+            matches!(err, Err(CatalogError::RequireContextNoKeywords(ref id)) if id == "BLANK")
+        );
+
+        // A usable keyword is accepted.
+        let mut catalog = PiiCatalog::new();
+        assert!(catalog
+            .merge_toml_str(
+                r#"
+locale = "x"
+name = "X"
+
+[[rules]]
+id = "OK"
+tag_prefix = "OK"
+regex = '\b[A-Z][0-9]{7}\b'
+require_context = true
+context_keywords = ["license"]
+"#,
+            )
+            .is_ok());
     }
 }

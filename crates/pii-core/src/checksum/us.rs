@@ -46,21 +46,41 @@ pub fn validate_us_ssn(input: &str) -> bool {
 }
 
 /// Validates an Individual Taxpayer Identification Number (ITIN).
-/// - 9 digits with optional single spaces/hyphens between the 3-2-4 groups
-///   (strict separator discipline)
+/// - Exactly 9 contiguous digits, OR `9XX-XX-XXXX` / `9XX XX XXXX` where both
+///   separators are the SAME character anchored at positions 3 and 6 only
+///   (no `"9-1-1-"` mosaics, no mixed `"911-70 1234"` styles)
 /// - Must start with digit `9` (mathematically disjoint from `us_ssn`, which
 ///   rejects the 900..=999 area range)
 /// - 4th and 5th digits (group) must be 50..=65, 70..=88, 90..=92 or 94..=99
 /// - Last 4 digits (serial) must not be 0000
 #[inline]
 pub fn validate_us_itin(input: &str) -> bool {
-    let Some(d) = super::common::strict_digits(input, b" -") else {
-        return false;
-    };
-    if d.len() != 9 || d[0] != 9 {
+    let b = input.as_bytes();
+    if b.len() != 9 && b.len() != 11 {
         return false;
     }
-    let group = d[3] * 10 + d[4];
+    if b.len() == 11 && (b[3] != b[6] || (b[3] != b'-' && b[3] != b' ')) {
+        return false;
+    }
+
+    let mut digits = [0u8; 9];
+    let mut n = 0usize;
+    for (i, &c) in b.iter().enumerate() {
+        if b.len() == 11 && (i == 3 || i == 6) {
+            continue;
+        }
+        if !c.is_ascii_digit() {
+            return false;
+        }
+        if n < 9 {
+            digits[n] = c - b'0';
+        }
+        n += 1;
+    }
+    if n != 9 || digits[0] != 9 {
+        return false;
+    }
+    let group = digits[3] * 10 + digits[4];
     if !(50..=65).contains(&group)
         && !(70..=88).contains(&group)
         && !(90..=92).contains(&group)
@@ -68,7 +88,7 @@ pub fn validate_us_itin(input: &str) -> bool {
     {
         return false;
     }
-    if d[5] == 0 && d[6] == 0 && d[7] == 0 && d[8] == 0 {
+    if digits[5..9] == [0, 0, 0, 0] {
         return false;
     }
     true
@@ -84,7 +104,17 @@ pub fn validate_us_aba_routing(input: &str) -> bool {
     if b.len() != 9 || !b.iter().all(|c| c.is_ascii_digit()) {
         return false;
     }
-    let d: Vec<u8> = b.iter().map(|c| c - b'0').collect();
+    let d = [
+        b[0] - b'0',
+        b[1] - b'0',
+        b[2] - b'0',
+        b[3] - b'0',
+        b[4] - b'0',
+        b[5] - b'0',
+        b[6] - b'0',
+        b[7] - b'0',
+        b[8] - b'0',
+    ];
     let fed = d[0] * 10 + d[1];
     if !(1..=12).contains(&fed)
         && !(21..=32).contains(&fed)
@@ -114,8 +144,11 @@ mod tests {
         assert!(!validate_us_itin("911-49-1234"));
         // Serial 0000
         assert!(!validate_us_itin("911-50-0000"));
-        // Consecutive separators / leading separator
+        // Consecutive separators / asymmetric placement / positional mosaics
         assert!(!validate_us_itin("911--70-1234"));
+        assert!(!validate_us_itin("9-1-1-7-0-1-2-3-4"));
+        assert!(!validate_us_itin("8.3.5.0.3.0.5.6.8"));
+        // Full-validation echo of the mosaic with matched separator counts
         assert!(!validate_us_itin(" 911-70-1234"));
         assert!(!validate_us_itin("911-70-1234-"));
     }

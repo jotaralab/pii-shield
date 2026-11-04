@@ -1,40 +1,12 @@
-/// Strips single ASCII separators between digit characters while enforcing
-/// strict separator discipline (R2): the input must start and end on a digit,
-/// never contain two separators in a row ("--", "  ", ".."), and never start
-/// or end with a separator. Returns `None` on any violation.
-#[inline]
-pub(crate) fn strict_digits(input: &str, seps: &[u8]) -> Option<Vec<u8>> {
-    let bytes = input.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    let is_sep = |b: u8| seps.contains(&b);
-    if is_sep(bytes[0]) || is_sep(bytes[bytes.len() - 1]) {
-        return None;
-    }
-    let mut digits = Vec::with_capacity(bytes.len());
-    let mut last_sep = false;
-    for &b in bytes {
-        if is_sep(b) {
-            if last_sep {
-                return None;
-            }
-            last_sep = true;
-            continue;
-        }
-        last_sep = false;
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        digits.push(b - b'0');
-    }
-    Some(digits)
-}
-
 /// Same strict separator discipline, but keeps ASCII alphanumeric bytes
-/// (uppercased) instead of digits only; used by UK NINO and FR NIR.
+/// (uppercased) instead of digits only; used by FR NIR. Allocation-free:
+/// results are written into the caller-provided `buf`.
 #[inline]
-pub(crate) fn strict_alnum(input: &str, seps: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn strict_alnum_buf<'a>(
+    input: &str,
+    seps: &[u8],
+    buf: &'a mut [u8],
+) -> Option<&'a [u8]> {
     let bytes = input.as_bytes();
     if bytes.is_empty() {
         return None;
@@ -43,7 +15,7 @@ pub(crate) fn strict_alnum(input: &str, seps: &[u8]) -> Option<Vec<u8>> {
     if is_sep(bytes[0]) || is_sep(bytes[bytes.len() - 1]) {
         return None;
     }
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut n = 0usize;
     let mut last_sep = false;
     for &b in bytes {
         if is_sep(b) {
@@ -57,9 +29,15 @@ pub(crate) fn strict_alnum(input: &str, seps: &[u8]) -> Option<Vec<u8>> {
         if !b.is_ascii_alphanumeric() {
             return None;
         }
-        out.push(b.to_ascii_uppercase());
+        if n < buf.len() {
+            buf[n] = b.to_ascii_uppercase();
+        }
+        n += 1;
     }
-    Some(out)
+    if n > buf.len() {
+        return None;
+    }
+    Some(&buf[..n])
 }
 
 /// Validates credit card numbers using the Luhn algorithm (mod 10).

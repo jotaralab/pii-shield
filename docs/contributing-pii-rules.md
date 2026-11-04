@@ -54,9 +54,33 @@ invalid_samples = ["123-45", "000-0000"]
 | `validator` | `String` | No | Algorithmic Stage-3 verifier (`"none"`, `"luhn"`, `"iban_mod97"`, `"e164_phone"`, etc.). Defaults to `"none"`. |
 | `priority` | `u16` | No | Disambiguation priority score (default `50`). Higher scores take precedence when candidate spans overlap. |
 | `context_keywords`| `Vec<String>`| No | Words within a $\pm 48$-byte window that boost match confidence score by `+25`. |
-| `require_context`| `bool`| No (default `false`) | When `true`, a candidate match is **rejected outright** unless at least one `context_keywords` entry appears within the ±48-byte window. Use this for low-entropy patterns without checksums (e.g. `US_CA_DL`) to prevent SKU/commit-SHA false positives. |
+| `require_context`| `bool`| No (default `false`) | When `true`, a candidate match is **rejected outright** unless at least one `context_keywords` entry appears within the ±48-byte window. Use this for low-entropy patterns without checksums (e.g. `US_CA_DL`) to prevent SKU/commit-SHA false positives. Rules with `require_context = true` must declare at least one non-blank keyword — the loader rejects dead rules that could never fire. |
 | `valid_samples` | `Vec<String>`| No | Test samples that **must** match during automated test verification. |
 | `invalid_samples` | `Vec<String>`| No | Test samples that **must be rejected** during automated test verification. |
+
+#### Built-in validator names
+
+| Validator | Rule(s) | Notes |
+|---|---|---|
+| `none` / `""` | any | No algorithmic check (Stage 3 always passes). |
+| `luhn` | `CREDIT_CARD` | Luhn mod-10. |
+| `id_nik` | `ID_NIK` | Indonesian NIK province/date/serial structure. |
+| `id_npwp` | `ID_NPWP` | Indonesian NPWP / NITKU structure. |
+| `id_phone` | `PHONE_ID` | Indonesian operator-prefix / area-code table. |
+| `us_ssn` | `US_SSN` | SSN area/group/serial constraints. |
+| `us_itin` | `US_ITIN` | ITIN `9` prefix + IRS group ranges. |
+| `us_aba_routing` | `US_ROUTING_ABA` | ABA prefix ranges + `3-7-1` mod-10 checksum. |
+| `iban_mod97` | `IBAN` | ISO 7064 Mod 97-10. |
+| `sg_nric` | `SG_NRIC` | Singapore NRIC/FIN mod-11. |
+| `e164_phone` | `PHONE_*` | E.164-shaped phone numbers. |
+| `de_steuer_id` | `DE_STEUER_ID` | ISO 7064 Mod 11,10 + digit histogram. |
+| `fr_nir` | `FR_NIR` | French NIR Mod 97 key, Corse/DOM-TOM departments. |
+| `es_dni` | `ES_DNI` | Spanish DNI/NIE mod-23 letter. |
+| `it_codice_fiscale` | `IT_CODICE_FISCALE` | Italian odd/even check char + omocodia days. |
+| `nl_bsn` | `NL_BSN` | Dutch 11-proef. |
+| `pl_pesel` | `PL_PESEL` | Polish PESEL date encoding + weighted check digit. |
+| `uk_nhs` | `UK_NHS` | UK NHS mod-11. |
+| `uk_nino` | `UK_NINO` | UK NINO prefix/format rules (no checksum digit). |
 
 ### 3. Register the Locale in `catalog.rs`
 
