@@ -140,7 +140,7 @@ pub fn process_outbound_line(line: &str, vault: &mut PiiSessionVault) -> String 
                 if k == "jsonrpc" || k == "id" || k == "method" {
                     continue;
                 }
-                vault.redact_json_value(v);
+                vault.redact_json_value_with_key(v, Some(k));
             }
         }
         Value::Array(arr) => {
@@ -151,7 +151,7 @@ pub fn process_outbound_line(line: &str, vault: &mut PiiSessionVault) -> String 
                         if k == "jsonrpc" || k == "id" || k == "method" {
                             continue;
                         }
-                        vault.redact_json_value(v);
+                        vault.redact_json_value_with_key(v, Some(k));
                     }
                 } else {
                     vault.redact_json_value(elem);

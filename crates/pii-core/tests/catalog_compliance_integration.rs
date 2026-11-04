@@ -296,41 +296,46 @@ fn test_vault_roundtrip_and_json_key_context() {
     assert_eq!(vault.rehydrate(&redacted), original);
 
     // JSON object keys act as qualifying context: the leaf value alone carries
-    // no prose keyword, but `driver_license` must still drive US_CA_DL.
-    let outbound = vault.redact_json(r#"{"driver_license":"A1234567"}"#);
+    // no prose keyword, but `driver_license` must still drive US_CA_DL. The
+    // array places the value >48 bytes from the key, which raw-text scanning
+    // cannot associate.
+    let raw_json =
+        r#"{"driver_license": ["000000000000000000000000000000000000000000000000", "A1234567"]}"#;
+    let outbound = vault.redact_json(raw_json);
     assert!(
         !outbound.contains("A1234567"),
         "Outbound JSON with a `driver_license` key must be redacted, got {}",
         outbound
     );
-
-    let mut json: serde_json::Value = serde_json::from_str(&outbound).expect("valid JSON");
-    vault.redact_json_value(&mut json);
-    let serialized = serde_json::to_string(&json).expect("serializable");
     assert!(
-        !serialized.contains("A1234567"),
-        "JSON value under a `driver_license` key must be redacted, got {}",
-        serialized
-    );
-    assert!(
-        serialized.contains("driver_license"),
+        outbound.contains("driver_license"),
         "JSON keys must be preserved, got {}",
-        serialized
+        outbound
     );
 
-    // ExternalUntrusted tools may never receive the raw value back.
-    let blocked = vault.rehydrate_json_value(&mut json, ToolTrustLevel::ExternalUntrusted);
+    // A *fresh* unredacted value must be redacted through the public API too,
+    // and ExternalUntrusted must block it on Layer 3 (not just Layer 1).
+    let mut fresh: serde_json::Value = serde_json::from_str(raw_json).expect("valid JSON");
+    vault.redact_json_value(&mut fresh);
+    let serialized = serde_json::to_string(&fresh).expect("serializable");
+    assert!(!serialized.contains("A1234567"), "got {}", serialized);
+
+    let mut fresh: serde_json::Value = serde_json::from_str(raw_json).expect("valid JSON");
+    let blocked = vault.rehydrate_json_value(&mut fresh, ToolTrustLevel::ExternalUntrusted);
     assert!(
         matches!(blocked, Err(SecurityError::ExfiltrationBlocked { .. })),
-        "ExternalUntrusted rehydration of a redacted object must be blocked"
+        "ExternalUntrusted rehydration of raw JSON under a qualifying key must be blocked"
     );
 
     // InternalTrusted rehydration restores the original JSON value.
     let mut json: serde_json::Value =
-        serde_json::from_str(&serialized).expect("round-tripped JSON is valid");
+        serde_json::from_str(&outbound).expect("round-tripped JSON is valid");
     vault
         .rehydrate_json_value(&mut json, ToolTrustLevel::InternalTrusted)
         .expect("trusted rehydration succeeds");
     let restored = serde_json::to_string(&json).expect("serializable");
-    assert_eq!(restored, r#"{"driver_license":"A1234567"}"#);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&restored).expect("valid restored JSON"),
+        serde_json::from_str::<serde_json::Value>(raw_json).expect("valid raw JSON")
+    );
 }

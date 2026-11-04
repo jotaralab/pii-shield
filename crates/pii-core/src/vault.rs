@@ -399,7 +399,10 @@ impl PiiSessionVault {
         self.redact_json_value_with_key(value, None)
     }
 
-    fn redact_json_value_with_key(
+    /// Like [`PiiSessionVault::redact_json_value`], but threads an explicit
+    /// parent object key as qualifying context. MCP proxies call this with the
+    /// top-level key so `{"driver_license": "A1234567"}` is redacted.
+    pub fn redact_json_value_with_key(
         &mut self,
         value: &mut serde_json::Value,
         parent_key: Option<&str>,
@@ -421,7 +424,8 @@ impl PiiSessionVault {
                     || (s.starts_with('[') && s.ends_with(']'))
                 {
                     if let Ok(mut inner_val) = serde_json::from_str::<serde_json::Value>(s) {
-                        self.redact_json_value(&mut inner_val);
+                        // Nested JSON-in-JSON inherits the parent key context.
+                        self.redact_json_value_with_key(&mut inner_val, parent_key);
                         if let Ok(serialized) = serde_json::to_string(&inner_val) {
                             *s = serialized;
                             return;
@@ -523,21 +527,28 @@ impl PiiSessionVault {
     ) -> Result<(), SecurityError> {
         match value {
             serde_json::Value::String(s) => {
+                // Nested JSON-in-JSON string leaves inherit `parent_key`, and
+                // are recursed into BEFORE the trust-level branch so that an
+                // ExternalUntrusted caller cannot hide a value inside a nested
+                // array/object string.
+                if (s.starts_with('{') && s.ends_with('}'))
+                    || (s.starts_with('[') && s.ends_with(']'))
+                {
+                    if let Ok(mut inner_val) = serde_json::from_str::<serde_json::Value>(s) {
+                        self.rehydrate_json_value_with_key(
+                            &mut inner_val,
+                            trust_level,
+                            parent_key,
+                        )?;
+                        if let Ok(serialized) = serde_json::to_string(&inner_val) {
+                            *s = serialized;
+                            return Ok(());
+                        }
+                    }
+                }
                 if trust_level == ToolTrustLevel::ExternalUntrusted {
                     self.check_exfiltration_with_key(s, parent_key)?;
                 } else {
-                    // Check if string leaf itself is nested JSON
-                    if (s.starts_with('{') && s.ends_with('}'))
-                        || (s.starts_with('[') && s.ends_with(']'))
-                    {
-                        if let Ok(mut inner_val) = serde_json::from_str::<serde_json::Value>(s) {
-                            self.rehydrate_json_value(&mut inner_val, trust_level)?;
-                            if let Ok(serialized) = serde_json::to_string(&inner_val) {
-                                *s = serialized;
-                                return Ok(());
-                            }
-                        }
-                    }
                     *s = self.rehydrate(s);
                 }
             }
@@ -610,7 +621,14 @@ impl PiiSessionVault {
         trust_level: ToolTrustLevel,
     ) -> Result<String, SecurityError> {
         if trust_level == ToolTrustLevel::ExternalUntrusted {
-            self.check_exfiltration(payload)?;
+            // Parse structured payloads so object keys can act as context for
+            // `require_context` rules; raw-text scanning alone misses values
+            // more than ±48 bytes from their key (arrays, pretty-printed JSON).
+            if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(payload) {
+                self.rehydrate_json_value(&mut json_val, trust_level)?;
+            } else {
+                self.check_exfiltration(payload)?;
+            }
             return Ok(payload.to_string());
         }
 
@@ -1142,6 +1160,95 @@ mod tests {
                 token: "<ID_NIK_1>".to_string()
             })
         );
+    }
+
+    fn us_vault() -> PiiSessionVault {
+        let catalog = crate::catalog::PiiCatalog::with_locales(&["global", "us"])
+            .expect("global+us catalogs parse");
+        PiiSessionVault::from_catalog(catalog)
+    }
+
+    #[test]
+    fn test_json_key_context_beyond_raw_window_and_camel_case() {
+        // The value sits >48 bytes from its key inside an array: raw-text
+        // scanning cannot associate them, but the JSON AST can.
+        let payload = r#"{"driver_license": ["000000000000000000000000000000000000000000000000", "A1234567"]}"#;
+        let mut vault = us_vault();
+        let out = vault.redact_json(payload);
+        assert!(
+            !out.contains("A1234567"),
+            "array element under `driver_license` must be redacted, got {}",
+            out
+        );
+
+        // `ExternalUntrusted` must block the same payload through the parsed
+        // JSON path (before the fix, `rehydrate_for_tool` scanned raw text).
+        let blocked = vault.rehydrate_for_tool(payload, ToolTrustLevel::ExternalUntrusted);
+        assert!(matches!(
+            blocked,
+            Err(SecurityError::ExfiltrationBlocked { .. })
+        ));
+
+        // camelCase keys are identifier-boundary aware.
+        let camel = r#"{"driverLicense":"F0192834"}"#;
+        let out = vault.redact_json(camel);
+        assert!(
+            !out.contains("F0192834"),
+            "camelCase key must redact: {}",
+            out
+        );
+        assert!(matches!(
+            vault.rehydrate_for_tool(camel, ToolTrustLevel::ExternalUntrusted),
+            Err(SecurityError::ExfiltrationBlocked { .. })
+        ));
+
+        // Benign keys containing "dl" as a subword must not gate the rule.
+        // Fresh vault: the earlier redaction registered F0192834 as session PII.
+        let mut vault = us_vault();
+        let sku = r#"{"bundle":"A1234567","buildLog":"F0192834"}"#;
+        let out = vault.redact_json(sku);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).expect("valid JSON"),
+            serde_json::from_str::<serde_json::Value>(sku).expect("valid JSON"),
+            "subword `dl` in JSON keys must never redact SKUs, got {}",
+            out
+        );
+        assert!(vault
+            .rehydrate_for_tool(sku, ToolTrustLevel::ExternalUntrusted)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_nested_json_string_inherits_parent_key() {
+        let mut vault = us_vault();
+
+        let nested = r#"{"driver_license":"[\"A1234567\"]"}"#;
+        let out = vault.redact_json(nested);
+        assert!(
+            !out.contains("A1234567"),
+            "nested array string under `driver_license` must be redacted, got {}",
+            out
+        );
+
+        // ExternalUntrusted must unpack the nested string (not trust it).
+        assert!(matches!(
+            vault.rehydrate_for_tool(nested, ToolTrustLevel::ExternalUntrusted),
+            Err(SecurityError::ExfiltrationBlocked { .. })
+        ));
+    }
+
+    #[test]
+    fn test_redact_json_value_with_key_is_public_for_proxies() {
+        let mut vault = us_vault();
+        let mut value: serde_json::Value =
+            serde_json::from_str(r#"{"ca_dl":"D9876543"}"#).expect("valid JSON");
+        if let serde_json::Value::Object(map) = &mut value {
+            for (k, v) in map.iter_mut() {
+                vault.redact_json_value_with_key(v, Some(k));
+            }
+        }
+        let serialized = serde_json::to_string(&value).expect("serializable");
+        assert!(!serialized.contains("D9876543"), "got {}", serialized);
     }
 
     #[test]

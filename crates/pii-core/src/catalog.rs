@@ -73,6 +73,7 @@ impl From<toml::de::Error> for CatalogError {
 
 /// A declarative PII rule specification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PiiRuleSpec {
     pub id: String,
     pub tag_prefix: String,
@@ -107,6 +108,7 @@ fn default_priority() -> u16 {
 
 /// A locale catalog containing multiple PII rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocaleCatalog {
     pub locale: String,
     pub name: String,
@@ -273,6 +275,67 @@ regex = '(unbalanced['
 "#,
         );
         assert!(matches!(err, Err(CatalogError::InvalidRegex(ref msg)) if msg.contains("BAD")));
+    }
+
+    #[test]
+    fn test_merge_rejects_unknown_fields() {
+        // A typo such as `requires_context` must fail closed instead of
+        // silently defaulting `require_context` to false.
+        let mut catalog = PiiCatalog::new();
+        let err = catalog.merge_toml_str(
+            r#"
+locale = "x"
+name = "X"
+
+[[rules]]
+id = "TYPO"
+tag_prefix = "TYPO"
+regex = '\b[A-Z][0-9]{7}\b'
+requires_context = true
+context_keywords = ["license"]
+"#,
+        );
+        assert!(matches!(err, Err(CatalogError::ParseError(_))));
+
+        // Unknown top-level locale fields fail closed too.
+        let mut catalog = PiiCatalog::new();
+        let err = catalog.merge_toml_str(
+            r#"
+locale = "x"
+name = "X"
+unknown_key = true
+
+[[rules]]
+id = "OK"
+tag_prefix = "OK"
+regex = '\b[A-Z][0-9]{7}\b'
+"#,
+        );
+        assert!(matches!(err, Err(CatalogError::ParseError(_))));
+    }
+
+    #[test]
+    fn test_from_catalog_rejects_gated_rule_without_keywords() {
+        // Struct-literal catalogs bypass `merge_toml_str`, so the scanner
+        // compiler re-validates the require_context invariant.
+        let mut catalog = PiiCatalog::new();
+        catalog.rules.push(PiiRuleSpec {
+            id: "DEAD".to_string(),
+            tag_prefix: "DEAD".to_string(),
+            description: String::new(),
+            regex: r"\b[A-Z][0-9]{7}\b".to_string(),
+            validator: "none".to_string(),
+            priority: 75,
+            context_keywords: vec!["   ".to_string()],
+            require_context: true,
+            valid_samples: Vec::new(),
+            invalid_samples: Vec::new(),
+        });
+        let err = match crate::scanner::PiiScanner::from_catalog(&catalog) {
+            Ok(_) => panic!("gated rule without usable keywords must not compile"),
+            Err(e) => e,
+        };
+        assert!(err.contains("DEAD"), "unexpected error: {}", err);
     }
 
     #[test]

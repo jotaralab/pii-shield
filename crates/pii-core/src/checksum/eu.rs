@@ -422,10 +422,6 @@ pub fn validate_pl_pesel(input: &str) -> bool {
     } else if (60..=72).contains(&raw_mm) {
         2200
     } else {
-        // The 1800-century block (`80..=92`) is intentionally NOT accepted:
-        // it would misclassify many Indonesian `628xxxxxxxx` 11-digit mobile
-        // numbers (PHONE_ID) as century-encoded PESELs, and no living person
-        // has an 1800s birth year.
         return false;
     };
     let year = year_base + (d[0] * 10 + d[1]) as u16;
@@ -611,12 +607,15 @@ fn parse_digits<'a>(input: &str, sep: u8, buf: &'a mut [u8]) -> Option<&'a [u8]>
         if !c.is_ascii_digit() {
             return None;
         }
-        if n < buf.len() {
-            buf[n] = c - b'0';
+        if n >= buf.len() {
+            // Truncating here would let a validator accept a longer input that
+            // merely starts with a valid value, so overflow is a hard reject.
+            return None;
         }
+        buf[n] = c - b'0';
         n += 1;
     }
-    Some(&buf[..n.min(buf.len())])
+    Some(&buf[..n])
 }
 
 #[cfg(test)]
@@ -640,6 +639,9 @@ mod tests {
         assert!(!validate_de_steuer_id("11223456789"));
         // Three-run is invalid
         assert!(!validate_de_steuer_id("51112227648"));
+        // Over-long inputs must not be truncated to a valid 11-digit prefix
+        assert!(!validate_de_steuer_id("519283276489999"));
+        assert!(!validate_de_steuer_id("51928327648999"));
     }
 
     #[test]
@@ -650,6 +652,7 @@ mod tests {
         assert!(validate_fr_nir("181022B10200429")); // Corse 2B -> 18
         assert!(validate_fr_nir("181 022 B 102 004 29")); // spaced 2B
         assert!(validate_fr_nir("195099710200141")); // overseas 971
+        assert!(validate_fr_nir("1 95 09 971 02 001 41")); // spaced overseas 971
         assert!(validate_fr_nir("195099854200106")); // overseas 984
                                                      // Bad key
         assert!(!validate_fr_nir("195024610200146"));
@@ -700,8 +703,10 @@ mod tests {
         assert!(!validate_it_codice_fiscale("RSSMRA85M99H501Q"));
         // Non-omocodia letters in the day slot (also catches the u8 overflow)
         assert!(!validate_it_codice_fiscale("RSSMRA85MZZH501Q"));
-        // Invalid month letter
-        assert!(!validate_it_codice_fiscale("RSSMRA85MJZ1H501Q"));
+        // Invalid month letter (16 chars, reaches the month check)
+        assert!(!validate_it_codice_fiscale("RSSMRA85Z01H501Q"));
+        // 17-char input is rejected on length, not silently truncated
+        assert!(!validate_it_codice_fiscale("RSSMRA85M01H501QQ"));
     }
 
     #[test]

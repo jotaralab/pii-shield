@@ -1,28 +1,35 @@
 /// Validates US Social Security Number (SSN).
-/// - 9 digits
+/// - Exactly 9 contiguous digits, OR `XXX-XX-XXXX` / `XXX XX XXXX` where both
+///   separators are the SAME character anchored at positions 3 and 6 only
+///   (no `"1-2-3-..."` mosaics or doubled separators)
 /// - Area number (first 3 digits) != 000, 666, and not in 900..=999
 /// - Group number (middle 2 digits) != 00
 /// - Serial number (last 4 digits) != 0000
 #[inline]
 pub fn validate_us_ssn(input: &str) -> bool {
-    let trimmed = input.trim();
-    let mut digits = [0u8; 9];
-    let mut count = 0usize;
-
-    for &b in trimmed.as_bytes() {
-        if b == b'-' || b == b' ' {
-            continue;
-        }
-        if !b.is_ascii_digit() {
-            return false;
-        }
-        if count < 9 {
-            digits[count] = b - b'0';
-        }
-        count += 1;
+    let b = input.as_bytes();
+    if b.len() != 9 && b.len() != 11 {
+        return false;
+    }
+    if b.len() == 11 && (b[3] != b[6] || (b[3] != b'-' && b[3] != b' ')) {
+        return false;
     }
 
-    if count != 9 {
+    let mut digits = [0u8; 9];
+    let mut n = 0usize;
+    for (i, &c) in b.iter().enumerate() {
+        if b.len() == 11 && (i == 3 || i == 6) {
+            continue;
+        }
+        if !c.is_ascii_digit() {
+            return false;
+        }
+        if n < 9 {
+            digits[n] = c - b'0';
+        }
+        n += 1;
+    }
+    if n != 9 {
         return false;
     }
 
@@ -132,6 +139,23 @@ pub fn validate_us_aba_routing(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_us_ssn() {
+        assert!(validate_us_ssn("123-45-6789"));
+        assert!(validate_us_ssn("123 45 6789"));
+        assert!(validate_us_ssn("123456789"));
+        // Positional separator mosaics and mixed/doubled separators rejected
+        assert!(!validate_us_ssn("1-2-3-4-5-6-7-8-9"));
+        assert!(!validate_us_ssn("123--45--6789"));
+        assert!(!validate_us_ssn("1 23-45 6789"));
+        assert!(!validate_us_ssn(" 123456789"));
+        assert!(!validate_us_ssn("000-12-3456"));
+        assert!(!validate_us_ssn("666-12-3456"));
+        assert!(!validate_us_ssn("900-12-3456"));
+        assert!(!validate_us_ssn("123-00-6789"));
+        assert!(!validate_us_ssn("123-45-0000"));
+    }
 
     #[test]
     fn test_us_itin() {

@@ -75,18 +75,25 @@ struct CompiledRule {
 /// Case-insensitive keyword hit with ASCII word boundaries: the bytes
 /// immediately before and after a hit must not be alphanumeric. This stops
 /// short keywords like `dl` or `cf` from matching inside `"bundle"`.
+///
+/// Boundary checks run against the FULL `haystack`, while candidate starts are
+/// restricted to `[start, end)`. Slicing the window first would turn the
+/// ±48-byte cutoff into a synthetic word boundary (e.g. `"soap.wsdl"` sliced
+/// right before `"dl"`).
 #[inline]
-fn contains_keyword(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || needle.len() > haystack.len() {
+fn contains_keyword_in(haystack: &[u8], start: usize, end: usize, needle: &[u8]) -> bool {
+    if needle.is_empty() || start >= end || end > haystack.len() || needle.len() > end - start {
         return false;
     }
-    for start in 0..=(haystack.len() - needle.len()) {
-        let prev_ok = start == 0 || !haystack[start - 1].is_ascii_alphanumeric();
-        let end = start + needle.len();
-        let next_ok = end == haystack.len() || !haystack[end].is_ascii_alphanumeric();
-        if prev_ok
-            && next_ok
-            && haystack[start..end]
+    for i in start..=(end - needle.len()) {
+        let hit_end = i + needle.len();
+        let prev_ok = i == 0 || !haystack[i - 1].is_ascii_alphanumeric();
+        if !prev_ok {
+            continue;
+        }
+        let next_ok = hit_end == haystack.len() || !haystack[hit_end].is_ascii_alphanumeric();
+        if next_ok
+            && haystack[i..hit_end]
                 .iter()
                 .zip(needle.iter())
                 .all(|(&h, &n)| h.eq_ignore_ascii_case(&n))
@@ -97,19 +104,56 @@ fn contains_keyword(haystack: &[u8], needle: &[u8]) -> bool {
     false
 }
 
-/// Unbounded case-insensitive substring hit, used only for machine-generated
-/// key context (JSON/MCP object keys like `"driver_license"`), where the
-/// surrounding bytes are identifier separators rather than prose.
+#[cfg(test)]
+#[inline]
+fn contains_keyword(haystack: &[u8], needle: &[u8]) -> bool {
+    contains_keyword_in(haystack, 0, haystack.len(), needle)
+}
+
+/// Identifier-boundary-aware case-insensitive hit for machine key context
+/// (JSON/MCP object keys like `"driver_license"`, `"driverLicense"`). A hit
+/// must be delimited by the key start/end, a non-alphanumeric separator
+/// (`_`, `-`, `.`, ` `), or a camelCase / letter-digit transition. Plain
+/// subword hits such as `"dl"` inside `"bundle"` or `"buildLog"` are rejected.
 #[inline]
 fn contains_key_fragment(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {
         return false;
     }
-    haystack.windows(needle.len()).any(|w| {
-        w.iter()
+    for start in 0..=(haystack.len() - needle.len()) {
+        let end = start + needle.len();
+        if !haystack[start..end]
+            .iter()
             .zip(needle.iter())
             .all(|(&h, &n)| h.eq_ignore_ascii_case(&n))
-    })
+        {
+            continue;
+        }
+        let prev_ok = if start == 0 {
+            true
+        } else {
+            is_identifier_boundary(haystack[start - 1], haystack[start])
+        };
+        let next_ok = if end == haystack.len() {
+            true
+        } else {
+            is_identifier_boundary(haystack[end - 1], haystack[end])
+        };
+        if prev_ok && next_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when two adjacent identifier bytes mark a word boundary, either
+/// because of a non-alphanumeric separator, a lowercase→uppercase camelCase
+/// transition, or a letter↔digit transition.
+#[inline]
+fn is_identifier_boundary(prev: u8, curr: u8) -> bool {
+    !prev.is_ascii_alphanumeric()
+        || (prev.is_ascii_lowercase() && curr.is_ascii_uppercase())
+        || (prev.is_ascii_alphabetic() != curr.is_ascii_alphabetic())
 }
 
 pub struct PiiScanner {
@@ -141,6 +185,18 @@ impl PiiScanner {
             .dfa_size_limit(Some(2 * 1024 * 1024));
 
         for rule in &catalog.rules {
+            // Struct-literal catalogs bypass `merge_toml_str`, so re-validate
+            // the require_context invariant here: a gated rule with no usable
+            // keyword would silently reject every candidate forever.
+            if rule.require_context
+                && (rule.context_keywords.is_empty()
+                    || rule.context_keywords.iter().any(|kw| kw.trim().is_empty()))
+            {
+                return Err(format!(
+                    "Rule '{}' sets require_context = true but defines no usable context_keywords",
+                    rule.id
+                ));
+            }
             patterns.push(rule.regex.as_str());
             let rule_regex = Regex::builder()
                 .configure(meta_config.clone())
@@ -212,24 +268,29 @@ impl PiiScanner {
                         // whose keyword is "cf").
                         let win_start = match_start.saturating_sub(48);
                         let win_end = (r_mat.end() + 48).min(text_bytes.len());
-                        let left = &text_bytes[win_start..match_start];
-                        let right = &text_bytes[r_mat.end()..win_end];
 
                         let keyword_hit = key_context.is_some_and(|key| {
                             rule.context_keywords
                                 .iter()
                                 .any(|kw| contains_key_fragment(key.as_bytes(), kw.as_bytes()))
                         }) || {
-                            let left_hit = rule
-                                .context_keywords
-                                .iter()
-                                .any(|kw| contains_keyword(left, kw.as_bytes()));
-                            let right_hit = left_hit
-                                || rule
-                                    .context_keywords
-                                    .iter()
-                                    .any(|kw| contains_keyword(right, kw.as_bytes()));
-                            left_hit || right_hit
+                            let left_hit = rule.context_keywords.iter().any(|kw| {
+                                contains_keyword_in(
+                                    text_bytes,
+                                    win_start,
+                                    match_start,
+                                    kw.as_bytes(),
+                                )
+                            });
+                            left_hit
+                                || rule.context_keywords.iter().any(|kw| {
+                                    contains_keyword_in(
+                                        text_bytes,
+                                        r_mat.end(),
+                                        win_end,
+                                        kw.as_bytes(),
+                                    )
+                                })
                         };
 
                         // Stage 2 hard gate: rules flagged require_context are
@@ -252,8 +313,12 @@ impl PiiScanner {
                             score += 25;
                         }
 
-                        // Specificity bonus: longer span preferred as tiebreaker
-                        score += (r_mat.end() - r_mat.start()) as i32;
+                        // Specificity bonus: a valid longer span (the full
+                        // entity, incl. its separators) must outrank a shorter
+                        // prefix match, so length is weighted rather than used
+                        // as a 1-point tiebreaker.
+                        let span_len = (r_mat.end() - r_mat.start()) as i32;
+                        score += span_len * 2;
 
                         let em = EntityMatch {
                             entity_type: rule.entity_type.clone(),
@@ -261,8 +326,9 @@ impl PiiScanner {
                             end: r_mat.end(),
                         };
 
-                        if let Some((_, best_score)) = best_match {
-                            if score > best_score {
+                        if let Some((ref best_em, best_score)) = best_match {
+                            let best_len = (best_em.end - best_em.start) as i32;
+                            if score > best_score || (score == best_score && span_len > best_len) {
                                 best_match = Some((em, score));
                             }
                         } else {
@@ -293,6 +359,12 @@ impl PiiScanner {
 mod tests {
     use super::*;
 
+    fn multi_locale_scanner() -> PiiScanner {
+        let catalog = crate::catalog::PiiCatalog::with_locales(&["global", "id", "us", "eu", "sg"])
+            .expect("builtin catalogs parse");
+        PiiScanner::from_catalog(&catalog).expect("scanner compiles")
+    }
+
     #[test]
     fn test_contains_keyword_word_bounds() {
         assert!(contains_keyword(b"handle this", b"handle"));
@@ -302,5 +374,146 @@ mod tests {
         assert!(contains_keyword(b"CA-DMV record", b"dmv"));
         // keyword never matches inside a digit-run/identifier
         assert!(!contains_keyword(b"A1234567", b"123"));
+    }
+
+    #[test]
+    fn test_contains_keyword_in_respects_full_text_boundaries() {
+        // Left cutoff landing mid-word: the window starts at "dl" of "wsdl",
+        // but the preceding byte in the full text is the alphanumeric 's'.
+        assert!(!contains_keyword_in(b"wsdlA1234567", 2, 6, b"dl"));
+        // Right cutoff landing mid-word: the window ends after "dl" of
+        // "adlz", but the following byte in the full text is alphanumeric.
+        assert!(!contains_keyword_in(b"A1234567 dlz", 9, 11, b"dl"));
+        // A genuine standalone keyword inside the window is still found.
+        assert!(contains_keyword_in(b" dl A1234567", 1, 4, b"dl"));
+        assert!(contains_keyword_in(b"A1234567 dl z", 9, 11, b"dl"));
+    }
+
+    #[test]
+    fn test_contains_key_fragment_identifier_boundaries() {
+        for key in [
+            "bundle",
+            "bundle_id",
+            "handler",
+            "deadline",
+            "idle",
+            "middle",
+            "deadlock",
+            "childList",
+            "readLine",
+            "cardLimit",
+            "uploadLink",
+            "buildLog",
+            "recordLocator",
+        ] {
+            assert!(
+                !contains_key_fragment(key.as_bytes(), b"dl"),
+                "key {:?} must not satisfy the `dl` keyword",
+                key
+            );
+        }
+        for key in ["dl", "ca_dl", "camelDl", "dl_number", "someDl"] {
+            assert!(
+                contains_key_fragment(key.as_bytes(), b"dl"),
+                "key {:?} must satisfy the `dl` keyword",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_json_key_context_does_not_redact_skus() {
+        let scanner = multi_locale_scanner();
+        for key in ["bundle", "handler", "buildLog", "deadline"] {
+            assert!(
+                !scanner
+                    .scan_with_context("A1234567", Some(key))
+                    .iter()
+                    .any(|m| m.entity_type.as_tag_prefix() == "US_CA_DL"),
+                "key {:?} must not gate US_CA_DL",
+                key
+            );
+        }
+        for key in ["driver_license", "driverLicense", "ca_dl"] {
+            assert!(
+                scanner
+                    .scan_with_context("A1234567", Some(key))
+                    .iter()
+                    .any(|m| m.entity_type.as_tag_prefix() == "US_CA_DL"),
+                "key {:?} must gate US_CA_DL",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_context_window_cutoffs_are_not_word_boundaries() {
+        let scanner = multi_locale_scanner();
+        for text in [
+            "soap.wsdl returned ok status for order packet item SKU A1234567",
+            "Order SKU A1234567 was processed normally by system module kernel32.dll",
+        ] {
+            assert!(
+                !scanner
+                    .scan(text)
+                    .iter()
+                    .any(|m| m.entity_type.as_tag_prefix() == "US_CA_DL"),
+                "window cutoff must not synthesize a `dl` keyword in {:?}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn test_longer_valid_span_outranks_short_prefix() {
+        let scanner = multi_locale_scanner();
+        // A 12-byte phone must not be truncated to the 9-byte ABA prefix.
+        for text in ["021555123-45", "081234562 789"] {
+            let matches = scanner.scan(text);
+            assert_eq!(matches.len(), 1, "expected one match for {:?}", text);
+            assert_eq!(
+                matches[0].entity_type.as_tag_prefix(),
+                "PHONE_ID",
+                "PHONE_ID must win for {:?}",
+                text
+            );
+            assert_eq!((matches[0].start, matches[0].end), (0, text.len()));
+        }
+
+        // A banking keyword must not let an ABA prefix truncate an email.
+        let email = "Send bank receipt to 121000248@example.com";
+        let matches = scanner.scan(email);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].entity_type.as_tag_prefix(), "EMAIL");
+        assert_eq!(
+            &email[matches[0].start..matches[0].end],
+            "121000248@example.com"
+        );
+
+        // A checksum-less NIE must not be truncated by gated US_CA_DL.
+        for text in [
+            "ID card: Y2345678-Z",
+            "ID card: Y2345678 Z",
+            "ID card: Y2345678Z",
+        ] {
+            let matches = scanner.scan(text);
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected one ES_DNI match for {:?}, got {:?}",
+                text,
+                matches
+            );
+            assert_eq!(matches[0].entity_type.as_tag_prefix(), "ES_DNI");
+            assert_eq!(matches[0].start, 9, "match must start at the NIE body");
+            assert_eq!(matches[0].end, text.len(), "NIE must not be truncated");
+        }
+
+        // Spaced German Steuer-IDs must beat a 9-digit BSN/ABA prefix.
+        let de = "51 928327648";
+        let matches = scanner.scan(de);
+        assert_eq!(matches.len(), 1, "expected one match for {:?}", de);
+        assert_eq!(matches[0].entity_type.as_tag_prefix(), "DE_STEUER_ID");
+        assert_eq!((matches[0].start, matches[0].end), (0, de.len()));
     }
 }
