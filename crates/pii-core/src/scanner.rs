@@ -68,7 +68,48 @@ struct CompiledRule {
     validator: String,
     priority: u16,
     context_keywords: Vec<String>,
+    require_context: bool,
     regex: Regex,
+}
+
+/// Case-insensitive keyword hit with ASCII word boundaries: the bytes
+/// immediately before and after a hit must not be alphanumeric. This stops
+/// short keywords like `dl` or `cf` from matching inside `"bundle"`.
+#[inline]
+fn contains_keyword(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    for start in 0..=(haystack.len() - needle.len()) {
+        let prev_ok = start == 0 || !haystack[start - 1].is_ascii_alphanumeric();
+        let end = start + needle.len();
+        let next_ok = end == haystack.len() || !haystack[end].is_ascii_alphanumeric();
+        if prev_ok
+            && next_ok
+            && haystack[start..end]
+                .iter()
+                .zip(needle.iter())
+                .all(|(&h, &n)| h.eq_ignore_ascii_case(&n))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Unbounded case-insensitive substring hit, used only for machine-generated
+/// key context (JSON/MCP object keys like `"driver_license"`), where the
+/// surrounding bytes are identifier separators rather than prose.
+#[inline]
+fn contains_key_fragment(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| {
+        w.iter()
+            .zip(needle.iter())
+            .all(|(&h, &n)| h.eq_ignore_ascii_case(&n))
+    })
 }
 
 pub struct PiiScanner {
@@ -111,6 +152,7 @@ impl PiiScanner {
                 validator: rule.validator.clone(),
                 priority: rule.priority,
                 context_keywords: rule.context_keywords.clone(),
+                require_context: rule.require_context,
                 regex: rule_regex,
             });
         }
@@ -129,6 +171,15 @@ impl PiiScanner {
     /// Scans text using the 3-Stage Cascading Sieve with UTF-8 safe context scoring
     /// and multi-rule candidate evaluation at overlapping spans.
     pub fn scan(&self, text: &str) -> Vec<EntityMatch> {
+        self.scan_with_context(text, None)
+    }
+
+    /// Like [`PiiScanner::scan`], but additionally treats `key_context`
+    /// (e.g. a JSON / MCP object key such as `"driver_license"`) as standing
+    /// context for rules that declare `context_keywords` / `require_context`.
+    /// `key_context` participates in both the `require_context` hard gate and
+    /// the `+25` keyword bonus (without the ±25 window scan of free text).
+    pub fn scan_with_context(&self, text: &str, key_context: Option<&str>) -> Vec<EntityMatch> {
         let mut results = Vec::new();
         let mut pos = 0;
         let text_bytes = text.as_bytes();
@@ -154,19 +205,51 @@ impl PiiScanner {
 
                     // Stage 3 Checksum Verification
                     if validate_by_name(&rule.validator, slice) {
-                        // Stage 2: Context Keyword & Priority Scoring
-                        let mut score = rule.priority as i32;
-
-                        // Check ±48 bytes window safely on bytes for ASCII context keywords
+                        // Check ±48 bytes window safely on bytes for ASCII
+                        // context keywords. The window EXCLUDES the matched
+                        // span itself so a candidate can never satisfy its
+                        // own gateway keyword ("CF123..." cannot pass a rule
+                        // whose keyword is "cf").
                         let win_start = match_start.saturating_sub(48);
                         let win_end = (r_mat.end() + 48).min(text_bytes.len());
-                        let context_slice = &text_bytes[win_start..win_end];
+                        let left = &text_bytes[win_start..match_start];
+                        let right = &text_bytes[r_mat.end()..win_end];
 
-                        for kw in &rule.context_keywords {
-                            if contains_ignore_ascii_case(context_slice, kw.as_bytes()) {
-                                score += 25;
-                                break;
-                            }
+                        let keyword_hit = key_context.is_some_and(|key| {
+                            rule.context_keywords
+                                .iter()
+                                .any(|kw| contains_key_fragment(key.as_bytes(), kw.as_bytes()))
+                        }) || {
+                            let left_hit = rule
+                                .context_keywords
+                                .iter()
+                                .any(|kw| contains_keyword(left, kw.as_bytes()));
+                            let right_hit = left_hit
+                                || rule
+                                    .context_keywords
+                                    .iter()
+                                    .any(|kw| contains_keyword(right, kw.as_bytes()));
+                            left_hit || right_hit
+                        };
+
+                        // Stage 2 hard gate: rules flagged require_context are
+                        // rejected outright when no context keyword is present
+                        // (prevents SKU/SHA false positives on low-entropy,
+                        // checksum-less patterns).
+                        if rule.require_context && !keyword_hit {
+                            continue;
+                        }
+
+                        // Stage 2: Context Keyword & Priority Scoring.
+                        // require_context rules do NOT earn the +25 bonus:
+                        // satisfying their keywords is the eligibility
+                        // precondition, not an extra signal — otherwise a
+                        // gated rule outscores stricter checksum rules after
+                        // a separator creates a word boundary (e.g. ES_DNI
+                        // "Y2345678-Z" truncated by gated US_CA_DL).
+                        let mut score = rule.priority as i32;
+                        if keyword_hit && !rule.require_context {
+                            score += 25;
                         }
 
                         // Specificity bonus: longer span preferred as tiebreaker
@@ -206,15 +289,18 @@ impl PiiScanner {
     }
 }
 
-#[inline]
-fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return false;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_contains_keyword_word_bounds() {
+        assert!(contains_keyword(b"handle this", b"handle"));
+        assert!(!contains_keyword(b"bundle SKU", b"dl"));
+        assert!(!contains_keyword(b"kindly process", b"dl"));
+        assert!(contains_keyword(b"via dl verification", b"dl"));
+        assert!(contains_keyword(b"CA-DMV record", b"dmv"));
+        // keyword never matches inside a digit-run/identifier
+        assert!(!contains_keyword(b"A1234567", b"123"));
     }
-    haystack.windows(needle.len()).any(|window| {
-        window
-            .iter()
-            .zip(needle.iter())
-            .all(|(&h, &n)| h.eq_ignore_ascii_case(&n))
-    })
 }

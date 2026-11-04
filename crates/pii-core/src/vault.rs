@@ -360,7 +360,14 @@ impl PiiSessionVault {
 
     /// Scrubs raw text and replaces detected PII with typed session-consistent tokens.
     pub fn redact(&mut self, input: &str) -> String {
-        let matches = self.scanner.scan(input);
+        self.redact_with_key(input, None)
+    }
+
+    /// Like [`PiiSessionVault::redact`], but also treats `key_context` (a
+    /// JSON / MCP object key) as qualifying context for rules that declare
+    /// `require_context = true`.
+    fn redact_with_key(&mut self, input: &str, key_context: Option<&str>) -> String {
+        let matches = self.scanner.scan_with_context(input, key_context);
         if matches.is_empty() {
             return input.to_string();
         }
@@ -385,16 +392,27 @@ impl PiiSessionVault {
     /// Recursively redacts all string leaves inside a serde_json::Value AST,
     /// leaving JSON keys, numbers, booleans, and null untouched.
     /// Also handles nested JSON-in-JSON string leaves.
+    /// The immediate parent object key is threaded through as qualifying
+    /// context, so `{"driver_license": "A1234567"}` is redacted even though
+    /// the leaf value itself carries no prose keyword.
     pub fn redact_json_value(&mut self, value: &mut serde_json::Value) {
+        self.redact_json_value_with_key(value, None)
+    }
+
+    fn redact_json_value_with_key(
+        &mut self,
+        value: &mut serde_json::Value,
+        parent_key: Option<&str>,
+    ) {
         match value {
             serde_json::Value::Object(map) => {
-                for (_k, v) in map {
-                    self.redact_json_value(v);
+                for (k, v) in map {
+                    self.redact_json_value_with_key(v, Some(k));
                 }
             }
             serde_json::Value::Array(arr) => {
                 for elem in arr {
-                    self.redact_json_value(elem);
+                    self.redact_json_value_with_key(elem, parent_key);
                 }
             }
             serde_json::Value::String(s) => {
@@ -410,7 +428,7 @@ impl PiiSessionVault {
                         }
                     }
                 }
-                *s = self.redact(s);
+                *s = self.redact_with_key(s, parent_key);
             }
             _ => {}
         }
@@ -486,15 +504,27 @@ impl PiiSessionVault {
 
     /// Recursively rehydrates all string leaves inside a serde_json::Value AST,
     /// enforcing 3-layer exfiltration defense on ExternalUntrusted tools.
+    /// The immediate parent object key is threaded through as qualifying
+    /// context, so `{"driver_license": "A1234567"}` is caught by Layer 3
+    /// even though the leaf value alone carries no contextual keyword.
     pub fn rehydrate_json_value(
         &self,
         value: &mut serde_json::Value,
         trust_level: ToolTrustLevel,
     ) -> Result<(), SecurityError> {
+        self.rehydrate_json_value_with_key(value, trust_level, None)
+    }
+
+    fn rehydrate_json_value_with_key(
+        &self,
+        value: &mut serde_json::Value,
+        trust_level: ToolTrustLevel,
+        parent_key: Option<&str>,
+    ) -> Result<(), SecurityError> {
         match value {
             serde_json::Value::String(s) => {
                 if trust_level == ToolTrustLevel::ExternalUntrusted {
-                    self.check_exfiltration(s)?;
+                    self.check_exfiltration_with_key(s, parent_key)?;
                 } else {
                     // Check if string leaf itself is nested JSON
                     if (s.starts_with('{') && s.ends_with('}'))
@@ -513,12 +543,12 @@ impl PiiSessionVault {
             }
             serde_json::Value::Array(arr) => {
                 for elem in arr {
-                    self.rehydrate_json_value(elem, trust_level)?;
+                    self.rehydrate_json_value_with_key(elem, trust_level, parent_key)?;
                 }
             }
             serde_json::Value::Object(map) => {
-                for (_k, v) in map {
-                    self.rehydrate_json_value(v, trust_level)?;
+                for (k, v) in map {
+                    self.rehydrate_json_value_with_key(v, trust_level, Some(k))?;
                 }
             }
             _ => {}
@@ -526,11 +556,18 @@ impl PiiSessionVault {
         Ok(())
     }
 
-    /// Enforces 3-layer inspection on an untrusted payload string:
-    /// 1. Vault tokens (<...>) or sealed tokens (<PII:...>)
-    /// 2. Known session PII stored in reverse_map.values()
-    /// 3. Raw PII detected by self.scanner.scan(payload)
+    /// Enforces 3-layer inspection on an untrusted payload string.
     fn check_exfiltration(&self, payload: &str) -> Result<(), SecurityError> {
+        self.check_exfiltration_with_key(payload, None)
+    }
+
+    /// Same as [`PiiSessionVault::check_exfiltration`], but the machine key
+    /// context (JSON/MCP object key) participates in Layer 3 scanning.
+    fn check_exfiltration_with_key(
+        &self,
+        payload: &str,
+        key_context: Option<&str>,
+    ) -> Result<(), SecurityError> {
         // Layer 1: Vault tokens
         for token in self.reverse_map.keys() {
             if payload.contains(token) {
@@ -556,7 +593,7 @@ impl PiiSessionVault {
         }
 
         // Layer 3: Scanner scan for raw PII
-        let matches = self.scanner.scan(payload);
+        let matches = self.scanner.scan_with_context(payload, key_context);
         if let Some(first_match) = matches.into_iter().next() {
             return Err(SecurityError::ExfiltrationBlocked {
                 token: format!("<RAW_{}>", first_match.entity_type.as_tag_prefix()),
@@ -1313,6 +1350,7 @@ fn test_try_from_catalog_fails_on_invalid_regex() {
             validator: "none".to_string(),
             priority: 50,
             context_keywords: vec![],
+            require_context: false,
             valid_samples: vec![],
             invalid_samples: vec![],
         }],

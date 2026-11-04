@@ -1,3 +1,45 @@
+/// Same strict separator discipline, but keeps ASCII alphanumeric bytes
+/// (uppercased) instead of digits only; used by FR NIR. Allocation-free:
+/// results are written into the caller-provided `buf`.
+#[inline]
+pub(crate) fn strict_alnum_buf<'a>(
+    input: &str,
+    seps: &[u8],
+    buf: &'a mut [u8],
+) -> Option<&'a [u8]> {
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let is_sep = |b: u8| seps.contains(&b);
+    if is_sep(bytes[0]) || is_sep(bytes[bytes.len() - 1]) {
+        return None;
+    }
+    let mut n = 0usize;
+    let mut last_sep = false;
+    for &b in bytes {
+        if is_sep(b) {
+            if last_sep {
+                return None;
+            }
+            last_sep = true;
+            continue;
+        }
+        last_sep = false;
+        if !b.is_ascii_alphanumeric() {
+            return None;
+        }
+        if n < buf.len() {
+            buf[n] = b.to_ascii_uppercase();
+        }
+        n += 1;
+    }
+    if n > buf.len() {
+        return None;
+    }
+    Some(&buf[..n])
+}
+
 /// Validates credit card numbers using the Luhn algorithm (mod 10).
 ///
 /// Enforces:

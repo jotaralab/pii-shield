@@ -134,6 +134,28 @@ Run `cargo test --workspace` to automatically compile and verify the rules.
 6. **`US_SSN`**: 9-digit United States Social Security Number excluding invalid area (`000`, `666`, `900`–`999`), group, and serial numbers.
 7. **`IBAN`**: International Bank Account Number verified via ISO 7064 Mod 97-10 checksum.
 8. **`SG_NRIC`**: Singapore National Registration Identity Card / FIN Mod-11 checksum.
+9. **`PHONE_SG`**: Singapore NANP-style mobile/landline numbers (`+65` optional, `3`/`6`/`8`/`9` prefixes) validated as E.164.
+
+**GDPR (European Union & UK) — `eu` locale:**
+
+- **`DE_STEUER_ID`**: 11-digit German Steuer-Identifikationsnummer with ISO 7064 Mod 11,10 check digit and dedup-protected digit histogram (single pair or single triple, no 3-digit runs).
+- **`FR_NIR`**: 15-character French social security number (NIR) with Mod 97 key check, Corse `2A`/`2B` normalization, and overseas DOM-TOM department validation (`971–978`, `984–988`).
+- **`ES_DNI` / NIE**: 9-character Spanish national ID with Mod 23 letter check (`TRWAGMYFPDXBNJZSQVHLCKE`), including `X/Y/Z` foreigner prefixes.
+- **`IT_CODICE_FISCALE`**: 16-character Italian fiscal code with official odd/even check-char tables and omocodia day decoding (`L→0 … V→9`).
+- **`NL_BSN`**: 9-digit Dutch Burgerservicenummer validated with the 11-proef (dot-separated or contiguous).
+- **`PL_PESEL`**: 11-digit Polish national number with century-aware month encoding, full Gregorian date validation (leap years 1900–2200; the 1800s century block is deliberately rejected to avoid colliding with Indonesian 11-digit mobile numbers), and weighted check digit.
+- **`UK_NHS`**: 10-digit UK National Health Service number verified with the Mod 11 algorithm (spaced, hyphenated, or contiguous).
+- **`UK_NINO`**: 9-character UK National Insurance number with reserved first/second letter rules and forbidden prefix list (`BG`, `GB`, `NK`, `KN`, `TN`, `NT`, `ZZ`).
+- **`PHONE_EU`**: European E.164 telephone numbers (`+3x` / `+4x` country codes) normalized and validated before redaction.
+
+**CCPA / US — `us` locale:**
+
+- **`US_ITIN`**: Individual Taxpayer Identification Number (`9XX-XX-XXXX`) with IRS group-range validation — mathematically disjoint from `US_SSN`, which rejects the 900–999 area range.
+- **`US_ROUTING_ABA`**: 9-digit ABA transit number with Federal Reserve prefix ranges (`01–12`, `21–32`, `61–72`, `80`) and the weight `3-7-1` mod 10 checksum.
+- **`US_CA_DL`**: California driver's license (`\b[A-Z][0-9]{7}\b`) with **`require_context = true`** — matched only when a keyword like `driver`, `license`, `dl`, `dmv`, or `california` appears within ±48 bytes, so product SKUs, ticket IDs and commit SHAs are never falsely redacted.
+- **`PHONE_US`**: North American NANP numbers (`+1` optional, `555-234-5678`, `(555) 234-5678`) with area-code / exchange digit constraints.
+
+All new validators enforce strict separator discipline: leading/trailing separators, consecutive separators (`--`, `  `, `..`), and stray characters are rejected up front. New declarative rules may also opt into context gating with `require_context = true` combined with `context_keywords` (see [docs/contributing-pii-rules.md](docs/contributing-pii-rules.md)).
 
 ---
 
