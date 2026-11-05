@@ -598,213 +598,6 @@ fn test_fail_closed_exit_code_2() {
 // Multi-pod E2E: shared RESP (Valkey/Redis) store
 // ---------------------------------------------------------------------------
 
-mod resp {
-    use std::collections::HashMap;
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::Duration;
-
-    #[derive(Default)]
-    pub struct State {
-        pub hashes: HashMap<String, HashMap<String, String>>,
-        pub commands: Vec<String>,
-    }
-
-    pub struct MockValkey {
-        addr: String,
-        state: Arc<Mutex<State>>,
-        stop: Arc<AtomicBool>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl MockValkey {
-        pub fn start() -> Self {
-            Self::start_with(true)
-        }
-
-        /// `keep_serving = false` serves the first connection until its first
-        /// HGETALL, then shuts the listener + socket down to simulate an outage.
-        pub fn start_with(keep_serving: bool) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock valkey");
-            listener.set_nonblocking(true).expect("nonblocking");
-            let addr = listener.local_addr().unwrap().to_string();
-            let state = Arc::new(Mutex::new(State::default()));
-            let stop = Arc::new(AtomicBool::new(false));
-            let state_t = Arc::clone(&state);
-            let stop_t = Arc::clone(&stop);
-            let handle = thread::spawn(move || {
-                let mut active: Vec<TcpStream> = Vec::new();
-                while !stop_t.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            stream.set_nonblocking(false).unwrap();
-                            let state_c = Arc::clone(&state_t);
-                            let stop_c = Arc::clone(&stop_t);
-                            let ctl = stream.try_clone().unwrap();
-                            active.push(ctl);
-                            thread::spawn(move || {
-                                handle_client(stream, state_c, stop_c, keep_serving);
-                            });
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => break,
-                    }
-                }
-                for s in active {
-                    let _ = s.shutdown(std::net::Shutdown::Both);
-                }
-            });
-            Self {
-                addr,
-                state,
-                stop,
-                handle: Some(handle),
-            }
-        }
-
-        pub fn url(&self) -> String {
-            format!("redis://{}", self.addr)
-        }
-
-        pub fn entry_count(&self, key: &str) -> usize {
-            self.state
-                .lock()
-                .unwrap()
-                .hashes
-                .get(key)
-                .map(|m| m.len())
-                .unwrap_or(0)
-        }
-    }
-
-    impl Drop for MockValkey {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::SeqCst);
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
-            }
-        }
-    }
-
-    fn read_args(reader: &mut BufReader<TcpStream>) -> Option<Vec<String>> {
-        let mut line = String::new();
-        if reader.read_line(&mut line).ok()? == 0 {
-            return None;
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if !line.starts_with('*') {
-            return Some(Vec::new());
-        }
-        let count: usize = line[1..].parse().ok()?;
-        let mut args = Vec::with_capacity(count);
-        for _ in 0..count {
-            let mut len_line = String::new();
-            reader.read_line(&mut len_line).ok()?;
-            let len_line = len_line.trim_end_matches(['\r', '\n']);
-            let len: usize = len_line.strip_prefix('$')?.parse().ok()?;
-            let mut buf = vec![0u8; len + 2];
-            reader.read_exact(&mut buf).ok()?;
-            args.push(String::from_utf8_lossy(&buf[..len]).to_string());
-        }
-        Some(args)
-    }
-
-    fn handle_client(
-        stream: TcpStream,
-        state: Arc<Mutex<State>>,
-        stop: Arc<AtomicBool>,
-        keep_serving: bool,
-    ) {
-        let mut writer = stream.try_clone().unwrap();
-        let mut reader = BufReader::new(stream);
-        let mut queued: Vec<Vec<String>> = Vec::new();
-        let mut in_multi = false;
-        while let Some(args) = read_args(&mut reader) {
-            if args.is_empty() {
-                continue;
-            }
-            let cmd = args[0].to_ascii_lowercase();
-            state.lock().unwrap().commands.push(cmd.clone());
-            if cmd == "client" {
-                let _ = writer.write_all(b"+OK\r\n");
-                continue;
-            }
-            if in_multi {
-                match cmd.as_str() {
-                    "exec" => {
-                        let replies: Vec<Vec<u8>> =
-                            queued.drain(..).map(|q| apply(&q, &state)).collect();
-                        write_array(&mut writer, &replies);
-                        in_multi = false;
-                    }
-                    _ => {
-                        queued.push(args);
-                        let _ = writer.write_all(b"+QUEUED\r\n");
-                    }
-                }
-                continue;
-            }
-            if cmd == "multi" {
-                in_multi = true;
-                let _ = writer.write_all(b"+OK\r\n");
-                continue;
-            }
-            let reply = apply(&args, &state);
-            let _ = writer.write_all(&reply);
-            if cmd == "hgetall" && !keep_serving {
-                stop.store(true, Ordering::SeqCst);
-                let _ = writer.shutdown(std::net::Shutdown::Both);
-                let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
-                break;
-            }
-        }
-    }
-
-    fn apply(args: &[String], state: &Arc<Mutex<State>>) -> Vec<u8> {
-        let cmd = args[0].to_ascii_lowercase();
-        let mut st = state.lock().unwrap();
-        match cmd.as_str() {
-            "hgetall" => {
-                let map = st.hashes.get(&args[1]).cloned().unwrap_or_default();
-                let mut out = format!("*{}\r\n", map.len() * 2).into_bytes();
-                for (k, v) in map {
-                    out.extend_from_slice(format!("${}\r\n{}\r\n", k.len(), k).as_bytes());
-                    out.extend_from_slice(format!("${}\r\n{}\r\n", v.len(), v).as_bytes());
-                }
-                out
-            }
-            "hset" | "hmset" => {
-                let map = st.hashes.entry(args[1].clone()).or_default();
-                let mut added = 0;
-                let mut i = 2;
-                while i + 1 < args.len() {
-                    if map.insert(args[i].clone(), args[i + 1].clone()).is_none() {
-                        added += 1;
-                    }
-                    i += 2;
-                }
-                format!(":{}\r\n", added).into_bytes()
-            }
-            "expire" => b":1\r\n".to_vec(),
-            "ping" => b"+PONG\r\n".to_vec(),
-            _ => b"+OK\r\n".to_vec(),
-        }
-    }
-
-    fn write_array(writer: &mut TcpStream, replies: &[Vec<u8>]) {
-        let mut out = format!("*{}\r\n", replies.len()).into_bytes();
-        for r in replies {
-            out.extend_from_slice(r);
-        }
-        let _ = writer.write_all(&out);
-    }
-}
-
 /// Extracts the first `<ID_NIK_...>` token from a line.
 fn extract_nik_token(buf: &str) -> String {
     let start = buf.find("<ID_NIK_").expect("NIK token present");
@@ -814,16 +607,51 @@ fn extract_nik_token(buf: &str) -> String {
 
 #[test]
 fn test_multi_pod_shared_valkey_store() {
-    use resp::MockValkey;
+    use pii_store_redis::test_support::MockValkey;
     use std::io::BufRead;
+    use std::time::{Duration, Instant};
 
     let key_hex = "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb";
     let session = "shared-session-1";
+    let hash_key = format!("pii:v1:{}", session);
     let valkey = MockValkey::start();
     let proxy_bin = env!("CARGO_BIN_EXE_pii-mcp-proxy");
     let mock_bin = env!("CARGO_BIN_EXE_mock_mcp_server");
 
-    // --- Pod A: redact + persist ---
+    // --- Pod B starts first and boots against an empty store ---
+    let mut pod_b = Command::new(proxy_bin)
+        .arg("--locales")
+        .arg("global,id")
+        .arg("--trusted-tools")
+        .arg("query_customer")
+        .arg("--valkey-url")
+        .arg(valkey.url())
+        .arg("--session-id")
+        .arg(session)
+        .arg("--")
+        .arg(mock_bin)
+        .env("PII_SHIELD_SESSION_KEY", key_hex)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn pod B");
+    let mut stdin_b = pod_b.stdin.take().unwrap();
+    let mut reader_b = BufReader::new(pod_b.stdout.take().unwrap());
+
+    // Wait until Pod B's mandatory startup HGETALL has been served while the
+    // store is still empty, so it cannot rely on startup hydration below.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while valkey.command_count("hgetall") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "Pod B never performed its startup HGETALL"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(valkey.entry_count(&hash_key), 0);
+
+    // --- Pod A starts while Pod B is live: redact + persist ---
     let mut pod_a = Command::new(proxy_bin)
         .arg("--locales")
         .arg("global,id")
@@ -833,6 +661,8 @@ fn test_multi_pod_shared_valkey_store() {
         .arg(valkey.url())
         .arg("--session-id")
         .arg(session)
+        .arg("--session-ttl")
+        .arg("120")
         .arg("--")
         .arg(mock_bin)
         .env("PII_SHIELD_SESSION_KEY", key_hex)
@@ -857,34 +687,30 @@ fn test_multi_pod_shared_valkey_store() {
         line
     );
     let token = extract_nik_token(&line);
+
+    // The atomic write must have been observed: MULTI/HSET/EXPIRE/EXEC and
+    // the configured TTL, not just an in-memory redaction.
     assert!(
-        valkey.entry_count(&format!("pii:v1:{}", session)) >= 1,
+        valkey.entry_count(&hash_key) >= 1,
         "Pod A must persist the sealed NIK entry"
     );
+    assert_eq!(
+        valkey.ttl(&hash_key),
+        Some(120),
+        "Pod A must apply the configured session TTL"
+    );
+    assert!(valkey.command_count("multi") >= 1, "MULTI must be used");
+    assert!(
+        valkey.command_count("hset") + valkey.command_count("hmset") >= 1,
+        "HSET/HMSET must be used"
+    );
+    assert!(valkey.command_count("expire") >= 1, "EXPIRE must be used");
+    assert!(valkey.command_count("exec") >= 1, "EXEC must be used");
+
     drop(stdin_a);
     assert!(pod_a.wait().unwrap().success());
 
-    // --- Pod B: startup hydration + rehydrate trusted, block untrusted ---
-    let mut pod_b = Command::new(proxy_bin)
-        .arg("--locales")
-        .arg("global,id")
-        .arg("--trusted-tools")
-        .arg("query_customer")
-        .arg("--valkey-url")
-        .arg(valkey.url())
-        .arg("--session-id")
-        .arg(session)
-        .arg("--")
-        .arg(mock_bin)
-        .env("PII_SHIELD_SESSION_KEY", key_hex)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn pod B");
-    let mut stdin_b = pod_b.stdin.take().unwrap();
-    let mut reader_b = BufReader::new(pod_b.stdout.take().unwrap());
-
+    // --- Pod B: dynamic inbound hydration (startup snapshot was empty) ---
     writeln!(
         stdin_b,
         r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"query_customer","arguments":{{"nik":"{}"}}}}}}"#,
@@ -896,7 +722,7 @@ fn test_multi_pod_shared_valkey_store() {
     reader_b.read_line(&mut line_b).unwrap();
     assert!(
         line_b.contains(r#""child_saw_token":false"#),
-        "Pod B must rehydrate the token from the shared store: {}",
+        "Pod B must hydrate the token dynamically on inbound tools/call: {}",
         line_b
     );
 
@@ -916,12 +742,85 @@ fn test_multi_pod_shared_valkey_store() {
     );
 
     drop(stdin_b);
-    let _ = pod_b.wait();
+    assert!(pod_b.wait().unwrap().success(), "Pod B must exit cleanly");
+}
+
+#[test]
+fn test_valkey_outbound_failure_retries_on_next_turn() {
+    use pii_store_redis::test_support::MockValkey;
+    use std::io::BufRead;
+
+    let key_hex = "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb";
+    let session = "retry-session-1";
+    let hash_key = format!("pii:v1:{}", session);
+    // First EXEC is aborted, so turn 1's tokens stay dirty; turn 2 retries.
+    let valkey = MockValkey::start_failing_first_exec();
+    let proxy_bin = env!("CARGO_BIN_EXE_pii-mcp-proxy");
+    let mock_bin = env!("CARGO_BIN_EXE_mock_mcp_server");
+
+    let mut proxy = Command::new(proxy_bin)
+        .arg("--locales")
+        .arg("global,id")
+        .arg("--trusted-tools")
+        .arg("query_customer")
+        .arg("--valkey-url")
+        .arg(valkey.url())
+        .arg("--session-id")
+        .arg(session)
+        .arg("--")
+        .arg(mock_bin)
+        .env("PII_SHIELD_SESSION_KEY", key_hex)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn proxy");
+    let mut stdin = proxy.stdin.take().unwrap();
+    let mut reader = BufReader::new(proxy.stdout.take().unwrap());
+
+    // Turn 1: outbound redaction creates a token, but the store write fails
+    // (first EXEC aborted), so nothing may be reported as persisted.
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"init_data"}}"#).unwrap();
+    stdin.flush().unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(
+        line.contains("<ID_NIK_") && !line.contains("3573012203950001"),
+        "turn 1 must redact NIK: {}",
+        line
+    );
+    assert_eq!(
+        valkey.entry_count(&hash_key),
+        0,
+        "aborted EXEC must not persist any entry"
+    );
+
+    // Turn 2: the retained dirty token is flushed before the inbound tool call
+    // and the retried EXEC succeeds.
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"query_customer","arguments":{{"nik":"3573012203950001"}}}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(
+        valkey.entry_count(&hash_key) >= 1,
+        "dirty token must be retried and persisted on turn 2"
+    );
+    assert!(
+        valkey.command_count("exec") >= 2,
+        "first EXEC must fail and the second must succeed"
+    );
+
+    drop(stdin);
+    assert!(proxy.wait().unwrap().success(), "proxy must exit cleanly");
 }
 
 #[test]
 fn test_valkey_outage_during_tools_call_fails_closed() {
-    use resp::MockValkey;
+    use pii_store_redis::test_support::MockValkey;
     use std::io::BufRead;
 
     let key_hex = "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb";
@@ -968,7 +867,7 @@ fn test_valkey_outage_during_tools_call_fails_closed() {
     assert!(line.contains("PII vault store synchronization failed"));
 
     drop(stdin);
-    let _ = proxy.wait();
+    assert!(proxy.wait().unwrap().success(), "proxy must exit cleanly");
 }
 
 #[test]

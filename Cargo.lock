@@ -451,6 +451,7 @@ name = "pii-ffi"
 version = "0.1.0"
 dependencies = [
  "pii-core",
+ "serde_json",
 ]
 
 [[package]]
@@ -478,6 +479,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom",
  "pii-core",
+ "serde_json",
  "wasm-bindgen",
 ]
 

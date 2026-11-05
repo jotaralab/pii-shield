@@ -213,6 +213,64 @@ pub unsafe extern "C" fn pii_vault_drain_dirty_sealed_entries_json(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pii_vault_seal_dirty_sealed_entries_json(
+    ptr: *mut PiiVaultHandle,
+    aad: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        if ptr.is_null() {
+            return ptr::null_mut();
+        }
+        let aad_str = if aad.is_null() {
+            ""
+        } else {
+            match CStr::from_ptr(aad).to_str() {
+                Ok(s) => s,
+                Err(_) => return ptr::null_mut(),
+            }
+        };
+        let handle = &*ptr;
+        let vault = match handle.0.lock() {
+            Ok(g) => g,
+            Err(_) => return ptr::null_mut(),
+        };
+        match CString::new(vault.seal_dirty_entries_json(aad_str)) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pii_vault_clear_dirty_tokens(
+    ptr: *mut PiiVaultHandle,
+    tokens_json: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if ptr.is_null() || tokens_json.is_null() {
+            return false;
+        }
+        let tokens_str = match CStr::from_ptr(tokens_json).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let tokens: Vec<String> = match serde_json::from_str(tokens_str) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        let handle = &*ptr;
+        let mut vault = match handle.0.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        vault.clear_dirty_tokens(&tokens);
+        true
+    }))
+    .unwrap_or(false)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pii_vault_import_sealed_entries_json(
     ptr: *mut PiiVaultHandle,
     json_map: *const c_char,
