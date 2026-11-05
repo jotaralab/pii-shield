@@ -98,6 +98,21 @@ impl WasmPiiSession {
         self.inner.drain_dirty_sealed_entries_json(aad)
     }
 
+    /// Non-destructive snapshot for safe async persistence: persist the JSON,
+    /// then call `clearDirtyTokens` only after the write succeeds.
+    #[wasm_bindgen(js_name = sealDirtySealedEntriesJson)]
+    pub fn seal_dirty_sealed_entries_json(&self, aad: &str) -> String {
+        self.inner.seal_dirty_entries_json(aad)
+    }
+
+    #[wasm_bindgen(js_name = clearDirtyTokens)]
+    pub fn clear_dirty_tokens(&mut self, tokens_json: &str) -> Result<(), JsValue> {
+        let tokens: Vec<String> = serde_json::from_str(tokens_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid token list: {}", e)))?;
+        self.inner.clear_dirty_tokens(&tokens);
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = importSealedEntriesJson)]
     pub fn import_sealed_entries_json(&mut self, json_map: &str, aad: &str) -> Result<(), JsValue> {
         self.inner

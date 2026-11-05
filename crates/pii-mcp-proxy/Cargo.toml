@@ -16,3 +16,6 @@ pii-store-redis = { path = "../pii-store-redis" }
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+pii-store-redis = { path = "../pii-store-redis", features = ["test-support"] }

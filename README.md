@@ -61,6 +61,7 @@
 - **`crates/pii-wasm`**: `wasm-bindgen` bindings for Browser demos, Cloudflare Workers, and Vercel Edge middleware.
 - **`crates/pii-ffi`**: C-ABI (`cbindgen`) thread-safe exports for zero-overhead embedding in Go, C/C++, Ruby, and Elixir.
 - **`crates/pii-mcp-proxy`**: Fail-closed bidirectional STDIO wrapper for Model Context Protocol (MCP) servers that automatically rehydrates tool arguments and scrubs tool outputs.
+- **`crates/pii-store-redis`**: Valkey / Redis backed `PiiVaultStore` adapter for distributed multi-pod sessions (atomic `MULTI`/`HSET`/`EXPIRE`/`EXEC` writes and per-session TTLs).
 
 ---
 
@@ -201,7 +202,7 @@ pii-mcp-proxy --locales none --rules-file ./rules/br.toml -- npx .../server
 --token-format stateless-sealed  # <PII:EMAIL:HEX>, self-contained encrypted token
 
 PII_SHIELD_SESSION_KEY=  # 64-char hex (32 bytes); required for cross-process
-                         # sealed-token decryption (--stdio-filter always needs it)
+                         # sealed-token decryption (always required by filter mode)
 PII_SHIELD_TOKEN_FORMAT= # env alias for --token-format
 PII_SHIELD_STATELESS=1   # env alias for stateless-sealed when --token-format is omitted
 ```
@@ -211,9 +212,9 @@ non-empty uppercase `[A-Z0-9_]+`, the regex must compile with the scanner's
 syntax config (bounded NFA/DFA sizes), and `pii-mcp-proxy` refuses to start if
 the merged catalog would contain no rules — invalid configuration can never
 silently disable PII redaction. STDIO filter mode (`--stdio-filter`, or running
-without a child command) requires `--token-format stateless-sealed` plus
-`PII_SHIELD_SESSION_KEY`, since stateful tokens cannot be generated in
-a redaction-less filter pass.
+without a child command) requires `PII_SHIELD_SESSION_KEY` and either
+`--token-format stateless-sealed`, or `compact-hash` tokens together with
+`--valkey-url` so the proxy can hydrate them from the shared store.
 
 ### Distributed sessions (Valkey / Redis)
 
@@ -240,9 +241,18 @@ PII_SHIELD_SESSION_TTL=  # env alias for --session-ttl (default 3600s)
 Distributed mode fails closed (exit `2`) unless a non-empty `--session-id` and
 a 32-byte `PII_SHIELD_SESSION_KEY` are set. Tokens default to `compact-hash`;
 `--token-format sequential` is rejected because per-pod counters collide across
-replicas. Startup hydration must succeed, inbound `tools/call` failures return
-JSON-RPC `-32003`, and outbound writes release the vault lock during network
-I/O with dirty tokens retained for retry when the store is unavailable.
+replicas, and `stateless-sealed` is rejected because it never writes session
+state. With a store configured, `--stdio-filter` may use `compact-hash` tokens
+and hydrates them on inbound `tools/call`; without a store, filter mode requires
+`stateless-sealed`. Startup hydration must succeed, inbound `tools/call`
+failures return JSON-RPC `-32003`, and outbound writes release the vault lock
+during network I/O with dirty tokens retained and retried before the next
+inbound call and on child EOF when the store is unavailable.
+
+> **TLS:** `rediss://` URLs require a TLS feature on the `redis` crate. The
+> dependency is currently built with `default-features = false` (no TLS), so use
+> a trusted private network or enable a TLS feature in `crates/pii-store-redis`
+> before configuring `rediss://`.
 
 Run `pii-mcp-proxy --help` / `--version` for the full CLI reference.
 
