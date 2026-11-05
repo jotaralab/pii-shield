@@ -210,10 +210,10 @@ impl PiiVaultStore for RedisVaultStore {
         session_id: &str,
         entries: Vec<(String, String)>,
     ) -> Result<(), Self::Error> {
+        Self::validate_session_id(session_id)?;
         if entries.is_empty() {
             return Ok(());
         }
-        Self::validate_session_id(session_id)?;
         let key = self.session_key(session_id);
         let ttl = self.ttl_secs;
         self.with_connection(|conn| {
@@ -296,6 +296,8 @@ mod tests {
         let store = store(&server);
         assert!(store.get_entries("").is_err());
         assert!(store.get_entries("   ").is_err());
+        assert!(store.put_entries("", Vec::new()).is_err());
+        assert!(store.put_entries(" ", Vec::new()).is_err());
         assert!(store
             .put_entries(" ", vec![("a".into(), "b".into())])
             .is_err());

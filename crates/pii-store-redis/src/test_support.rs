@@ -40,6 +40,7 @@ pub struct MockValkey {
     state: Arc<Mutex<MockState>>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+    workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
 }
 
 impl MockValkey {
@@ -106,6 +107,8 @@ impl MockValkey {
         let state_t = Arc::clone(&state);
         let stop_t = Arc::clone(&stop);
         let faults = Arc::new(faults);
+        let workers = Arc::new(Mutex::new(Vec::new()));
+        let workers_t = Arc::clone(&workers);
         let handle = thread::spawn(move || {
             let mut active: Vec<TcpStream> = Vec::new();
             while !stop_t.load(Ordering::SeqCst) {
@@ -120,9 +123,10 @@ impl MockValkey {
                         let faults_c = Arc::clone(&faults);
                         let ctl = stream.try_clone().unwrap();
                         active.push(ctl);
-                        thread::spawn(move || {
+                        let worker = thread::spawn(move || {
                             handle_client(stream, state_c, stop_c, faults_c);
                         });
+                        workers_t.lock().unwrap().push(worker);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -139,6 +143,7 @@ impl MockValkey {
             state,
             stop,
             handle: Some(handle),
+            workers,
         }
     }
 
@@ -189,6 +194,12 @@ impl Drop for MockValkey {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
+        }
+        // The listener shut down every active socket above, so each client
+        // worker observes EOF and can be joined deterministically.
+        let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        for worker in workers {
+            let _ = worker.join();
         }
     }
 }

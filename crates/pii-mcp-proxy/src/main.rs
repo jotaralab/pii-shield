@@ -52,11 +52,20 @@ pub fn process_inbound_line(
         return InboundAction::Forward(line.to_string());
     }
 
-    let Ok(mut val) = serde_json::from_str::<Value>(trimmed) else {
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(val) => process_inbound_value(val, line, vault, acl),
         // If not valid JSON, forward as-is
-        return InboundAction::Forward(line.to_string());
-    };
+        Err(_) => InboundAction::Forward(line.to_string()),
+    }
+}
 
+/// Processes an already-parsed inbound JSON value.
+fn process_inbound_value(
+    mut val: Value,
+    line: &str,
+    vault: &mut PiiSessionVault,
+    acl: &ToolAcl,
+) -> InboundAction {
     match &mut val {
         Value::Object(map) => {
             if let Some(action) = process_single_inbound_request(map, vault, acl) {
@@ -130,7 +139,9 @@ fn process_single_inbound_request(
             match params {
                 Value::Object(obj) => {
                     for (key, value) in obj.iter_mut() {
-                        if key == "name" {
+                        // Trusted tools keep their tool identifier untouched;
+                        // untrusted calls still scan `name` for exfiltration.
+                        if key == "name" && trust_level == ToolTrustLevel::InternalTrusted {
                             continue;
                         }
                         if let Err(err) =
@@ -151,48 +162,59 @@ fn process_single_inbound_request(
     None
 }
 
-/// Returns true when the JSON-RPC payload (single or batch) is a `tools/call`.
-pub fn payload_is_tools_call(line: &str) -> bool {
-    let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
-        return false;
-    };
+fn value_is_tools_call(val: &Value) -> bool {
     let is_call = |v: &Value| v.get("method").and_then(|m| m.as_str()) == Some("tools/call");
-    match &val {
-        Value::Object(_) => is_call(&val),
+    match val {
+        Value::Object(_) => is_call(val),
         Value::Array(arr) => arr.iter().any(is_call),
         _ => false,
     }
 }
 
-fn payload_request_id(line: &str) -> Value {
-    let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
-        return Value::Null;
-    };
-    match &val {
-        Value::Object(map) => map.get("id").cloned().unwrap_or(Value::Null),
-        Value::Array(arr) => arr
-            .iter()
-            .find(|v| v.get("method").and_then(|m| m.as_str()) == Some("tools/call"))
-            .and_then(|v| v.get("id"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        _ => Value::Null,
-    }
+/// Returns true when the JSON-RPC payload (single or batch) is a `tools/call`.
+pub fn payload_is_tools_call(line: &str) -> bool {
+    serde_json::from_str::<Value>(line.trim())
+        .map(|val| value_is_tools_call(&val))
+        .unwrap_or(false)
 }
 
-/// Fail-closed JSON-RPC error returned when the distributed store cannot be
-/// synchronized before an inbound tool call.
-pub fn storage_sync_error_response(line: &str, detail: &str) -> String {
+fn sync_error_value(id: Value, detail: &str) -> Value {
     serde_json::json!({
         "jsonrpc": "2.0",
-        "id": payload_request_id(line),
+        "id": id,
         "error": {
             "code": -32003,
             "message": "PII vault store synchronization failed",
             "data": { "detail": detail }
         }
     })
-    .to_string()
+}
+
+/// Fail-closed JSON-RPC error returned when the distributed store cannot be
+/// synchronized before an inbound tool call. Batch requests get one error per
+/// `tools/call` element so the client can correlate responses by id.
+pub fn storage_sync_error_response(line: &str, detail: &str) -> String {
+    let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
+        return sync_error_value(Value::Null, detail).to_string();
+    };
+    match val {
+        Value::Object(map) => {
+            sync_error_value(map.get("id").cloned().unwrap_or(Value::Null), detail).to_string()
+        }
+        Value::Array(arr) => {
+            let errors: Vec<Value> = arr
+                .iter()
+                .filter(|v| value_is_tools_call(v))
+                .map(|v| sync_error_value(v.get("id").cloned().unwrap_or(Value::Null), detail))
+                .collect();
+            if errors.is_empty() {
+                sync_error_value(Value::Null, detail).to_string()
+            } else {
+                Value::Array(errors).to_string()
+            }
+        }
+        _ => sync_error_value(Value::Null, detail).to_string(),
+    }
 }
 
 /// Persists any dirty tokens accumulated by outbound redaction to the
@@ -237,7 +259,20 @@ pub fn fetch_entries_for_request(
     store: &dyn PiiVaultStore<Error = String>,
     session_id: &str,
 ) -> Result<Option<Vec<(String, String)>>, String> {
-    if !payload_is_tools_call(line) {
+    match serde_json::from_str::<Value>(line.trim()) {
+        Ok(val) => fetch_entries_for_value(&val, store, session_id),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Parsed-value variant of [`fetch_entries_for_request`] so callers can avoid
+/// re-parsing the same inbound line.
+fn fetch_entries_for_value(
+    val: &Value,
+    store: &dyn PiiVaultStore<Error = String>,
+    session_id: &str,
+) -> Result<Option<Vec<(String, String)>>, String> {
+    if !value_is_tools_call(val) {
         return Ok(None);
     }
     store.get_entries(session_id).map(Some)
@@ -246,6 +281,21 @@ pub fn fetch_entries_for_request(
 /// Imports a prefetched store snapshot into the vault, then processes the
 /// inbound request. Any import failure fails closed with `-32003`.
 pub fn process_inbound_line_prefetched(
+    line: &str,
+    vault: &mut PiiSessionVault,
+    acl: &ToolAcl,
+    prefetched: Option<Vec<(String, String)>>,
+    session_id: &str,
+) -> InboundAction {
+    match serde_json::from_str::<Value>(line.trim()) {
+        Ok(val) => process_inbound_value_prefetched(val, line, vault, acl, prefetched, session_id),
+        Err(_) => process_inbound_line(line, vault, acl),
+    }
+}
+
+/// Parsed-value variant of [`process_inbound_line_prefetched`].
+fn process_inbound_value_prefetched(
+    val: Value,
     line: &str,
     vault: &mut PiiSessionVault,
     acl: &ToolAcl,
@@ -264,10 +314,11 @@ pub fn process_inbound_line_prefetched(
             ));
         }
     }
-    process_inbound_line(line, vault, acl)
+    process_inbound_value(val, line, vault, acl)
 }
 
-/// Convenience wrapper used by STDIO filter mode (single-threaded).
+/// Convenience wrapper used by STDIO filter mode (single-threaded). Parses the
+/// line once and reuses the value for store detection and request processing.
 pub fn process_inbound_line_synced(
     line: &str,
     vault: &mut PiiSessionVault,
@@ -275,8 +326,11 @@ pub fn process_inbound_line_synced(
     store: Option<&dyn PiiVaultStore<Error = String>>,
     session_id: Option<&str>,
 ) -> InboundAction {
+    let Some(val) = serde_json::from_str::<Value>(line.trim()).ok() else {
+        return process_inbound_line(line, vault, acl);
+    };
     let prefetched = match (store, session_id) {
-        (Some(store), Some(sid)) => match fetch_entries_for_request(line, store, sid) {
+        (Some(store), Some(sid)) => match fetch_entries_for_value(&val, store, sid) {
             Ok(entries) => entries,
             Err(e) => {
                 return InboundAction::BlockWithError(storage_sync_error_response(line, &e));
@@ -284,7 +338,7 @@ pub fn process_inbound_line_synced(
         },
         _ => None,
     };
-    process_inbound_line_prefetched(line, vault, acl, prefetched, session_id.unwrap_or(""))
+    process_inbound_value_prefetched(val, line, vault, acl, prefetched, session_id.unwrap_or(""))
 }
 
 /// Processes outbound Child stdout lines, redacting string leaves in result/error/params.
@@ -778,7 +832,8 @@ OPTIONS:
                                'none', or .toml rules file paths [default: global,id]
     --rules-file <path>        External TOML rules file (repeatable or comma-separated)
     --stdio-filter             Run in pure STDIO filtering mode (no child command);
-                               requires stateless-sealed tokens + PII_SHIELD_SESSION_KEY
+                               requires stateless-sealed tokens, or compact-hash
+                               tokens with --valkey-url, plus PII_SHIELD_SESSION_KEY
     --token-format <fmt>       sequential | compact-hash | stateless-sealed
     --valkey-url <url>         Valkey/Redis URL (alias: --redis-url); enables
                                distributed session persistence across pods
@@ -797,7 +852,8 @@ ENVIRONMENT:
 
 Fail-closed: unknown flags, invalid rules, unknown locales, or an empty catalog
 exits with status code 2. Running without a child command enters STDIO filter
-mode, which requires --token-format stateless-sealed and PII_SHIELD_SESSION_KEY.
+mode, which requires PII_SHIELD_SESSION_KEY and either stateless-sealed tokens
+or compact-hash tokens with --valkey-url.
 ";
 
 fn main() {
@@ -940,6 +996,11 @@ fn main() {
         for line in stdin.lock().lines() {
             let Ok(payload) = line else { break };
 
+            // Parse the inbound line once and reuse it for store detection,
+            // fail-closed responses, and request processing.
+            let parsed = serde_json::from_str::<Value>(payload.trim()).ok();
+            let is_tools_call = parsed.as_ref().is_some_and(value_is_tools_call);
+
             // Flush outbound-created tokens before any inbound tool call so a
             // pod handling the next turn can hydrate them from the store.
             // Pending tokens are retained on failure and retried next time.
@@ -950,7 +1011,7 @@ fn main() {
                     .map(|s| s as &dyn PiiVaultStore<Error = String>),
                 session_id_t1.as_deref(),
             ) {
-                if payload_is_tools_call(&payload) {
+                if is_tools_call {
                     let err_resp = storage_sync_error_response(&payload, &e);
                     let mut out = stdout_t1.lock().unwrap();
                     let _ = writeln!(out, "{}", err_resp);
@@ -963,29 +1024,37 @@ fn main() {
                 );
             }
 
-            let prefetched = match (store_t1.as_deref(), session_id_t1.as_deref()) {
-                (Some(store), Some(sid)) => match fetch_entries_for_request(&payload, store, sid) {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        let err_resp = storage_sync_error_response(&payload, &e);
-                        let mut out = stdout_t1.lock().unwrap();
-                        let _ = writeln!(out, "{}", err_resp);
-                        let _ = out.flush();
-                        continue;
+            let prefetched = match (store_t1.as_deref(), session_id_t1.as_deref(), &parsed) {
+                (Some(store), Some(sid), Some(val)) => {
+                    match fetch_entries_for_value(val, store, sid) {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            let err_resp = storage_sync_error_response(&payload, &e);
+                            let mut out = stdout_t1.lock().unwrap();
+                            let _ = writeln!(out, "{}", err_resp);
+                            let _ = out.flush();
+                            continue;
+                        }
                     }
-                },
+                }
                 _ => None,
             };
 
-            let action = {
-                let mut v = vault_t1.lock().unwrap();
-                process_inbound_line_prefetched(
-                    &payload,
-                    &mut v,
-                    &acl,
-                    prefetched,
-                    session_id_t1.as_deref().unwrap_or(""),
-                )
+            let action = match parsed {
+                Some(val) => {
+                    let mut v = vault_t1.lock().unwrap();
+                    process_inbound_value_prefetched(
+                        val,
+                        &payload,
+                        &mut v,
+                        &acl,
+                        prefetched,
+                        session_id_t1.as_deref().unwrap_or(""),
+                    )
+                }
+                // Empty/invalid JSON is forwarded verbatim, as in
+                // `process_inbound_line`.
+                None => InboundAction::Forward(payload.clone()),
             };
 
             match action {
@@ -1104,6 +1173,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_untrusted_params_name_is_scanned_for_exfiltration() {
+        let mut vault = PiiSessionVault::new(pii_core::SecurityPolicy::IndonesiaUuPdpStrict);
+        let _ = vault.redact("User 3573012203950001");
+        let acl = ToolAcl::new(Vec::new(), false);
+
+        let req =
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"<ID_NIK_1>"}}"#;
+        match process_inbound_line(req, &mut vault, &acl) {
+            InboundAction::BlockWithError(err) => {
+                assert!(err.contains("-32001"), "{}", err);
+            }
+            InboundAction::Forward(fw) => {
+                panic!("token hidden in params.name must be blocked: {}", fw)
+            }
+        }
+    }
+
+    #[test]
+    fn test_storage_sync_error_response_is_batch_aware() {
+        let batch = r#"[
+            {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"a"}},
+            {"jsonrpc":"2.0","id":8,"method":"notifications/progress"},
+            {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"b"}}
+        ]"#;
+        let response = storage_sync_error_response(batch, "offline");
+        let val: Value = serde_json::from_str(&response).expect("valid JSON");
+        let arr = val.as_array().expect("batch response array");
+        assert_eq!(arr.len(), 2, "one error per tools/call element");
+        let ids: Vec<&Value> = arr.iter().map(|v| &v["id"]).collect();
+        assert_eq!(ids, vec![&Value::from(7), &Value::from(9)]);
+        assert!(arr.iter().all(|v| v["error"]["code"] == -32003));
+
+        let single = storage_sync_error_response(
+            r#"{"jsonrpc":"2.0","id":"req-1","method":"tools/call","params":{"name":"a"}}"#,
+            "offline",
+        );
+        let val: Value = serde_json::from_str(&single).expect("valid JSON");
+        assert_eq!(val["id"], Value::from("req-1"));
+    }
+
     fn test_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()
@@ -1178,7 +1288,87 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("session-ttl"), "{}", err);
 
-        // Valid configuration defaults to compact-hash + 3600s TTL.
+        // TTL larger than i64::MAX rejected (would become a negative EXPIRE).
+        let err = parse_cli_and_env(
+            &args(&[
+                "--valkey-url",
+                "redis://127.0.0.1:6379",
+                "--session-id",
+                "sess-1",
+                "--session-ttl",
+                "9223372036854775808",
+                "--",
+                "/bin/true",
+            ]),
+            &test_env(&[("PII_SHIELD_SESSION_KEY", TEST_KEY)]),
+        )
+        .unwrap_err();
+        assert!(err.contains("session-ttl"), "{}", err);
+
+        // Orphan --session-id without a store is a misconfiguration.
+        let err = parse_cli_and_env(
+            &args(&["--session-id", "sess-1", "--", "/bin/true"]),
+            &test_env(&[("PII_SHIELD_SESSION_KEY", TEST_KEY)]),
+        )
+        .unwrap_err();
+        assert!(err.contains("--valkey-url"), "{}", err);
+
+        // Orphan --session-ttl without a store is a misconfiguration.
+        let err = parse_cli_and_env(
+            &args(&["--session-ttl", "60", "--", "/bin/true"]),
+            &test_env(&[("PII_SHIELD_SESSION_KEY", TEST_KEY)]),
+        )
+        .unwrap_err();
+        assert!(err.contains("--valkey-url"), "{}", err);
+
+        // Stateless-sealed tokens never persist, so a store is unusable.
+        let err = parse_cli_and_env(
+            &args(&[
+                "--valkey-url",
+                "redis://127.0.0.1:6379",
+                "--session-id",
+                "sess-1",
+                "--token-format",
+                "stateless-sealed",
+                "--",
+                "/bin/true",
+            ]),
+            &test_env(&[("PII_SHIELD_SESSION_KEY", TEST_KEY)]),
+        )
+        .unwrap_err();
+        assert!(err.contains("stateless-sealed"), "{}", err);
+
+        // An empty env URL reports the exact alias that was set.
+        let err = parse_cli_and_env(
+            &args(&["--", "/bin/true"]),
+            &test_env(&[
+                ("PII_SHIELD_SESSION_KEY", TEST_KEY),
+                ("PII_SHIELD_REDIS_URL", "   "),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("PII_SHIELD_REDIS_URL"), "{}", err);
+
+        // Filter mode accepts compact-hash when a store can hydrate it.
+        let action = parse_cli_and_env(
+            &args(&[
+                "--stdio-filter",
+                "--valkey-url",
+                "redis://127.0.0.1:6379",
+                "--session-id",
+                "sess-1",
+            ]),
+            &test_env(&[("PII_SHIELD_SESSION_KEY", TEST_KEY)]),
+        )
+        .expect("filter mode with a store");
+        match action {
+            ProxyAction::Run(config) => {
+                assert!(config.stdio_filter);
+                assert_eq!(config.token_format, ProxyTokenFormat::CompactHash);
+            }
+            _ => panic!("expected Run"),
+        }
+
         let action = parse_cli_and_env(
             &args(&[
                 "--valkey-url",

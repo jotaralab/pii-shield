@@ -202,7 +202,7 @@ pii-mcp-proxy --locales none --rules-file ./rules/br.toml -- npx .../server
 --token-format stateless-sealed  # <PII:EMAIL:HEX>, self-contained encrypted token
 
 PII_SHIELD_SESSION_KEY=  # 64-char hex (32 bytes); required for cross-process
-                         # sealed-token decryption (--stdio-filter always needs it)
+                         # sealed-token decryption (always required by filter mode)
 PII_SHIELD_TOKEN_FORMAT= # env alias for --token-format
 PII_SHIELD_STATELESS=1   # env alias for stateless-sealed when --token-format is omitted
 ```
@@ -212,9 +212,9 @@ non-empty uppercase `[A-Z0-9_]+`, the regex must compile with the scanner's
 syntax config (bounded NFA/DFA sizes), and `pii-mcp-proxy` refuses to start if
 the merged catalog would contain no rules — invalid configuration can never
 silently disable PII redaction. STDIO filter mode (`--stdio-filter`, or running
-without a child command) requires `--token-format stateless-sealed` plus
-`PII_SHIELD_SESSION_KEY`, since stateful tokens cannot be generated in
-a redaction-less filter pass.
+without a child command) requires `PII_SHIELD_SESSION_KEY` and either
+`--token-format stateless-sealed`, or `compact-hash` tokens together with
+`--valkey-url` so the proxy can hydrate them from the shared store.
 
 ### Distributed sessions (Valkey / Redis)
 
