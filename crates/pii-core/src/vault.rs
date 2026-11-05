@@ -30,9 +30,17 @@ pub enum TokenFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecurityError {
-    ExfiltrationBlocked { token: String },
+    ExfiltrationBlocked {
+        token: String,
+    },
     InvalidStateBlob,
-    StateConflict { token: String },
+    StateConflict {
+        token: String,
+    },
+    /// A remote vault store could not be reached or returned an I/O failure.
+    /// Kept distinct from [`SecurityError::InvalidStateBlob`] so operators can
+    /// tell a transient network outage apart from cryptographic tampering.
+    StorageError(String),
 }
 
 impl std::fmt::Display for SecurityError {
@@ -44,6 +52,9 @@ impl std::fmt::Display for SecurityError {
             SecurityError::InvalidStateBlob => write!(f, "Invalid or corrupted state blob"),
             SecurityError::StateConflict { token } => {
                 write!(f, "State conflict on token: {}", token)
+            }
+            SecurityError::StorageError(msg) => {
+                write!(f, "PII vault store error: {}", msg)
             }
         }
     }
@@ -788,6 +799,38 @@ impl PiiSessionVault {
         map
     }
 
+    /// Exports newly created entries since the last sync **without** clearing
+    /// the dirty set. Callers that perform network I/O can snapshot under the
+    /// vault lock, release it, persist, and only then call
+    /// [`PiiSessionVault::clear_dirty_tokens`].
+    pub fn seal_dirty_entries(&self, aad: &str) -> Vec<(String, String)> {
+        let mut out = Vec::with_capacity(self.dirty_tokens.len());
+        for token in &self.dirty_tokens {
+            if let Some((entity_type, raw_pii)) = self.reverse_map.get(token) {
+                let sealed = self.seal_entry_bytes(
+                    entity_type.as_tag_prefix(),
+                    raw_pii.as_str(),
+                    token,
+                    aad,
+                );
+                out.push((token.clone(), sealed));
+            }
+        }
+        out
+    }
+
+    /// Removes `tokens` from the dirty set after a successful store write.
+    /// Tokens not present (e.g. already flushed by a concurrent turn) are
+    /// ignored; tokens created after the snapshot remain queued.
+    pub fn clear_dirty_tokens(&mut self, tokens: &[String]) {
+        if tokens.is_empty() {
+            return;
+        }
+        let flushed: AHashMap<&str, ()> = tokens.iter().map(|t| (t.as_str(), ())).collect();
+        self.dirty_tokens
+            .retain(|t| !flushed.contains_key(t.as_str()));
+    }
+
     /// Drains and exports newly created entries since the last sync.
     pub fn drain_dirty_sealed_entries(&mut self, aad: &str) -> AHashMap<String, String> {
         let dirty = std::mem::take(&mut self.dirty_tokens);
@@ -1024,14 +1067,14 @@ impl PiiSessionVault {
     }
 
     /// Loads entries from any generic Key-Value or document storage backend.
-    pub fn load_from_store<S: PiiVaultStore>(
+    pub fn load_from_store<S: PiiVaultStore + ?Sized>(
         &mut self,
         store: &S,
         session_id: &str,
     ) -> Result<(), SecurityError> {
         let entries = store
             .get_entries(session_id)
-            .map_err(|_| SecurityError::InvalidStateBlob)?;
+            .map_err(|e| SecurityError::StorageError(format!("{:?}", e)))?;
         let entry_refs: Vec<(&str, &str)> = entries
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1040,19 +1083,25 @@ impl PiiSessionVault {
     }
 
     /// Flushes all dirty entries created during the current turn to a Key-Value storage backend.
-    pub fn flush_to_store<S: PiiVaultStore>(
+    ///
+    /// The dirty set is only cleared once `put_entries` succeeds, so a transient
+    /// store failure never loses tokens from future flush attempts.
+    pub fn flush_to_store<S: PiiVaultStore + ?Sized>(
         &mut self,
-        store: &mut S,
+        store: &S,
         session_id: &str,
     ) -> Result<usize, SecurityError> {
-        let dirty = self.drain_dirty_sealed_entries(session_id);
+        if self.dirty_tokens.is_empty() {
+            return Ok(0);
+        }
+        let dirty = self.seal_dirty_entries(session_id);
         let count = dirty.len();
         if count > 0 {
-            let entries: Vec<(String, String)> = dirty.into_iter().collect();
             store
-                .put_entries(session_id, entries)
-                .map_err(|_| SecurityError::InvalidStateBlob)?;
+                .put_entries(session_id, dirty)
+                .map_err(|e| SecurityError::StorageError(format!("{:?}", e)))?;
         }
+        self.dirty_tokens.clear();
         Ok(count)
     }
 }
@@ -1072,20 +1121,26 @@ struct VaultSnapshotV1 {
 }
 
 /// Pluggable storage trait for persisting sealed PII entries across distributed workers.
-pub trait PiiVaultStore {
-    type Error: std::fmt::Debug;
+///
+/// Implementations must be `Send + Sync` and take `&self` so a single store
+/// handle can be shared across concurrent proxy threads without a global lock.
+pub trait PiiVaultStore: Send + Sync {
+    type Error: std::fmt::Debug + Send + Sync;
     fn get_entries(&self, session_id: &str) -> Result<Vec<(String, String)>, Self::Error>;
     fn put_entries(
-        &mut self,
+        &self,
         session_id: &str,
         entries: Vec<(String, String)>,
     ) -> Result<(), Self::Error>;
 }
 
 /// In-memory reference store for testing or process-level cache sharing.
+///
+/// Uses `Arc<Mutex<..>>` internally so the store stays `Send + Sync` and
+/// clones share the same backing map.
 #[derive(Default, Debug, Clone)]
 pub struct InMemoryVaultStore {
-    storage: AHashMap<String, AHashMap<String, String>>,
+    storage: std::sync::Arc<std::sync::Mutex<AHashMap<String, AHashMap<String, String>>>>,
 }
 
 impl InMemoryVaultStore {
@@ -1098,7 +1153,8 @@ impl PiiVaultStore for InMemoryVaultStore {
     type Error = std::convert::Infallible;
 
     fn get_entries(&self, session_id: &str) -> Result<Vec<(String, String)>, Self::Error> {
-        let entries = match self.storage.get(session_id) {
+        let storage = self.storage.lock().expect("in-memory store poisoned");
+        let entries = match storage.get(session_id) {
             Some(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             None => Vec::new(),
         };
@@ -1106,11 +1162,12 @@ impl PiiVaultStore for InMemoryVaultStore {
     }
 
     fn put_entries(
-        &mut self,
+        &self,
         session_id: &str,
         entries: Vec<(String, String)>,
     ) -> Result<(), Self::Error> {
-        let map = self.storage.entry(session_id.to_string()).or_default();
+        let mut storage = self.storage.lock().expect("in-memory store poisoned");
+        let map = storage.entry(session_id.to_string()).or_default();
         for (k, v) in entries {
             map.insert(k, v);
         }
@@ -1295,10 +1352,93 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_to_store_preserves_dirty_tokens_on_failure() {
+        #[derive(Debug)]
+        struct FlakyStore {
+            fail: std::sync::atomic::AtomicBool,
+            saved: std::sync::Mutex<Vec<(String, String)>>,
+        }
+
+        impl PiiVaultStore for FlakyStore {
+            type Error = &'static str;
+
+            fn get_entries(&self, _session_id: &str) -> Result<Vec<(String, String)>, Self::Error> {
+                Ok(Vec::new())
+            }
+
+            fn put_entries(
+                &self,
+                _session_id: &str,
+                entries: Vec<(String, String)>,
+            ) -> Result<(), Self::Error> {
+                if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("transient network failure");
+                }
+                self.saved.lock().unwrap().extend(entries);
+                Ok(())
+            }
+        }
+
+        let store = FlakyStore {
+            fail: std::sync::atomic::AtomicBool::new(true),
+            saved: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut vault = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, [7u8; 32]);
+        vault.set_token_format(TokenFormat::CompactHash);
+        vault.redact("NIK 3573012203950001");
+
+        let err = vault.flush_to_store(&store, "session:flaky").unwrap_err();
+        assert!(matches!(err, SecurityError::StorageError(_)));
+        assert_eq!(
+            vault.dirty_tokens.len(),
+            1,
+            "failed flush must keep dirty tokens queued"
+        );
+
+        // Recover the store and retry: the same token is persisted.
+        store.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(vault.flush_to_store(&store, "session:flaky").unwrap(), 1);
+        assert!(vault.dirty_tokens.is_empty());
+        assert_eq!(store.saved.lock().unwrap().len(), 1);
+
+        // Second flush is a cheap no-op.
+        assert_eq!(vault.flush_to_store(&store, "session:flaky").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_load_from_store_maps_io_failure_to_storage_error() {
+        #[derive(Debug)]
+        struct DeadStore;
+        impl PiiVaultStore for DeadStore {
+            type Error = &'static str;
+            fn get_entries(&self, _session_id: &str) -> Result<Vec<(String, String)>, Self::Error> {
+                Err("connection refused")
+            }
+            fn put_entries(
+                &self,
+                _session_id: &str,
+                _entries: Vec<(String, String)>,
+            ) -> Result<(), Self::Error> {
+                Err("connection refused")
+            }
+        }
+
+        let mut vault = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, [9u8; 32]);
+        let err = vault
+            .load_from_store(&DeadStore, "session:dead")
+            .unwrap_err();
+        assert!(
+            matches!(err, SecurityError::StorageError(ref m) if m.contains("connection refused")),
+            "store I/O must not be reported as InvalidStateBlob: {:?}",
+            err
+        );
+    }
+
+    #[test]
     fn test_distributed_kv_concurrent_pods_lock_free() {
         let cluster_key = [88u8; 32];
         let session_id = "session:order_99";
-        let mut shared_store = InMemoryVaultStore::new();
+        let shared_store = InMemoryVaultStore::new();
 
         // Pod A starts in CompactHash mode and redacts Alice's NIK
         let mut pod_a =
@@ -1315,9 +1455,9 @@ mod tests {
         assert!(masked_b.contains("<PHONE_ID_"));
 
         // Both pods flush their dirty entries to shared store (commutative HSET)
-        let flushed_a = pod_a.flush_to_store(&mut shared_store, session_id).unwrap();
+        let flushed_a = pod_a.flush_to_store(&shared_store, session_id).unwrap();
         assert_eq!(flushed_a, 1);
-        let flushed_b = pod_b.flush_to_store(&mut shared_store, session_id).unwrap();
+        let flushed_b = pod_b.flush_to_store(&shared_store, session_id).unwrap();
         assert_eq!(flushed_b, 1);
 
         // Pod C (egress / tool runner) starts fresh and loads all entries

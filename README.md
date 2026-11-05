@@ -215,6 +215,35 @@ without a child command) requires `--token-format stateless-sealed` plus
 `PII_SHIELD_SESSION_KEY`, since stateful tokens cannot be generated in
 a redaction-less filter pass.
 
+### Distributed sessions (Valkey / Redis)
+
+Multiple proxy pods can share one session through
+[`crates/pii-store-redis`](crates/pii-store-redis): each session is a Redis
+hash (`pii:v1:{session_id}`) of `token -> SIV-sealed hex` entries, written with
+an atomic `MULTI`/`HSET`/`EXPIRE`/`EXEC` pipeline. Pod A can redact on one
+replica and Pod B can rehydrate (trusted) or block (untrusted) using the same
+token after loading the store.
+
+```bash
+pii-mcp-proxy \
+    --valkey-url redis://valkey.internal:6379 \
+    --session-id "$SESSION_ID" \
+    --session-ttl 3600 \
+    --trusted-tools query_db \
+    -- npx .../server
+
+PII_SHIELD_VALKEY_URL=   # env alias (`PII_SHIELD_REDIS_URL` also accepted)
+PII_SHIELD_SESSION_ID=   # env alias for --session-id
+PII_SHIELD_SESSION_TTL=  # env alias for --session-ttl (default 3600s)
+```
+
+Distributed mode fails closed (exit `2`) unless a non-empty `--session-id` and
+a 32-byte `PII_SHIELD_SESSION_KEY` are set. Tokens default to `compact-hash`;
+`--token-format sequential` is rejected because per-pod counters collide across
+replicas. Startup hydration must succeed, inbound `tools/call` failures return
+JSON-RPC `-32003`, and outbound writes release the vault lock during network
+I/O with dirty tokens retained for retry when the store is unavailable.
+
 Run `pii-mcp-proxy --help` / `--version` for the full CLI reference.
 
 ---

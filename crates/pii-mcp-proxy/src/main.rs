@@ -1,4 +1,6 @@
-use pii_core::{PiiCatalog, PiiSessionVault, SecurityError, TokenFormat, ToolTrustLevel};
+use pii_core::{
+    PiiCatalog, PiiSessionVault, PiiVaultStore, SecurityError, TokenFormat, ToolTrustLevel,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -7,6 +9,9 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+mod store;
+use store::ProxyStore;
 
 pub struct ToolAcl {
     trusted_tools: HashSet<String>,
@@ -37,7 +42,11 @@ pub enum InboundAction {
 
 /// Processes an inbound JSON-RPC request (Host stdin -> Child stdin),
 /// supporting single requests and batch arrays.
-pub fn process_inbound_line(line: &str, vault: &PiiSessionVault, acl: &ToolAcl) -> InboundAction {
+pub fn process_inbound_line(
+    line: &str,
+    vault: &mut PiiSessionVault,
+    acl: &ToolAcl,
+) -> InboundAction {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return InboundAction::Forward(line.to_string());
@@ -74,7 +83,7 @@ pub fn process_inbound_line(line: &str, vault: &PiiSessionVault, acl: &ToolAcl) 
 
 fn process_single_inbound_request(
     map: &mut serde_json::Map<String, Value>,
-    vault: &PiiSessionVault,
+    vault: &mut PiiSessionVault,
     acl: &ToolAcl,
 ) -> Option<InboundAction> {
     if map.get("method").and_then(|v| v.as_str()) == Some("tools/call") {
@@ -119,6 +128,108 @@ fn process_single_inbound_request(
         }
     }
     None
+}
+
+/// Returns true when the JSON-RPC payload (single or batch) is a `tools/call`.
+pub fn payload_is_tools_call(line: &str) -> bool {
+    let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    let is_call = |v: &Value| v.get("method").and_then(|m| m.as_str()) == Some("tools/call");
+    match &val {
+        Value::Object(_) => is_call(&val),
+        Value::Array(arr) => arr.iter().any(is_call),
+        _ => false,
+    }
+}
+
+fn payload_request_id(line: &str) -> Value {
+    let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
+        return Value::Null;
+    };
+    match &val {
+        Value::Object(map) => map.get("id").cloned().unwrap_or(Value::Null),
+        Value::Array(arr) => arr
+            .iter()
+            .find(|v| v.get("method").and_then(|m| m.as_str()) == Some("tools/call"))
+            .and_then(|v| v.get("id"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+/// Fail-closed JSON-RPC error returned when the distributed store cannot be
+/// synchronized before an inbound tool call.
+pub fn storage_sync_error_response(line: &str, detail: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": payload_request_id(line),
+        "error": {
+            "code": -32003,
+            "message": "PII vault store synchronization failed",
+            "data": { "detail": detail }
+        }
+    })
+    .to_string()
+}
+
+/// Fetches the remote session snapshot for a `tools/call`, performing network
+/// I/O **without** holding the vault mutex. Returns `Ok(None)` for payloads
+/// that do not need store access.
+pub fn fetch_entries_for_request(
+    line: &str,
+    store: &dyn PiiVaultStore<Error = String>,
+    session_id: &str,
+) -> Result<Option<Vec<(String, String)>>, String> {
+    if !payload_is_tools_call(line) {
+        return Ok(None);
+    }
+    store.get_entries(session_id).map(Some)
+}
+
+/// Imports a prefetched store snapshot into the vault, then processes the
+/// inbound request. Any import failure fails closed with `-32003`.
+pub fn process_inbound_line_prefetched(
+    line: &str,
+    vault: &mut PiiSessionVault,
+    acl: &ToolAcl,
+    prefetched: Option<Vec<(String, String)>>,
+    session_id: &str,
+) -> InboundAction {
+    if let Some(entries) = prefetched {
+        let entry_refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        if let Err(e) = vault.import_sealed_entries(entry_refs, session_id) {
+            return InboundAction::BlockWithError(storage_sync_error_response(
+                line,
+                &e.to_string(),
+            ));
+        }
+    }
+    process_inbound_line(line, vault, acl)
+}
+
+/// Convenience wrapper used by STDIO filter mode (single-threaded).
+pub fn process_inbound_line_synced(
+    line: &str,
+    vault: &mut PiiSessionVault,
+    acl: &ToolAcl,
+    store: Option<&dyn PiiVaultStore<Error = String>>,
+    session_id: Option<&str>,
+) -> InboundAction {
+    let prefetched = match (store, session_id) {
+        (Some(store), Some(sid)) => match fetch_entries_for_request(line, store, sid) {
+            Ok(entries) => entries,
+            Err(e) => {
+                return InboundAction::BlockWithError(storage_sync_error_response(line, &e));
+            }
+        },
+        _ => None,
+    };
+    process_inbound_line_prefetched(line, vault, acl, prefetched, session_id.unwrap_or(""))
 }
 
 /// Processes outbound Child stdout lines, redacting string leaves in result/error/params.
@@ -181,6 +292,7 @@ impl From<ProxyTokenFormat> for TokenFormat {
     }
 }
 
+#[derive(Debug)]
 pub struct ProxyConfig {
     pub trusted_tools: Vec<String>,
     pub trust_all: bool,
@@ -190,8 +302,16 @@ pub struct ProxyConfig {
     pub stdio_filter: bool,
     pub session_key: Option<[u8; 32]>,
     pub child_cmd: Option<(String, Vec<String>)>,
+    /// Valkey/Redis URL for distributed session persistence.
+    pub valkey_url: Option<String>,
+    /// Session identifier used as the store hash key suffix.
+    pub session_id: Option<String>,
+    /// TTL applied to the session hash on every write.
+    pub session_ttl: u64,
 }
 
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ProxyAction {
     Run(ProxyConfig),
     Help,
@@ -227,6 +347,9 @@ pub fn parse_cli_and_env(
     let mut token_format: Option<ProxyTokenFormat> = None;
     let mut stdio_filter = false;
     let mut session_key: Option<[u8; 32]> = None;
+    let mut valkey_url: Option<String> = None;
+    let mut session_id: Option<String> = None;
+    let mut session_ttl: Option<u64> = None;
     let mut child_cmd_start: Option<usize> = None;
 
     fn next_value(args: &[String], i: usize) -> Result<&str, String> {
@@ -298,6 +421,34 @@ pub fn parse_cli_and_env(
                 token_format = Some(parse_token_format(raw.trim())?);
                 i += 1;
             }
+            "--valkey-url" | "--redis-url" => {
+                let raw = next_value(args, i)?;
+                if raw.trim().is_empty() {
+                    return Err("--valkey-url must not be empty".to_string());
+                }
+                valkey_url = Some(raw.trim().to_string());
+                i += 1;
+            }
+            "--session-id" => {
+                let raw = next_value(args, i)?;
+                if raw.trim().is_empty() {
+                    return Err("--session-id must not be empty".to_string());
+                }
+                session_id = Some(raw.trim().to_string());
+                i += 1;
+            }
+            "--session-ttl" => {
+                let raw = next_value(args, i)?;
+                let ttl: u64 = raw
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("Invalid --session-ttl '{}': expected seconds", raw))?;
+                if ttl == 0 {
+                    return Err("--session-ttl must be greater than zero".to_string());
+                }
+                session_ttl = Some(ttl);
+                i += 1;
+            }
             "--help" | "-h" => return Ok(ProxyAction::Help),
             "--version" | "-V" => return Ok(ProxyAction::Version),
             "--" => {
@@ -337,6 +488,41 @@ pub fn parse_cli_and_env(
         k.copy_from_slice(&bytes);
         session_key = Some(k);
     }
+
+    // Env: distributed store configuration (CLI wins over env).
+    if valkey_url.is_none() {
+        if let Some(url) = env_vars
+            .get("PII_SHIELD_VALKEY_URL")
+            .or_else(|| env_vars.get("PII_SHIELD_REDIS_URL"))
+        {
+            let url = url.trim();
+            if url.is_empty() {
+                return Err("PII_SHIELD_VALKEY_URL is set but empty".to_string());
+            }
+            valkey_url = Some(url.to_string());
+        }
+    }
+    if session_id.is_none() {
+        if let Some(id) = env_vars.get("PII_SHIELD_SESSION_ID") {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err("PII_SHIELD_SESSION_ID is set but empty".to_string());
+            }
+            session_id = Some(id.to_string());
+        }
+    }
+    if session_ttl.is_none() {
+        if let Some(raw) = env_vars.get("PII_SHIELD_SESSION_TTL") {
+            let ttl: u64 = raw.trim().parse().map_err(|_| {
+                format!("Invalid PII_SHIELD_SESSION_TTL '{}': expected seconds", raw)
+            })?;
+            if ttl == 0 {
+                return Err("PII_SHIELD_SESSION_TTL must be greater than zero".to_string());
+            }
+            session_ttl = Some(ttl);
+        }
+    }
+    let session_ttl = session_ttl.unwrap_or(3600);
 
     // Env / CLI token format resolution
     if token_format.is_none() {
@@ -390,6 +576,33 @@ pub fn parse_cli_and_env(
     }
     let locales = if none_requested { Vec::new() } else { builtins };
 
+    // Distributed store fail-closed validation: a misconfigured multi-pod
+    // deployment must never start with per-pod tokens or an unreadable store.
+    if valkey_url.is_some() {
+        if session_id.as_deref().unwrap_or("").is_empty() {
+            return Err(
+                "--valkey-url requires a non-empty --session-id (or PII_SHIELD_SESSION_ID)"
+                    .to_string(),
+            );
+        }
+        if session_key.is_none() {
+            return Err(
+                "--valkey-url requires PII_SHIELD_SESSION_KEY (32-byte hex) so every pod derives identical tokens"
+                    .to_string(),
+            );
+        }
+        if token_format == Some(ProxyTokenFormat::Sequential) {
+            return Err(
+                "--token-format sequential cannot be used with --valkey-url: per-pod sequential counters cause StateConflict across pods"
+                    .to_string(),
+            );
+        }
+        if token_format.is_none() {
+            // Compact hashes are deterministic across pods; sequential ones are not.
+            token_format = Some(ProxyTokenFormat::CompactHash);
+        }
+    }
+
     // Fail closed: STDIO filter mode (explicit --stdio-filter, or implicit
     // when no child command is given) performs no outbound redaction, so
     // stateful tokens (sequential / compact-hash) can never be generated
@@ -432,6 +645,9 @@ pub fn parse_cli_and_env(
         stdio_filter,
         session_key,
         child_cmd,
+        valkey_url,
+        session_id,
+        session_ttl,
     }))
 }
 
@@ -482,6 +698,10 @@ OPTIONS:
     --stdio-filter             Run in pure STDIO filtering mode (no child command);
                                requires stateless-sealed tokens + PII_SHIELD_SESSION_KEY
     --token-format <fmt>       sequential | compact-hash | stateless-sealed
+    --valkey-url <url>         Valkey/Redis URL (alias: --redis-url); enables
+                               distributed session persistence across pods
+    --session-id <id>          Shared session id used as the store hash key
+    --session-ttl <secs>       TTL applied to the session hash [default: 3600]
     -h, --help                 Show this help
     -V, --version              Show version
 
@@ -489,6 +709,9 @@ ENVIRONMENT:
     PII_SHIELD_SESSION_KEY     64-char hex (32 bytes) shared session key
     PII_SHIELD_TOKEN_FORMAT    Alias for --token-format
     PII_SHIELD_STATELESS=1     Alias for --token-format stateless-sealed
+    PII_SHIELD_VALKEY_URL      Alias for --valkey-url (PII_SHIELD_REDIS_URL accepted)
+    PII_SHIELD_SESSION_ID      Alias for --session-id
+    PII_SHIELD_SESSION_TTL     Alias for --session-ttl
 
 Fail-closed: unknown flags, invalid rules, unknown locales, or an empty catalog
 exits with status code 2. Running without a child command enters STDIO filter
@@ -501,6 +724,10 @@ fn main() {
         "PII_SHIELD_SESSION_KEY",
         "PII_SHIELD_TOKEN_FORMAT",
         "PII_SHIELD_STATELESS",
+        "PII_SHIELD_VALKEY_URL",
+        "PII_SHIELD_REDIS_URL",
+        "PII_SHIELD_SESSION_ID",
+        "PII_SHIELD_SESSION_TTL",
     ];
     let env_vars: HashMap<String, String> = env_keys
         .iter()
@@ -524,7 +751,7 @@ fn main() {
         }
     };
 
-    let vault = match build_vault(&config) {
+    let mut vault = match build_vault(&config) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("pii-mcp-proxy error: {}", msg);
@@ -532,6 +759,30 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // Distributed store: startup hydration is mandatory (fail closed).
+    let store: Option<Arc<ProxyStore>> = match config.valkey_url.as_deref() {
+        Some(url) => {
+            let s = match ProxyStore::redis(url, config.session_ttl) {
+                Ok(s) => s,
+                Err(msg) => {
+                    eprintln!("pii-mcp-proxy error: {}", msg);
+                    std::process::exit(2);
+                }
+            };
+            let session_id = config.session_id.as_deref().expect("validated session id");
+            if let Err(e) = vault.load_from_store(&s, session_id) {
+                eprintln!(
+                    "pii-mcp-proxy error: initial vault store load failed for session '{}': {}",
+                    session_id, e
+                );
+                std::process::exit(2);
+            }
+            Some(Arc::new(s))
+        }
+        None => None,
+    };
+    let session_id: Option<String> = config.session_id.clone();
 
     let acl = ToolAcl::new(config.trusted_tools.clone(), config.trust_all);
 
@@ -542,7 +793,16 @@ fn main() {
 
         for line in stdin.lock().lines() {
             let Ok(payload) = line else { break };
-            match process_inbound_line(&payload, &vault, &acl) {
+            let action = process_inbound_line_synced(
+                &payload,
+                &mut vault,
+                &acl,
+                store
+                    .as_deref()
+                    .map(|s| s as &dyn PiiVaultStore<Error = String>),
+                session_id.as_deref(),
+            );
+            match action {
                 InboundAction::Forward(fw) => {
                     let mut out = stdout.lock().unwrap();
                     let _ = writeln!(out, "{}", fw);
@@ -583,9 +843,13 @@ fn main() {
     let vault_arc = Arc::new(Mutex::new(vault));
     let stdout_arc = Arc::new(Mutex::new(io::stdout()));
 
-    // Thread 1: Host stdin -> Child stdin (with exfiltration check)
+    // Thread 1: Host stdin -> Child stdin (with exfiltration check).
+    // Remote store reads happen *before* taking the vault lock so a slow
+    // Valkey/Redis round-trip never serializes outbound redaction.
     let vault_t1 = Arc::clone(&vault_arc);
     let stdout_t1 = Arc::clone(&stdout_arc);
+    let store_t1 = store.clone();
+    let session_id_t1 = session_id.clone();
 
     let t1 = thread::spawn(move || {
         let stdin = io::stdin();
@@ -593,9 +857,30 @@ fn main() {
 
         for line in stdin.lock().lines() {
             let Ok(payload) = line else { break };
+
+            let prefetched = match (store_t1.as_deref(), session_id_t1.as_deref()) {
+                (Some(store), Some(sid)) => match fetch_entries_for_request(&payload, store, sid) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        let err_resp = storage_sync_error_response(&payload, &e);
+                        let mut out = stdout_t1.lock().unwrap();
+                        let _ = writeln!(out, "{}", err_resp);
+                        let _ = out.flush();
+                        continue;
+                    }
+                },
+                _ => None,
+            };
+
             let action = {
-                let v = vault_t1.lock().unwrap();
-                process_inbound_line(&payload, &v, &acl)
+                let mut v = vault_t1.lock().unwrap();
+                process_inbound_line_prefetched(
+                    &payload,
+                    &mut v,
+                    &acl,
+                    prefetched,
+                    session_id_t1.as_deref().unwrap_or(""),
+                )
             };
 
             match action {
@@ -614,18 +899,50 @@ fn main() {
         // child_writer drops here, signaling EOF to child MCP server
     });
 
-    // Thread 2: Child stdout -> Host stdout (with redaction)
+    // Thread 2: Child stdout -> Host stdout (with redaction + store flush).
+    // The dirty-token snapshot is taken under the vault lock, but the network
+    // write happens with the lock released; tokens are only cleared after the
+    // store confirms success so transient failures are retried next turn.
     let vault_t2 = Arc::clone(&vault_arc);
     let stdout_t2 = Arc::clone(&stdout_arc);
+    let store_t2 = store;
+    let session_id_t2 = session_id;
 
     let t2 = thread::spawn(move || {
         let reader = BufReader::new(child_stdout);
         for line in reader.lines() {
             let Ok(payload) = line else { break };
-            let redacted = {
+
+            let (redacted, pending) = {
                 let mut v = vault_t2.lock().unwrap();
-                process_outbound_line(&payload, &mut v)
+                let redacted = process_outbound_line(&payload, &mut v);
+                let pending = match (store_t2.as_deref(), session_id_t2.as_deref()) {
+                    (Some(_), Some(sid)) => v.seal_dirty_entries(sid),
+                    _ => Vec::new(),
+                };
+                (redacted, pending)
             };
+
+            if !pending.is_empty() {
+                let store = store_t2.as_deref().expect("pending requires a store");
+                let sid = session_id_t2
+                    .as_deref()
+                    .expect("pending requires a session id");
+                let flushed: Vec<String> = pending.iter().map(|(token, _)| token.clone()).collect();
+                match store.put_entries(sid, pending) {
+                    Ok(()) => {
+                        let mut v = vault_t2.lock().unwrap();
+                        v.clear_dirty_tokens(&flushed);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "pii-mcp-proxy warning: vault store flush failed, {} token(s) kept for retry: {}",
+                            flushed.len(),
+                            e
+                        );
+                    }
+                }
+            }
 
             let mut out = stdout_t2.lock().unwrap();
             let _ = writeln!(out, "{}", redacted);
@@ -660,7 +977,7 @@ mod tests {
 
         // Trusted tool call succeeds
         let trusted_req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_db","arguments":{"nik":"<ID_NIK_1>"}}}"#;
-        match process_inbound_line(trusted_req, &vault, &acl) {
+        match process_inbound_line(trusted_req, &mut vault, &acl) {
             InboundAction::Forward(fw) => {
                 assert!(fw.contains("3573012203950001"));
             }
@@ -669,13 +986,220 @@ mod tests {
 
         // Untrusted tool call blocked with JSON-RPC -32001 error
         let untrusted_req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"web_search","arguments":{"q":"<ID_NIK_1>"}}}"#;
-        match process_inbound_line(untrusted_req, &vault, &acl) {
+        match process_inbound_line(untrusted_req, &mut vault, &acl) {
             InboundAction::BlockWithError(err) => {
                 assert!(err.contains("-32001"));
                 assert!(err.contains("PII exfiltration blocked"));
             }
             InboundAction::Forward(_) => panic!("Untrusted tool call must be blocked"),
         }
+    }
+
+    fn test_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn args(items: &[&str]) -> Vec<String> {
+        std::iter::once("pii-mcp-proxy".to_string())
+            .chain(items.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    const TEST_KEY: &str = "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb";
+
+    #[test]
+    fn test_valkey_config_validation_is_fail_closed() {
+        // Missing session id.
+        let err = parse_cli_and_env(
+            &args(&["--valkey-url", "redis://127.0.0.1:6379", "--", "/bin/true"]),
+            &test_env(&[("PII_SHIELD_SESSION_KEY", TEST_KEY)]),
+        )
+        .unwrap_err();
+        assert!(err.contains("session-id"), "{}", err);
+
+        // Missing shared session key.
+        let err = parse_cli_and_env(
+            &args(&[
+                "--valkey-url",
+                "redis://127.0.0.1:6379",
+                "--session-id",
+                "sess-1",
+                "--",
+                "/bin/true",
+            ]),
+            &test_env(&[]),
+        )
+        .unwrap_err();
+        assert!(err.contains("PII_SHIELD_SESSION_KEY"), "{}", err);
+
+        // Sequential tokens conflict across pods.
+        let err = parse_cli_and_env(
+            &args(&[
+                "--valkey-url",
+                "redis://127.0.0.1:6379",
+                "--session-id",
+                "sess-1",
+                "--token-format",
+                "sequential",
+                "--",
+                "/bin/true",
+            ]),
+            &test_env(&[("PII_SHIELD_SESSION_KEY", TEST_KEY)]),
+        )
+        .unwrap_err();
+        assert!(err.contains("sequential"), "{}", err);
+
+        // Zero TTL rejected.
+        let err = parse_cli_and_env(
+            &args(&[
+                "--valkey-url",
+                "redis://127.0.0.1:6379",
+                "--session-id",
+                "sess-1",
+                "--session-ttl",
+                "0",
+                "--",
+                "/bin/true",
+            ]),
+            &test_env(&[("PII_SHIELD_SESSION_KEY", TEST_KEY)]),
+        )
+        .unwrap_err();
+        assert!(err.contains("session-ttl"), "{}", err);
+
+        // Valid configuration defaults to compact-hash + 3600s TTL.
+        let action = parse_cli_and_env(
+            &args(&[
+                "--valkey-url",
+                "redis://127.0.0.1:6379",
+                "--session-id",
+                "sess-1",
+                "--",
+                "/bin/true",
+            ]),
+            &test_env(&[("PII_SHIELD_SESSION_KEY", TEST_KEY)]),
+        )
+        .expect("valid valkey config");
+        match action {
+            ProxyAction::Run(config) => {
+                assert_eq!(
+                    config.token_format,
+                    ProxyTokenFormat::CompactHash,
+                    "distributed mode must default to compact-hash"
+                );
+                assert_eq!(config.session_ttl, 3600);
+                assert_eq!(config.session_id.as_deref(), Some("sess-1"));
+            }
+            _ => panic!("expected Run"),
+        }
+
+        // Env aliases are accepted (--redis-url is a CLI alias too).
+        let action = parse_cli_and_env(
+            &args(&["--redis-url", "redis://127.0.0.1:6379", "--", "/bin/true"]),
+            &test_env(&[
+                ("PII_SHIELD_SESSION_KEY", TEST_KEY),
+                ("PII_SHIELD_SESSION_ID", "env-session"),
+                ("PII_SHIELD_SESSION_TTL", "120"),
+            ]),
+        )
+        .expect("env valkey config");
+        match action {
+            ProxyAction::Run(config) => {
+                assert_eq!(config.session_id.as_deref(), Some("env-session"));
+                assert_eq!(config.session_ttl, 120);
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn test_store_hydration_bridges_pods() {
+        use pii_core::SecurityPolicy;
+
+        let key = [42u8; 32];
+        let session = "session:multi-pod";
+        let shared = ProxyStore::memory();
+
+        // Pod A redacts a NIK and persists the sealed entry.
+        let mut pod_a = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        pod_a.set_token_format(TokenFormat::CompactHash);
+        let masked = pod_a.redact("Customer NIK 3573012203950001");
+        let token = masked
+            .split_whitespace()
+            .find(|w| w.starts_with('<'))
+            .expect("token")
+            .to_string();
+        assert_eq!(pod_a.flush_to_store(&shared, session).unwrap(), 1);
+
+        // Pod B has an empty vault. Trusted tools rehydrate after a store sync.
+        let mut pod_b = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        pod_b.set_token_format(TokenFormat::CompactHash);
+        let acl = ToolAcl::new(vec!["query_customer".to_string()], false);
+        let trusted = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"query_customer","arguments":{{"nik":"{}"}}}}}}"#,
+            token
+        );
+        match process_inbound_line_synced(&trusted, &mut pod_b, &acl, Some(&shared), Some(session))
+        {
+            InboundAction::Forward(fw) => {
+                assert!(fw.contains("3573012203950001"), "got {}", fw);
+            }
+            InboundAction::BlockWithError(e) => panic!("trusted tool blocked: {}", e),
+        }
+
+        // An untrusted tool on Pod B must still be blocked after hydration.
+        let untrusted = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"web_search","arguments":{{"q":"{}"}}}}}}"#,
+            token
+        );
+        match process_inbound_line_synced(
+            &untrusted,
+            &mut pod_b,
+            &acl,
+            Some(&shared),
+            Some(session),
+        ) {
+            InboundAction::BlockWithError(e) => assert!(e.contains("-32001"), "got {}", e),
+            InboundAction::Forward(_) => panic!("untrusted tool must be blocked"),
+        }
+    }
+
+    #[test]
+    fn test_store_failure_fails_closed_with_32003() {
+        use pii_core::SecurityPolicy;
+
+        #[derive(Debug)]
+        struct DeadStore;
+        impl PiiVaultStore for DeadStore {
+            type Error = String;
+            fn get_entries(&self, _: &str) -> Result<Vec<(String, String)>, Self::Error> {
+                Err("connection refused".to_string())
+            }
+            fn put_entries(&self, _: &str, _: Vec<(String, String)>) -> Result<(), Self::Error> {
+                Err("connection refused".to_string())
+            }
+        }
+
+        let mut vault = PiiSessionVault::with_key(SecurityPolicy::StandardGlobal, [3u8; 32]);
+        let acl = ToolAcl::new(vec![], false);
+        let req = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"web_search","arguments":{"q":"x"}}}"#;
+        match process_inbound_line_synced(req, &mut vault, &acl, Some(&DeadStore), Some("s")) {
+            InboundAction::BlockWithError(e) => {
+                assert!(e.contains("-32003"), "got {}", e);
+                assert!(e.contains("PII vault store synchronization failed"));
+                assert!(e.contains(r#""id":7"#));
+            }
+            InboundAction::Forward(_) => panic!("store failure must fail closed"),
+        }
+
+        // Non-tools/call payloads never touch the store.
+        let init = r#"{"jsonrpc":"2.0","id":8,"method":"init_data"}"#;
+        assert!(matches!(
+            process_inbound_line_synced(init, &mut vault, &acl, Some(&DeadStore), Some("s")),
+            InboundAction::Forward(_)
+        ));
     }
 
     #[test]

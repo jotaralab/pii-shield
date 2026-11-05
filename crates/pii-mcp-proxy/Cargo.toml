@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 pii-core = { path = "../pii-core" }
+pii-store-redis = { path = "../pii-store-redis" }
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
