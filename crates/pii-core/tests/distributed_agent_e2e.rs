@@ -7,7 +7,7 @@ use pii_core::{
 fn test_distributed_agent_lifecycle_e2e_compact_hash() {
     let cluster_key = [101u8; 32];
     let session_id = "agent_session_ord_442";
-    let mut distributed_kv = InMemoryVaultStore::new();
+    let distributed_kv = InMemoryVaultStore::new();
 
     // =========================================================================
     // TURN 1: Ingress Gateway (Pod A)
@@ -41,9 +41,7 @@ fn test_distributed_agent_lifecycle_e2e_compact_hash() {
         .unwrap();
 
     // Pod A flushes dirty entries to distributed KV store (HSET)
-    let flushed_count = pod_a
-        .flush_to_store(&mut distributed_kv, session_id)
-        .unwrap();
+    let flushed_count = pod_a.flush_to_store(&distributed_kv, session_id).unwrap();
     assert_eq!(flushed_count, 3);
 
     // Pod A terminates (crash / scale down / ephemeral worker drop)
@@ -85,9 +83,7 @@ fn test_distributed_agent_lifecycle_e2e_compact_hash() {
     assert!(masked_tool_result.contains(r#""balance":1500000"#));
 
     // Pod B flushes newly minted phone entry to distributed KV
-    let flushed_delta = pod_b
-        .flush_to_store(&mut distributed_kv, session_id)
-        .unwrap();
+    let flushed_delta = pod_b.flush_to_store(&distributed_kv, session_id).unwrap();
     assert_eq!(flushed_delta, 1);
 
     // =========================================================================
