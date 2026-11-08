@@ -78,6 +78,21 @@ fn encode_base36(mut val: u64, min_len: usize) -> String {
 }
 
 #[inline]
+/// Extracts a sequential token suffix (`<ID_NIK_42>` -> `42`).
+///
+/// `CompactHash` suffixes are 6+ base36 chars and may be all digits; treating
+/// one as a sequential counter would jump the counter to ~1_000_000. Cap the
+/// length and reject leading zeros so only real sequential tokens qualify.
+fn sequential_suffix(token: &str) -> Option<u64> {
+    let inner = token.strip_prefix('<')?.strip_suffix('>')?;
+    let suffix = inner.rsplit_once('_')?.1;
+    if suffix.is_empty() || suffix.starts_with('0') || suffix.len() >= 6 {
+        return None;
+    }
+    suffix.parse::<u64>().ok()
+}
+
+#[inline]
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -348,8 +363,12 @@ impl PiiSessionVault {
                 let num = u64::from_be_bytes(digest[..8].try_into().unwrap());
                 let base_code = encode_base36(num % 2_176_782_336, 6);
                 let mut candidate = format!("<{}_{}>", tag_prefix, base_code);
-                if let Some((_, existing_raw)) = self.reverse_map.get(&candidate) {
-                    if existing_raw.as_str() != raw_pii.trim() {
+                if let Some((existing_entity, existing_raw)) = self.reverse_map.get(&candidate) {
+                    // HMAC tokens are case-folded, so two case variants of the
+                    // same address may legitimately map to this token.
+                    if existing_entity != &entity_type
+                        || !existing_raw.as_str().eq_ignore_ascii_case(raw_pii.trim())
+                    {
                         let ext_code = encode_base36(num % 2_821_109_907_456, 8);
                         candidate = format!("<{}_{}>", tag_prefix, ext_code);
                     }
@@ -530,7 +549,7 @@ impl PiiSessionVault {
         self.rehydrate_json_value_with_key(value, trust_level, None)
     }
 
-    fn rehydrate_json_value_with_key(
+    pub fn rehydrate_json_value_with_key(
         &self,
         value: &mut serde_json::Value,
         trust_level: ToolTrustLevel,
@@ -677,7 +696,8 @@ impl PiiSessionVault {
         getrandom::getrandom(&mut nonce).expect("OS CSPRNG unavailable");
 
         let trimmed = raw_pii.trim();
-        let mut plaintext = Vec::with_capacity(entity_prefix.len() + 1 + trimmed.len());
+        let mut plaintext =
+            Zeroizing::new(Vec::with_capacity(entity_prefix.len() + 1 + trimmed.len()));
         plaintext.extend_from_slice(entity_prefix.as_bytes());
         plaintext.push(0x00);
         plaintext.extend_from_slice(trimmed.as_bytes());
@@ -819,6 +839,15 @@ impl PiiSessionVault {
         out
     }
 
+    /// Non-destructive JSON variant of [`PiiSessionVault::seal_dirty_entries`].
+    /// Safe for Wasm/FFI callers that persist asynchronously and only clear the
+    /// dirty set after the remote write succeeds.
+    pub fn seal_dirty_entries_json(&self, aad: &str) -> String {
+        let map: std::collections::BTreeMap<String, String> =
+            self.seal_dirty_entries(aad).into_iter().collect();
+        serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+    }
+
     /// Removes `tokens` from the dirty set after a successful store write.
     /// Tokens not present (e.g. already flushed by a concurrent turn) are
     /// ignored; tokens created after the snapshot remain queued.
@@ -860,15 +889,52 @@ impl PiiSessionVault {
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
         let mut decrypted = Vec::new();
+        let mut seen_tokens: AHashMap<String, (EntityType, Zeroizing<String>)> = AHashMap::new();
+        let mut seen_digests: AHashMap<[u8; 32], String> = AHashMap::new();
+
         for (token, sealed) in entries {
             let (entity_type, raw_val) = self.unseal_entry_bytes(sealed, token, aad)?;
-            if let Some((_, existing_raw)) = self.reverse_map.get(token) {
-                if existing_raw.as_str() != raw_val.as_str() {
+            let normalized = Zeroizing::new(raw_val.trim().to_string());
+
+            // Pre-existing vault entry: entity and case-folded plaintext must
+            // agree (HMAC/CompactHash is case-insensitive by design).
+            if let Some((existing_entity, existing_raw)) = self.reverse_map.get(token) {
+                if existing_entity != &entity_type
+                    || !existing_raw.as_str().eq_ignore_ascii_case(&normalized)
+                {
                     return Err(SecurityError::StateConflict {
                         token: token.to_string(),
                     });
                 }
             }
+
+            // Intra-batch duplicate token with a different value/entity.
+            if let Some((seen_entity, seen_raw)) = seen_tokens.get(token) {
+                if seen_entity != &entity_type || !seen_raw.eq_ignore_ascii_case(&normalized) {
+                    return Err(SecurityError::StateConflict {
+                        token: token.to_string(),
+                    });
+                }
+            }
+
+            // A digest already bound to a different token (pre-existing or
+            // earlier in this batch) would create two tokens for one value.
+            let digest = self.compute_hmac(entity_type.as_tag_prefix(), &normalized);
+            let conflict = self
+                .forward_map
+                .get(&digest)
+                .is_some_and(|existing_token| existing_token != token)
+                || seen_digests
+                    .get(&digest)
+                    .is_some_and(|seen_token| seen_token != token);
+            if conflict {
+                return Err(SecurityError::StateConflict {
+                    token: token.to_string(),
+                });
+            }
+
+            seen_tokens.insert(token.to_string(), (entity_type.clone(), normalized.clone()));
+            seen_digests.insert(digest, token.to_string());
             decrypted.push((token.to_string(), entity_type, raw_val));
         }
 
@@ -876,13 +942,9 @@ impl PiiSessionVault {
             let digest = self.compute_hmac(entity_type.as_tag_prefix(), raw_val.as_str());
             self.forward_map.insert(digest, token.clone());
 
-            if let Some(inner) = token.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
-                if let Some(last_us) = inner.rfind('_') {
-                    if let Ok(seq_num) = inner[last_us + 1..].parse::<u64>() {
-                        let cur = self.counters.entry(entity_type.clone()).or_insert(0);
-                        *cur = (*cur).max(seq_num);
-                    }
-                }
+            if let Some(seq_num) = sequential_suffix(&token) {
+                let cur = self.counters.entry(entity_type.clone()).or_insert(0);
+                *cur = (*cur).max(seq_num);
             }
 
             self.reverse_map.insert(token, (entity_type, raw_val));
@@ -946,7 +1008,8 @@ impl PiiSessionVault {
             counters,
         };
 
-        let plaintext = serde_json::to_vec(&snapshot).expect("Snapshot serializable");
+        let plaintext =
+            Zeroizing::new(serde_json::to_vec(&snapshot).expect("Snapshot serializable"));
 
         let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
         mac.update(b"PIIS1");
@@ -1039,14 +1102,53 @@ impl PiiSessionVault {
             return Err(SecurityError::InvalidStateBlob);
         }
 
+        let mut seen_tokens: AHashMap<String, (EntityType, Zeroizing<String>)> = AHashMap::new();
+        let mut seen_digests: AHashMap<[u8; 32], String> = AHashMap::new();
         for entry in &snapshot.entries {
-            if let Some((_, existing_raw)) = self.reverse_map.get(&entry.token) {
-                if existing_raw.as_str() != entry.raw.as_str() {
+            let entry_entity = EntityType::from_tag_prefix(&entry.entity);
+            let normalized = Zeroizing::new(entry.raw.trim().to_string());
+
+            // Pre-existing vault entry: entity and case-folded plaintext must
+            // agree (HMAC/CompactHash is case-insensitive by design).
+            if let Some((existing_entity, existing_raw)) = self.reverse_map.get(&entry.token) {
+                if existing_entity != &entry_entity
+                    || !existing_raw.as_str().eq_ignore_ascii_case(&normalized)
+                {
                     return Err(SecurityError::StateConflict {
                         token: entry.token.clone(),
                     });
                 }
             }
+
+            // Intra-batch duplicate token with a different value/entity.
+            if let Some((seen_entity, seen_raw)) = seen_tokens.get(&entry.token) {
+                if seen_entity != &entry_entity
+                    || !seen_raw.as_str().eq_ignore_ascii_case(&normalized)
+                {
+                    return Err(SecurityError::StateConflict {
+                        token: entry.token.clone(),
+                    });
+                }
+            }
+
+            // A digest already bound to a different token (pre-existing or
+            // earlier in this snapshot) would create two tokens for one value.
+            let digest = self.compute_hmac(&entry.entity, &normalized);
+            let conflict = self
+                .forward_map
+                .get(&digest)
+                .is_some_and(|existing_token| existing_token != &entry.token)
+                || seen_digests
+                    .get(&digest)
+                    .is_some_and(|seen_token| seen_token != &entry.token);
+            if conflict {
+                return Err(SecurityError::StateConflict {
+                    token: entry.token.clone(),
+                });
+            }
+
+            seen_tokens.insert(entry.token.clone(), (entry_entity, normalized));
+            seen_digests.insert(digest, entry.token.clone());
         }
 
         for entry in snapshot.entries {
@@ -1074,7 +1176,7 @@ impl PiiSessionVault {
     ) -> Result<(), SecurityError> {
         let entries = store
             .get_entries(session_id)
-            .map_err(|e| SecurityError::StorageError(format!("{:?}", e)))?;
+            .map_err(|e| SecurityError::StorageError(e.to_string()))?;
         let entry_refs: Vec<(&str, &str)> = entries
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1099,7 +1201,7 @@ impl PiiSessionVault {
         if count > 0 {
             store
                 .put_entries(session_id, dirty)
-                .map_err(|e| SecurityError::StorageError(format!("{:?}", e)))?;
+                .map_err(|e| SecurityError::StorageError(e.to_string()))?;
         }
         self.dirty_tokens.clear();
         Ok(count)
@@ -1125,7 +1227,7 @@ struct VaultSnapshotV1 {
 /// Implementations must be `Send + Sync` and take `&self` so a single store
 /// handle can be shared across concurrent proxy threads without a global lock.
 pub trait PiiVaultStore: Send + Sync {
-    type Error: std::fmt::Debug + Send + Sync;
+    type Error: std::fmt::Debug + std::fmt::Display + Send + Sync;
     fn get_entries(&self, session_id: &str) -> Result<Vec<(String, String)>, Self::Error>;
     fn put_entries(
         &self,
@@ -1153,7 +1255,10 @@ impl PiiVaultStore for InMemoryVaultStore {
     type Error = std::convert::Infallible;
 
     fn get_entries(&self, session_id: &str) -> Result<Vec<(String, String)>, Self::Error> {
-        let storage = self.storage.lock().expect("in-memory store poisoned");
+        let storage = self
+            .storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entries = match storage.get(session_id) {
             Some(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             None => Vec::new(),
@@ -1166,7 +1271,13 @@ impl PiiVaultStore for InMemoryVaultStore {
         session_id: &str,
         entries: Vec<(String, String)>,
     ) -> Result<(), Self::Error> {
-        let mut storage = self.storage.lock().expect("in-memory store poisoned");
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut storage = self
+            .storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let map = storage.entry(session_id.to_string()).or_default();
         for (k, v) in entries {
             map.insert(k, v);
@@ -1349,6 +1460,79 @@ mod tests {
         vault2.set_token_format(TokenFormat::CompactHash);
         let masked2 = vault2.redact("NIK: 3573012203950001");
         assert_eq!(masked.split(' ').nth(1), masked2.split(' ').nth(1));
+    }
+
+    #[test]
+    fn test_compact_hash_import_is_case_insensitive_across_pods() {
+        let key = [66u8; 32];
+        let session = "session:case-fold";
+
+        let mut pod_a = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        pod_a.set_token_format(TokenFormat::CompactHash);
+        let masked_a = pod_a.redact("Email Budi.Santoso@Gmail.com");
+        let token = masked_a
+            .split_whitespace()
+            .last()
+            .expect("token")
+            .to_string();
+        let sealed_a = pod_a
+            .export_sealed_entries(session)
+            .remove(&token)
+            .expect("sealed entry");
+
+        let mut pod_b = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        pod_b.set_token_format(TokenFormat::CompactHash);
+        pod_b
+            .import_sealed_entries(vec![(token.as_str(), sealed_a.as_str())], session)
+            .expect("initial import");
+        assert_eq!(pod_b.rehydrate(&token), "Budi.Santoso@Gmail.com");
+
+        // Same HMAC (case-folded), different casing: must merge, not conflict.
+        let mut pod_c = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        pod_c.set_token_format(TokenFormat::CompactHash);
+        let masked_c = pod_c.redact("Email budi.santoso@gmail.com");
+        assert_eq!(masked_c.split_whitespace().last().unwrap(), token.as_str());
+        let sealed_c = pod_c
+            .export_sealed_entries(session)
+            .remove(&token)
+            .expect("sealed entry");
+        pod_b
+            .import_sealed_entries(vec![(token.as_str(), sealed_c.as_str())], session)
+            .expect("case-only plaintext difference must not conflict");
+    }
+
+    #[test]
+    fn test_seal_dirty_entries_json_is_non_destructive() {
+        let mut vault = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, [12u8; 32]);
+        vault.set_token_format(TokenFormat::CompactHash);
+        vault.redact("NIK 3573012203950001");
+        assert_eq!(vault.dirty_tokens.len(), 1);
+
+        let json = vault.seal_dirty_entries_json("session:dirty");
+        assert_ne!(json, "{}");
+        assert_eq!(
+            vault.dirty_tokens.len(),
+            1,
+            "sealing must not clear pending tokens"
+        );
+
+        let sealed: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&json).expect("valid sealed map");
+        let tokens: Vec<String> = sealed.keys().cloned().collect();
+        vault.clear_dirty_tokens(&tokens);
+        assert!(vault.dirty_tokens.is_empty());
+        assert_eq!(vault.seal_dirty_entries_json("session:dirty"), "{}");
+    }
+
+    #[test]
+    fn test_sequential_suffix_ignores_compact_hash_codes() {
+        assert_eq!(sequential_suffix("<ID_NIK_1>"), Some(1));
+        assert_eq!(sequential_suffix("<ID_NIK_42>"), Some(42));
+        // CompactHash may be all digits but is 6-8 chars: never a counter.
+        assert_eq!(sequential_suffix("<ID_NIK_123456>"), None);
+        assert_eq!(sequential_suffix("<ID_NIK_04F7Q1>"), None);
+        assert_eq!(sequential_suffix("<ID_NIK_0>"), None);
+        assert_eq!(sequential_suffix("no-brackets"), None);
     }
 
     #[test]

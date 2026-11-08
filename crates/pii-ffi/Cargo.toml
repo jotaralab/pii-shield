@@ -11,3 +11,4 @@ crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
 pii-core = { path = "../pii-core" }
+serde_json.workspace = true
