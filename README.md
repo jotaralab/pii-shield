@@ -7,6 +7,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 [![Wasm Ready](https://img.shields.io/badge/wasm-%3C250KB-blueviolet.svg)](#wasm--cloudflare-workers)
 [![UU PDP & International](https://img.shields.io/badge/PII-UU%20PDP%20%7C%20GDPR%20%7C%20CCPA-emerald.svg)](#built-in-entity-recognizers)
+[![M8ven Score](https://m8ven.ai/badge/mcp/jotaralab-pii-shield-y1iylb?v=0c2188b0f6e839d224efbcbdf95ee1b2)](https://m8ven.ai/mcp/jotaralab-pii-shield-y1iylb?s=readme)
 
 `pii-shield` is an embeddable, zero-backtracking PII firewall engineered in Rust. Unlike traditional regex scanners or heavy Python sidecars (like Microsoft Presidio), `pii-shield` uses a **Declarative i18n Rule Catalog**, a **3-Stage Cascading Sieve**, and a **Session-Scoped Bi-Directional Vault** so AI agents can reason over sensitive user data, execute database/MCP tool calls, and stream responses—without a single byte of raw PII ever reaching the LLM provider.
 
