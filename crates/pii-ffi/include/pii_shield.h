@@ -22,6 +22,22 @@ typedef struct PiiStreamHandle PiiStreamHandle;
 extern "C" {
 #endif // __cplusplus
 
+/* Extended constructors and error-reporting variants added for the
+ * multi-language SDK bindings. These are not yet emitted by cbindgen
+ * (current tooling does not support the signatures); keep them in sync
+ * with crates/pii-ffi/src/lib.rs.
+ */
+struct PiiVaultHandle *pii_vault_with_custom_toml(
+    const char *locales_csv,
+    const char *custom_toml,
+    const uint8_t *key_ptr,
+    uintptr_t key_len);
+
+char *pii_vault_rehydrate_for_tool_ex(const struct PiiVaultHandle *ptr,
+                                      const char *payload,
+                                      bool is_trusted,
+                                      char **err_out);
+
 struct PiiVaultHandle *pii_vault_new(void);
 
 struct PiiVaultHandle *pii_vault_new_with_locales(const char *locales);
