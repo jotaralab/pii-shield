@@ -450,6 +450,7 @@ dependencies = [
 name = "pii-ffi"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "pii-core",
  "serde_json",
 ]

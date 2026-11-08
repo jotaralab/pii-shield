@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pii-shield"
+version = "0.1.0"
+description = "Sub-millisecond PII redaction & reversible pseudonymization for AI agents (Python bindings for pii-shield)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0 OR MIT" }
+authors = [{ name = "Jotara Lab", email = "inquiries@jotaralab.com" }]
+keywords = ["pii", "redaction", "privacy", "ai", "llm", "security", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+
+[tool.setuptools.packages.find]
+include = ["pii_shield*"]
+
+[tool.setuptools.package-data]
+pii_shield = ["py.typed"]
