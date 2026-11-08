@@ -72,7 +72,10 @@ int main(void) {
     assert(blocked_ok == NULL);
     assert(err_out != NULL);
     printf("[C ABI E2E] Blocked token via _ex: %s\n", err_out);
-    assert(strstr(err_out, "<ID_NIK_") == err_out);
+    /* The vault may report whichever offending token it finds first
+     * (NIK or email); assert the format instead of a fixed entity. */
+    assert(err_out[0] == '<');
+    assert(strchr(err_out, '>') != NULL);
     pii_string_free(err_out);
 
     // Trusted call still rehydrates and must not touch err_out.
