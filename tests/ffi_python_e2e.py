@@ -11,18 +11,28 @@ pointer is always handed back to `pii_string_free` immediately.
 import ctypes
 import json
 import os
+import sys
+from pathlib import Path
+
 
 def find_lib():
+    ws_root = Path(__file__).resolve().parent.parent
+    if sys.platform == "darwin":
+        filename = "libpii_ffi.dylib"
+    elif os.name == "nt":
+        filename = "pii_ffi.dll"
+    else:
+        filename = "libpii_ffi.so"
     candidates = [
-        "target/debug/libpii_ffi.so",
-        "target/release/libpii_ffi.so",
-        "../../target/debug/libpii_ffi.so",
-        "../../target/release/libpii_ffi.so",
+        ws_root / "target" / "debug" / filename,
+        ws_root / "target" / "release" / filename,
     ]
     for c in candidates:
-        if os.path.exists(c):
-            return os.path.abspath(c)
-    raise FileNotFoundError("Could not find libpii_ffi.so. Build with `cargo build -p pii-ffi` first.")
+        if c.is_file():
+            return str(c)
+    raise FileNotFoundError(
+        f"Could not find {filename}. Build with `cargo build -p pii-ffi` first."
+    )
 
 VOID_P = ctypes.c_void_p
 

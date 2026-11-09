@@ -23,18 +23,25 @@ class TestPiiShield < Test::Unit::TestCase
     validator = "none"
   TOML
 
-  def skip_unless_native
-    unless File.exist?(
-      File.expand_path(File.join(__dir__, "..", "..", "..", "target", "debug", "libpii_ffi.so"))
-    ) || ENV["PII_SHIELD_LIB_PATH"]
-      omit("shared library not built (run `cargo build -p pii-ffi`)")
+  LIB_FILENAME =
+    case RUBY_PLATFORM
+    when /mswin|mingw/ then "pii_ffi.dll"
+    when /darwin/ then "libpii_ffi.dylib"
+    else "libpii_ffi.so"
     end
+
+  def skip_unless_native
+    built =
+      %w[release debug].any? do |build|
+        File.exist?(File.expand_path(File.join(__dir__, "..", "..", "..", "target", build, LIB_FILENAME)))
+      end
+    omit("shared library not built (run `cargo build -p pii-ffi`)") unless built || ENV["PII_SHIELD_LIB_PATH"]
   end
 
   def test_redact_rehydrate_roundtrip
     skip_unless_native
     vault = PiiShield::Vault.new
-    assert_not_equal 0, vault.handle
+    refute_predicate vault, :closed?
     begin
       vault.set_token_format(PiiShield::TokenFormat::COMPACT_HASH)
       redacted = vault.redact("NIK 3573012203950001")
@@ -50,6 +57,12 @@ class TestPiiShield < Test::Unit::TestCase
     skip_unless_native
     e = assert_raise(ArgumentError) { PiiShield::Vault.new(locales_csv: "global_typo") }
     assert_match(/creation failed/, e.message)
+  end
+
+  def test_empty_locales_fail_closed
+    skip_unless_native
+    assert_raise(ArgumentError) { PiiShield::Vault.new(locales_csv: "") }
+    assert_raise(ArgumentError) { PiiShield::Vault.new(locales_csv: " , ") }
   end
 
   def test_bad_key_rejected
@@ -92,6 +105,45 @@ class TestPiiShield < Test::Unit::TestCase
     end
   end
 
+  def test_invalid_trust_rejected
+    skip_unless_native
+    vault = PiiShield::Vault.new
+    begin
+      assert_raise(ArgumentError) do
+        vault.rehydrate_for_tool("x", trusted: "yes")
+      end
+      assert_raise(ArgumentError) do
+        vault.rehydrate_for_tool("x", trusted: 1)
+      end
+    ensure
+      vault.close
+    end
+  end
+
+  def test_nul_and_invalid_utf8_rejected
+    skip_unless_native
+    vault = PiiShield::Vault.new
+    begin
+      assert_raise(ArgumentError) { vault.redact("a\x00b") }
+      assert_raise(ArgumentError) { vault.rehydrate("\x00") }
+      bad = String.new("caf\xC3".b)
+      bad.force_encoding(Encoding::UTF_8)
+      assert_raise(ArgumentError) { vault.redact(bad) }
+    ensure
+      vault.close
+    end
+  end
+
+  def test_closed_vault_raises
+    skip_unless_native
+    vault = PiiShield::Vault.new
+    vault.close
+    assert_predicate vault, :closed?
+    vault.close # idempotent
+    assert_raise(RuntimeError) { vault.redact("x") }
+    assert_raise(RuntimeError) { vault.handle }
+  end
+
   def test_redact_json_preserves_numbers
     skip_unless_native
     vault = PiiShield::Vault.new
@@ -100,6 +152,28 @@ class TestPiiShield < Test::Unit::TestCase
       parsed = JSON.parse(redacted)
       assert_equal 1_234_567_890_123_456, parsed["order_id"]
       assert parsed["nik"].start_with?("<ID_NIK_")
+    ensure
+      vault.close
+    end
+  end
+
+  def test_two_phase_seal_clear_and_stateless
+    skip_unless_native
+    vault = PiiShield::Vault.new
+    begin
+      vault.set_token_format(PiiShield::TokenFormat::COMPACT_HASH)
+      vault.redact("NIK 3573012203950001")
+      sealed = vault.seal_dirty_sealed_entries_json("aad:ruby")
+      refute_empty JSON.parse(sealed)
+
+      tokens = JSON.parse(sealed).keys
+      vault.clear_dirty_tokens(JSON.generate(tokens))
+      assert_equal({}, JSON.parse(vault.seal_dirty_sealed_entries_json("aad:ruby")))
+
+      vault.set_token_format(PiiShield::TokenFormat::STATELESS_SEALED)
+      assert vault.is_stateless_mode?
+      vault.set_token_format(PiiShield::TokenFormat::SEQUENTIAL)
+      refute vault.is_stateless_mode?
     ensure
       vault.close
     end

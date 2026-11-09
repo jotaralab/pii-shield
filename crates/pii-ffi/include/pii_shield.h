@@ -26,6 +26,11 @@ extern "C" {
  * multi-language SDK bindings. These are not yet emitted by cbindgen
  * (current tooling does not support the signatures); keep them in sync
  * with crates/pii-ffi/src/lib.rs.
+ *
+ * pii_vault_with_custom_toml contract: returns NULL on any invalid input
+ * (locales, TOML, key policy); a NULL key with len 0 generates a CSPRNG key,
+ * and either a NULL key with non-zero len or a non-NULL key that is not
+ * exactly 32 bytes fails closed.
  */
 struct PiiVaultHandle *pii_vault_with_custom_toml(
     const char *locales_csv,
@@ -33,10 +38,27 @@ struct PiiVaultHandle *pii_vault_with_custom_toml(
     const uint8_t *key_ptr,
     uintptr_t key_len);
 
+/**
+ * Rehydrates a tool-call payload and reports the blocked token.
+ *
+ * Returns NULL on failure. When `err_out` points at a valid `char *` slot:
+ * - ACL exfiltration block: `*err_out` is set to a caller-owned
+ *   NUL-terminated token string (free via `pii_string_free`).
+ * - Input/operational failure: `*err_out` stays NULL.
+ * `*err_out` is zeroed at entry.
+ */
 char *pii_vault_rehydrate_for_tool_ex(const struct PiiVaultHandle *ptr,
                                       const char *payload,
                                       bool is_trusted,
                                       char **err_out);
+
+char *pii_vault_seal_dirty_sealed_entries_json(const struct PiiVaultHandle *ptr,
+                                               const char *aad);
+
+bool pii_vault_clear_dirty_tokens(struct PiiVaultHandle *ptr,
+                                  const char *tokens_json);
+
+bool pii_vault_is_stateless_mode(const struct PiiVaultHandle *ptr);
 
 struct PiiVaultHandle *pii_vault_new(void);
 

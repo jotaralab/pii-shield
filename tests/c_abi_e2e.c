@@ -43,10 +43,30 @@ int main(void) {
     printf("[C ABI E2E] Rehydrated string: %s\n", rehydrated);
     assert(strcmp(rehydrated, prompt) == 0);
 
-    // 4. Test tool rehydration
+    // 4. Test tool rehydration: tokens inside the *redacted* input for an
+    //    untrusted tool come back redacted; a trusted tool sees plaintext.
     const char *tool_call = "{\"nik\":\"<ID_NIK_1>\"}";
     char *tool_rehydrated = pii_vault_rehydrate_for_tool(vault, tool_call, true);
     assert(tool_rehydrated != NULL);
+
+    // 4b. Custom TOML keyed with the explicit shared key (keyed path) and
+    //     cross-vault rehydration. Stateless sealed tokens carry their
+    //     ciphertext, so a fresh vault with the same key rehydrates them.
+    unsigned char key32[32];
+    memset(key32, 7, sizeof(key32));
+    struct PiiVaultHandle *kvault = pii_vault_with_custom_toml("global", CUSTOM_TOML, key32, sizeof(key32));
+    assert(kvault != NULL);
+    struct PiiVaultHandle *kvault2 = pii_vault_with_custom_toml("global", CUSTOM_TOML, key32, sizeof(key32));
+    assert(kvault2 != NULL);
+    pii_vault_set_token_format(kvault, 2);
+    pii_vault_set_token_format(kvault2, 2);
+    char *kred = pii_vault_redact(kvault, "Account ACC-999999 opened");
+    assert(kred != NULL && strstr(kred, "<PII:CUSTOM_ACC:") != NULL);
+    char *krehydrated = pii_vault_rehydrate(kvault2, kred);
+    assert(krehydrated != NULL);
+    assert(strcmp(krehydrated, "Account ACC-999999 opened") == 0);
+    pii_string_free(kred);
+    pii_string_free(krehydrated);
 
     // 5. Custom TOML constructor (CSPRNG key path)
     struct PiiVaultHandle *cvault = pii_vault_with_custom_toml("global", CUSTOM_TOML, NULL, 0);
@@ -65,8 +85,6 @@ int main(void) {
     assert(pii_vault_with_custom_toml("global", CUSTOM_TOML, NULL, 32) == NULL);
 
     // 6. rehydrate_for_tool_ex reports the blocked token.
-    unsigned char key32[32];
-    memset(key32, 7, sizeof(key32));
     char *err_out = NULL;
     char *blocked_ok = pii_vault_rehydrate_for_tool_ex(vault, redacted, false, &err_out);
     assert(blocked_ok == NULL);
@@ -83,7 +101,45 @@ int main(void) {
     char *trusted = pii_vault_rehydrate_for_tool_ex(vault, redacted, true, &err_out);
     assert(trusted != NULL);
     assert(err_out == NULL);
+    assert(strcmp(trusted, prompt) == 0);
     pii_string_free(trusted);
+
+    // 6b. Two-phase dirty sync from C: seal without clearing, then clear by
+    //     the tokens contained in the sealed map.
+    const char *aad = "session:c_abi_e2e";
+    char *sealed = pii_vault_seal_dirty_sealed_entries_json(vault, aad);
+    assert(sealed != NULL && strstr(sealed, "PIIE1:") != NULL);
+    // Extract every key (token) of the sealed JSON map into a tokens array.
+    char tokens_json[1024];
+    tokens_json[0] = '[';
+    size_t pos = 1;
+    const char *p = sealed;
+    while ((p = strchr(p, '"')) != NULL) {
+        const char *q1 = p;              // opening quote
+        const char *q2 = strchr(q1 + 1, '"');
+        assert(q2 != NULL);
+        // Only keys precede a ':' within the same pair.
+        if (q2[1] == ':') {
+            if (pos > 1) {
+                tokens_json[pos++] = ',';
+            }
+            memcpy(tokens_json + pos, q1, (size_t)(q2 - q1 + 1));
+            pos += (size_t)(q2 - q1 + 1);
+        }
+        p = q2 + 1;
+    }
+    tokens_json[pos++] = ']';
+    tokens_json[pos] = '\0';
+    assert(pii_vault_clear_dirty_tokens(vault, tokens_json));
+    char *sealed2 = pii_vault_seal_dirty_sealed_entries_json(vault, aad);
+    assert(sealed2 != NULL && strcmp(sealed2, "{}") == 0);
+
+    // 6c. is_stateless_mode toggles.
+    pii_vault_set_stateless_mode(vault, true);
+    assert(pii_vault_is_stateless_mode(vault));
+    pii_vault_set_stateless_mode(vault, false);
+    assert(!pii_vault_is_stateless_mode(vault));
+    assert(!pii_vault_is_stateless_mode(NULL));
 
     // Legacy entry point still returns plain NULL on block (ABI compat).
     assert(pii_vault_rehydrate_for_tool(vault, redacted, false) == NULL);
@@ -124,6 +180,8 @@ int main(void) {
     pii_stream_free(stream);
     pii_vault_free(vault);
     pii_vault_free(cvault);
+    pii_vault_free(kvault);
+    pii_vault_free(kvault2);
 
     printf("[C ABI E2E] All native C tests passed cleanly with 0 errors!\n");
     return 0;

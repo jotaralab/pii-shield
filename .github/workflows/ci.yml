@@ -38,8 +38,15 @@ jobs:
         run: |
           cargo build -p pii-ffi
           python3 tests/ffi_python_e2e.py
-          gcc -Wall -Werror tests/c_abi_e2e.c -Ltarget/debug -lpii_ffi -Icrates/pii-ffi/include -Wl,-rpath,'$ORIGIN/target/debug',-rpath,$PWD/target/debug -o /tmp/c_abi_test
+          gcc -Wall -Wextra -Werror tests/c_abi_e2e.c -Ltarget/debug -lpii_ffi -Icrates/pii-ffi/include -Wl,-rpath,'$ORIGIN/target/debug',-rpath,$PWD/target/debug -o /tmp/c_abi_test
           /tmp/c_abi_test
+      - name: Run Python SDK Unit Tests
+        run: python3 -m unittest discover -s bindings/python/tests -v
+      - name: Run Go SDK Tests
+        run: |
+          cd bindings/go
+          go vet ./...
+          go test -race -v ./...
 
   security-audit:
     name: Security & License Audit

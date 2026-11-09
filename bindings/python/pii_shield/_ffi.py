@@ -4,58 +4,79 @@ Zero-leak string lifecycle: functions returning `*mut c_char` are declared
 with ``restype = ctypes.c_void_p`` so ctypes keeps the raw pointer available
 for ``pii_string_free``. Values are read with ``ctypes.string_at``.
 
-Library discovery order (``_find_library``):
+Library discovery is strict and never searches the working directory (an
+untrusted CWD would allow DLL hijacking). Resolution order
+(``_find_library``):
 
-1. ``PII_SHIELD_LIB_PATH`` environment variable
-2. workspace ``target/release`` then ``target/debug``
-3. system loader default (bare lib name via ``ctypes.CDLL``)
+1. ``PII_SHIELD_LIB_PATH`` (must exist, else ``FileNotFoundError``)
+2. bundled wheel directory (``pii_shield/`` itself)
+3. ``PII_SHIELD_WS`` environment variable root + ``target/{release,debug}``
+4. editable checkout workspace root (verified by a sibling ``Cargo.toml``)
+5. system dynamic loader (LD_LIBRARY_PATH / rpath decides)
 """
 from __future__ import annotations
 
 import ctypes
 import os
+import sys
+import threading
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 _VOID_P = ctypes.c_void_p
+
+_lib_lock = threading.Lock()
 
 
 def _lib_filename() -> str:
     if os.name == "nt":
         return "pii_ffi.dll"
-    if os.uname().sysname == "Darwin":  # macOS
+    if sys.platform == "darwin":
         return "libpii_ffi.dylib"
     return "libpii_ffi.so"
 
 
+def _here() -> Path:
+    return Path(__file__).resolve().parent
+
+
 def _find_library() -> str:
-    """Resolve the path of the shared library, honoring PII_SHIELD_LIB_PATH."""
+    """Resolve the path of the shared library. See module docstring."""
     filename = _lib_filename()
+
+    # 1. Explicit override: must exist or the user made a mistake.
     env = os.environ.get("PII_SHIELD_LIB_PATH")
     if env:
-        if os.path.exists(env):
+        if Path(env).is_file():
             return env
         raise FileNotFoundError(
             f"PII_SHIELD_LIB_PATH is set to {env!r} but the file does not exist"
         )
+
     candidates: list[Path] = []
-    for base in (os.environ.get("PII_SHIELD_WS"),
-                 ".",
-                 Path(os.path.dirname(__file__)).parent.parent / ".."):
-        if not base:
-            continue
-        root = Path(base).resolve()
+
+    # 2. Bundled wheel directory (matches the package install location).
+    candidates.append(_here() / filename)
+
+    # 3. Explicit workspace override.
+    ws_env = os.environ.get("PII_SHIELD_WS")
+    if ws_env:
+        ws_root = Path(ws_env).resolve()
         for build in ("release", "debug"):
-            candidates.append(root / "target" / build / filename)
-    # Walk upward from this file so `pip install`ed editable sources still find it.
-    here = Path(os.path.dirname(__file__)).resolve()
-    for parent in here.parents:
+            candidates.append(ws_root / "target" / build / filename)
+
+    # 4. Editable checkout: pii_shield/**/_ffi.py -> bindings/python/../..
+    #    -> the cargo workspace, verified by a sibling Cargo.toml.
+    ws_root = Path(__file__).resolve().parents[3]
+    if (ws_root / "Cargo.toml").is_file():
         for build in ("release", "debug"):
-            candidates.append(parent / "target" / build / filename)
+            candidates.append(ws_root / "target" / build / filename)
+
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.is_file():
             return str(candidate)
-    # Last resort: system loader (LD_LIBRARY_PATH / rpath) decides.
+
+    # 5. Last resort: system loader (LD_LIBRARY_PATH / rpath) decides.
     return filename
 
 
@@ -86,7 +107,7 @@ class _Lib:
         lib.pii_vault_new_with_locales_and_key.restype = v
 
         lib.pii_vault_with_custom_toml.argtypes = [
-            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t
         ]
         lib.pii_vault_with_custom_toml.restype = v
 
@@ -98,6 +119,9 @@ class _Lib:
 
         lib.pii_vault_set_stateless_mode.argtypes = [v, ctypes.c_bool]
         lib.pii_vault_set_stateless_mode.restype = None
+
+        lib.pii_vault_is_stateless_mode.argtypes = [v]
+        lib.pii_vault_is_stateless_mode.restype = ctypes.c_bool
 
         # -- redaction / rehydration ----------------------------------------
         lib.pii_vault_redact.argtypes = [v, ctypes.c_char_p]
@@ -123,6 +147,12 @@ class _Lib:
 
         lib.pii_vault_drain_dirty_sealed_entries_json.argtypes = [v, ctypes.c_char_p]
         lib.pii_vault_drain_dirty_sealed_entries_json.restype = v
+
+        lib.pii_vault_seal_dirty_sealed_entries_json.argtypes = [v, ctypes.c_char_p]
+        lib.pii_vault_seal_dirty_sealed_entries_json.restype = v
+
+        lib.pii_vault_clear_dirty_tokens.argtypes = [v, ctypes.c_char_p]
+        lib.pii_vault_clear_dirty_tokens.restype = ctypes.c_bool
 
         lib.pii_vault_import_sealed_entries_json.argtypes = [v, ctypes.c_char_p, ctypes.c_char_p]
         lib.pii_vault_import_sealed_entries_json.restype = ctypes.c_bool
@@ -165,9 +195,12 @@ _lib_instance: Optional[_Lib] = None
 
 
 def get_lib() -> _Lib:
+    """Return the process-wide bound library, initializing it under a lock."""
     global _lib_instance
     if _lib_instance is None:
-        _lib_instance = _Lib()
+        with _lib_lock:
+            if _lib_instance is None:
+                _lib_instance = _Lib()
     return _lib_instance
 
 

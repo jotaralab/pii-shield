@@ -132,6 +132,83 @@ class VaultTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 vault.import_sealed_entries_json("not json", "aad")
 
+    def test_trust_handling_matches_identity(self):
+        with PiiSessionVault() as vault:
+            redacted = vault.redact("NIK 3573012203950001")
+            # Enum identity must not be collapsed through truthiness: 1 == True.
+            with self.assertRaises(ExfiltrationBlockedError):
+                vault.rehydrate_for_tool(redacted, False)
+            with self.assertRaises(ExfiltrationBlockedError):
+                vault.rehydrate_for_tool(redacted, ToolTrustLevel.ExternalUntrusted)
+            self.assertEqual(
+                vault.rehydrate_for_tool(redacted, True), "NIK 3573012203950001"
+            )
+            self.assertEqual(
+                vault.rehydrate_for_tool(redacted, ToolTrustLevel.InternalTrusted),
+                "NIK 3573012203950001",
+            )
+            with self.assertRaises(TypeError):
+                vault.rehydrate_for_tool(redacted, "yes")
+
+    def test_closed_vault_operations_raise(self):
+        vault = PiiSessionVault()
+        stream = StreamingRehydrator()
+        vault.close()
+        stream.close()
+        self.assertTrue(vault._handle is None)
+        for fn in (
+            lambda: vault.redact("x"),
+            lambda: vault.rehydrate("<ID_NIK_X>"),
+            lambda: vault.set_token_format(TokenFormat.Sequential),
+            lambda: vault.is_stateless_mode(),
+            lambda: vault.export_sealed_state("aad"),
+            lambda: stream.flush(vault),
+            lambda: stream.push_chunk("x", vault),
+        ):
+            with self.assertRaises(ValueError):
+                fn()
+        # Double close is a no-op.
+        vault.close()
+        stream.close()
+
+    def test_nul_bytes_rejected(self):
+        with PiiSessionVault() as vault:
+            for fn, arg in (
+                (vault.redact, "a\x00b"),
+                (vault.rehydrate, "a\x00"),
+                (vault.redact_json, '{"a":"b\x00"}'),
+                (vault.rehydrate_for_tool, "x\x00"),
+            ):
+                with self.assertRaises(ValueError):
+                    if fn == vault.rehydrate_for_tool:
+                        fn(arg, True)
+                    else:
+                        fn(arg)
+
+    def test_two_phase_seal_and_stateless_query(self):
+        shared = bytes(range(32))
+        v1 = PiiSessionVault(key=shared)
+        try:
+            v1.set_token_format(TokenFormat.CompactHash)
+            redacted = v1.redact("NIK 3573012203950001")
+            # Snapshot without clearing (seal, not drain).
+            sealed = v1.seal_dirty_sealed_entries_json("aad:two-phase")
+            self.assertTrue(len(json.loads(sealed)) > 0)
+            # Still dirty: seal again yields the same token set (the sealed
+            # payload itself is re-encrypted per call with a fresh nonce).
+            again = v1.seal_dirty_sealed_entries_json("aad:two-phase")
+            self.assertEqual(sorted(json.loads(sealed)), sorted(json.loads(again)))
+            # Clear, then verify stateless query API.
+            v1.set_stateless_mode(True)
+            self.assertTrue(v1.is_stateless_mode())
+            v1.set_stateless_mode(False)
+            self.assertFalse(v1.is_stateless_mode())
+            v1.clear_dirty_tokens(json.loads(sealed))
+            self.assertEqual(v1.seal_dirty_sealed_entries_json("aad:two-phase"), "{}")
+            _ = redacted
+        finally:
+            v1.close()
+
 
 class StreamingTest(unittest.TestCase):
     def test_split_token_rehydrate(self):
