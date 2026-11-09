@@ -31,5 +31,5 @@ Every C function returning `char *` returns a Rust-owned heap allocation that
   with `defer C.pii_string_free`.
 - **Ruby** (`ffi`): `:pointer` return type + `read_string` + `pii_string_free`
   inside `ensure`.
-- **Elixir** (NIF shim): harms' `ErlNifResourceType` destructors free vaults
+- **Elixir** (NIF shim): the BEAM's `ErlNifResourceType` destructors free vaults
   and streams; strings copied into Erlang binaries before freeing.

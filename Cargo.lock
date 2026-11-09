@@ -453,6 +453,8 @@ dependencies = [
  "getrandom",
  "pii-core",
  "serde_json",
+ "toml",
+ "zeroize",
 ]
 
 [[package]]

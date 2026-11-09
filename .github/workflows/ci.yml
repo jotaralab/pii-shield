@@ -38,8 +38,30 @@ jobs:
         run: |
           cargo build -p pii-ffi
           python3 tests/ffi_python_e2e.py
-          gcc -Wall -Werror tests/c_abi_e2e.c -Ltarget/debug -lpii_ffi -Icrates/pii-ffi/include -Wl,-rpath,'$ORIGIN/target/debug',-rpath,$PWD/target/debug -o /tmp/c_abi_test
+          gcc -Wall -Wextra -Werror tests/c_abi_e2e.c -Ltarget/debug -lpii_ffi -Icrates/pii-ffi/include -Wl,-rpath,'$ORIGIN/target/debug',-rpath,$PWD/target/debug -o /tmp/c_abi_test
           /tmp/c_abi_test
+      - name: Run Python SDK Unit Tests
+        run: python3 -m unittest discover -s bindings/python/tests -v
+      - name: Run Go SDK Tests
+        run: |
+          cd bindings/go
+          go vet ./...
+          go test -race -v ./...
+      - name: Run Ruby SDK Tests
+        run: |
+          gem install ffi --no-document
+          cd bindings/ruby
+          ruby -Ilib:test test/test_pii_shield.rb
+      - name: Run Elixir SDK Tests
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+      - name: Elixir SDK mix compile & test
+        run: |
+          cd bindings/elixir
+          mix compile
+          mix test
 
   security-audit:
     name: Security & License Audit

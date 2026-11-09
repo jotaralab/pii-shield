@@ -13,3 +13,5 @@ crate-type = ["staticlib", "cdylib"]
 pii-core = { path = "../pii-core" }
 serde_json.workspace = true
 getrandom.workspace = true
+toml.workspace = true
+zeroize.workspace = true

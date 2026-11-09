@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "ffi"
-require "singleton"
 
 # Ruby SDK for pii-shield (libpii_ffi C-ABI).
 #
@@ -12,6 +11,8 @@ require "singleton"
 #   `ensure` block.
 # * Vault and stream handles use FFI::AutoPointer so pii_vault_free /
 #   pii_stream_free run exactly once at GC time (unless `close`d eagerly).
+#   A per-instance Mutex prevents `close` from freeing the pointer while
+#   another thread is inside a GVL-released FFI call.
 module PiiShield
   module FFILib
     extend FFI::Library
@@ -30,10 +31,10 @@ module PiiShield
           raise LoadError, "PII_SHIELD_LIB_PATH=#{env.inspect} does not exist"
         end
       else
-        # Search workspace target/{release,debug}, walking up from this file.
+        # Search workspace target/{release,debug}: bindings/ruby/lib -> the
+        # cargo workspace root is three levels up from this file.
         filename_dup = filename
-          # bindings/ruby/lib -> workspace root is three levels up.
-          root = File.expand_path("../../..", __dir__)
+        root = File.expand_path("../../..", __dir__)
         candidates = [
           File.join(root, "target", "release", filename_dup),
           File.join(root, "target", "debug", filename_dup)
@@ -60,6 +61,7 @@ module PiiShield
     attach_function :pii_vault_free, [:pointer], :void
     attach_function :pii_vault_set_token_format, %i[pointer uint8], :void
     attach_function :pii_vault_set_stateless_mode, %i[pointer bool], :void
+    attach_function :pii_vault_is_stateless_mode, [:pointer], :bool
 
     # ---- redaction / rehydration ------------------------------------------------
     # NOTE: return_type must be :pointer, never :string, so the returned Rust
@@ -77,6 +79,16 @@ module PiiShield
     # ---- persistence -----------------------------------------------------------
     attach_function :pii_vault_export_sealed_entries_json, %i[pointer string], :pointer
     attach_function :pii_vault_drain_dirty_sealed_entries_json, %i[pointer string], :pointer
+    attach_function(
+      :pii_vault_seal_dirty_sealed_entries_json,
+      %i[pointer string],
+      :pointer
+    )
+    attach_function(
+      :pii_vault_clear_dirty_tokens,
+      %i[pointer string],
+      :bool
+    )
     attach_function :pii_vault_import_sealed_entries_json, %i[pointer string string], :bool
     attach_function :pii_vault_export_sealed_state, %i[pointer string], :pointer
     attach_function :pii_vault_import_sealed_state, %i[pointer string string], :bool
@@ -89,17 +101,17 @@ module PiiShield
 
     attach_function :pii_string_free, [:pointer], :void
 
-    # Reads a returned *char into a UTF-8 Ruby string and frees the Rust buffer.
+    # Reads a returned *char into a UTF-8 Ruby string. The Rust buffer is
+    # freed inside `ensure` so even if `read_string` raises (e.g. an
+    # unexpected encoding failure), the native allocation never leaks.
     def self.take_string(ptr)
-      return nil if ptr.null?
+      return nil if ptr.nil? || ptr.null?
 
-      s = ptr.read_string.force_encoding(Encoding::UTF_8)
-      protocol_string_free(ptr)
-      s
-    end
-
-    def self.protocol_string_free(ptr)
-      pii_string_free(ptr)
+      begin
+        ptr.read_string.force_encoding(Encoding::UTF_8)
+      ensure
+        pii_string_free(ptr)
+      end
     end
   end
 
@@ -127,10 +139,29 @@ module PiiShield
     EXTERNAL_UNTRUSTED = false
   end
 
-  # Immutable wrapper so FFI::AutoPointer owns the native vault lifetime.
+  # Validates that a string argument crosses the FFI boundary intact: valid
+  # UTF-8, no interior NUL bytes. Interior NUL would silently truncate the
+  # argument; invalid UTF-8 would fail closed inside the engine.
+  def self.validate_cstring!(value, name)
+    raise ArgumentError, "#{name} must be a String, got #{value.class}" unless value.is_a?(String)
+    raise ArgumentError, "#{name} must be valid UTF-8" unless value.valid_encoding?
+    raise ArgumentError, "#{name} must not contain interior NUL bytes" if value.include?("\0")
+
+    value
+  end
+
+  # Wrapper over PiiVaultHandle with FFI::AutoPointer ownership.
   class Vault
     def initialize(locales_csv: nil, custom_toml: nil, key: nil)
+      @mutex = Mutex.new
+      key = key.dup.freeze if key
+      locales_csv &&= PiiShield.validate_cstring!(locales_csv, "locales_csv")
+      # An explicitly-supplied but empty/blank locales CSV fails closed
+      # inside the engine; nil (not passed) selects the default "global,id".
+      raise ArgumentError, "locales_csv must not be empty" if locales_csv.is_a?(String) && locales_csv.strip.empty?
+
       if custom_toml
+        PiiShield.validate_cstring!(custom_toml, "custom_toml")
         key_ptr = nil
         key_len = 0
         if key
@@ -159,68 +190,122 @@ module PiiShield
       @ptr = FFI::AutoPointer.new(ptr, FFILib.method(:pii_vault_free))
     end
 
-    # Eagerly frees native resources. Safe to call multiple times.
+    # Eagerly frees native resources. Safe to call multiple times and from
+    # any thread; the mutex keeps close() from racing an in-flight FFI call
+    # (FFI calls release the GVL).
     def close
-      return unless @ptr
+      @mutex.synchronize do
+        return unless @ptr
 
-      @ptr.free
-      @ptr = nil
+        @ptr.free
+        @ptr = nil
+      end
     end
 
     def closed?
-      @ptr.nil?
+      @mutex.synchronize { @ptr.nil? }
     end
 
     def handle
-      raise "vault closed" if closed?
+      @mutex.synchronize do
+        raise "vault closed" if @ptr.nil?
 
-      @ptr
+        @ptr
+      end
     end
 
     def set_token_format(fmt)
+      raise ArgumentError, "fmt must be an Integer in 0..2" unless fmt.is_a?(Integer) && (0..2).cover?(fmt)
+
       FFILib.pii_vault_set_token_format(handle, fmt)
       nil
     end
 
     def set_stateless_mode(enabled)
+      raise ArgumentError, "enabled must be true or false" unless enabled == true || enabled == false
+
       FFILib.pii_vault_set_stateless_mode(handle, enabled)
       nil
     end
 
+    def is_stateless_mode?
+      FFILib.pii_vault_is_stateless_mode(handle)
+    end
+
     def redact(text)
-      FFILib.take_string(FFILib.pii_vault_redact(handle, text))
+      PiiShield.validate_cstring!(text, "text")
+      result_or_fail(FFILib.take_string(FFILib.pii_vault_redact(handle, text)), "redact")
     end
 
     def redact_json(payload)
-      FFILib.take_string(FFILib.pii_vault_redact_json(handle, payload))
+      PiiShield.validate_cstring!(payload, "payload")
+      result_or_fail(FFILib.take_string(FFILib.pii_vault_redact_json(handle, payload)), "redact_json")
     end
 
     def rehydrate(text)
-      FFILib.take_string(FFILib.pii_vault_rehydrate(handle, text))
+      PiiShield.validate_cstring!(text, "text")
+      result_or_fail(FFILib.take_string(FFILib.pii_vault_rehydrate(handle, text)), "rehydrate")
     end
 
-    # Rehydrates a tool-call payload. Raises ExfiltrationBlockedError (with the
-    # exact offending token) when the tool is untrusted.
+    # Rehydrates a tool-call payload. Only raises ExfiltrationBlockedError
+    # (with the exact offending token) when the engine reports an ACL block
+    # through err_out; any other failure raises RuntimeError.
     def rehydrate_for_tool(payload, trusted:)
+      raise ArgumentError, "trusted must be true or false" unless trusted == true || trusted == false
+
+      PiiShield.validate_cstring!(payload, "payload")
+      is_trusted = trusted == ToolTrustLevel::INTERNAL_TRUSTED
       err_ptr = FFI::MemoryPointer.new(:pointer)
-      is_trusted = trusted == ToolTrustLevel::INTERNAL_TRUSTED || trusted == true
       out = FFILib.pii_vault_rehydrate_for_tool_ex(handle, payload, is_trusted, err_ptr)
       if out.null?
         token_ptr = err_ptr.read_pointer
-        token = token_ptr.null? ? "<UNKNOWN>" : FFILib.take_string(token_ptr)
-        raise ExfiltrationBlockedError.new(token)
+        unless token_ptr.null?
+          token = FFILib.take_string(token_ptr)
+          raise ExfiltrationBlockedError.new(token) if token
+
+          raise "native rehydrate_for_tool_ex call failed"
+        end
+        raise "native rehydrate_for_tool_ex call failed"
       end
-      FFILib.take_string(out)
+      result_or_fail(FFILib.take_string(out), "rehydrate_for_tool")
     ensure
       err_ptr&.free
     end
 
     def export_sealed_entries_json(aad)
-      FFILib.take_string(FFILib.pii_vault_export_sealed_entries_json(handle, aad))
+      PiiShield.validate_cstring!(aad, "aad")
+      result_or_fail(
+        FFILib.take_string(FFILib.pii_vault_export_sealed_entries_json(handle, aad)),
+        "export_sealed_entries_json"
+      )
     end
 
     def drain_dirty_sealed_entries_json(aad)
-      FFILib.take_string(FFILib.pii_vault_drain_dirty_sealed_entries_json(handle, aad))
+      PiiShield.validate_cstring!(aad, "aad")
+      result_or_fail(
+        FFILib.take_string(FFILib.pii_vault_drain_dirty_sealed_entries_json(handle, aad)),
+        "drain_dirty_sealed_entries_json"
+      )
+    end
+
+    # Two-phase sync, step 1: snapshot the dirty entries without clearing
+    # them (non-destructive counterpart of drain_dirty_sealed_entries_json).
+    def seal_dirty_sealed_entries_json(aad)
+      PiiShield.validate_cstring!(aad, "aad")
+      result_or_fail(
+        FFILib.take_string(FFILib.pii_vault_seal_dirty_sealed_entries_json(handle, aad)),
+        "seal_dirty_sealed_entries_json"
+      )
+    end
+
+    # Two-phase sync, step 2: clear the given tokens after a successful
+    # store write. Accepts the JSON array of tokens exported by the seal /
+    # drain helpers, e.g. `["<ID_NIK_A1>"]`.
+    def clear_dirty_tokens(tokens_json)
+      PiiShield.validate_cstring!(tokens_json, "tokens_json")
+      raise ArgumentError, "failed to clear dirty tokens" unless FFILib.pii_vault_clear_dirty_tokens(handle, tokens_json)
+
+      nil
     end
 
     def import_sealed_entries_json(json_map, aad)
@@ -228,17 +313,32 @@ module PiiShield
     end
 
     def export_sealed_state(aad)
-      FFILib.take_string(FFILib.pii_vault_export_sealed_state(handle, aad))
+      PiiShield.validate_cstring!(aad, "aad")
+      result_or_fail(
+        FFILib.take_string(FFILib.pii_vault_export_sealed_state(handle, aad)),
+        "export_sealed_state"
+      )
     end
 
     def import_sealed_state(sealed, aad)
       raise ArgumentError, "failed to import sealed state" unless FFILib.pii_vault_import_sealed_state(handle, sealed, aad)
+    end
+
+    private
+
+    # A NULL return means the native call failed; never collapse that into
+    # an empty (possibly empty-looking but valid) string.
+    def result_or_fail(value, op)
+      raise "native #{op} call failed" if value.nil?
+
+      value
     end
   end
 
   # Rehydrates tokens split across streamed chunks (SSE).
   class StreamingRehydrator
     def initialize
+      @mutex = Mutex.new
       ptr = FFILib.pii_stream_new
       raise "stream allocation failed" if ptr.null?
 
@@ -246,24 +346,47 @@ module PiiShield
     end
 
     def close
-      return unless @ptr
+      @mutex.synchronize do
+        return unless @ptr
 
-      @ptr.free
-      @ptr = nil
+        @ptr.free
+        @ptr = nil
+      end
+    end
+
+    def closed?
+      @mutex.synchronize { @ptr.nil? }
     end
 
     def handle
-      raise "stream closed" if @ptr.nil?
+      @mutex.synchronize do
+        raise "stream closed" if @ptr.nil?
 
-      @ptr
+        @ptr
+      end
     end
 
     def push_chunk(chunk, vault)
-      FFILib.take_string(FFILib.pii_stream_push_chunk(handle, vault.handle, chunk))
+      PiiShield.validate_cstring!(chunk, "chunk")
+      result_or_fail(
+        FFILib.take_string(FFILib.pii_stream_push_chunk(handle, vault.handle, chunk)),
+        "push_chunk"
+      )
     end
 
     def flush(vault)
-      FFILib.take_string(FFILib.pii_stream_flush(handle, vault.handle))
+      result_or_fail(
+        FFILib.take_string(FFILib.pii_stream_flush(handle, vault.handle)),
+        "flush"
+      )
+    end
+
+    private
+
+    def result_or_fail(value, op)
+      raise "native #{op} call failed" if value.nil?
+
+      value
     end
   end
 end

@@ -60,6 +60,7 @@ defmodule Mix.Tasks.Compile.PiiNif do
     or set PII_SHIELD_LIB_PATH=/absolute/path/to/libpii_ffi.so
     """)
 
+    lib = Path.expand(lib)
     priv_dir = Path.dirname(priv_nif)
     File.mkdir_p!(priv_dir)
 
@@ -71,40 +72,40 @@ defmodule Mix.Tasks.Compile.PiiNif do
     include_hdr = Path.expand("../../crates/pii-ffi/include", __ENV__.file |> Path.dirname())
 
     lib_dir = Path.dirname(lib)
+
+    # macOS needs -dynamiclib (with undefined lookups resolved at load time
+    # from the rpath-loaded libpii_ffi); Linux/other unix use -shared.
+    base_flags =
+      case :os.type() do
+        {:unix, :darwin} -> ["-O2", "-fPIC", "-dynamiclib", "-undefined", "dynamic_lookup"]
+        _ -> ["-O2", "-fPIC", "-shared"]
+      end
+
+    rpaths = ["-Wl,-rpath,#{lib_dir}"]
     rpaths =
-      for d <- [
-            Path.expand("../../target/release", lib_dir),
-            Path.expand("../../target/debug", lib_dir)
-          ],
-          do: "-Wl,-rpath,#{d}"
+      case :os.type() do
+        # ld on macOS uses -rpath (no -Wl wrapper needed)
+        {:unix, :darwin} -> for d <- rpaths, do: String.replace(d, "-Wl,-rpath,", "-rpath,")
+        _ -> rpaths
+      end
 
-    env = %{
-      "CC" => System.get_env("CC", "cc"),
-      "CFLAGS" =>
-        Enum.join(
-          [
-            "-O2 -fPIC -shared",
-            "-I#{include_nif}",
-            "-I#{include_hdr}",
-            "-L#{lib_dir}"
-          ] ++ rpaths,
-          " "
-        ),
-      "LDFLAGS" => "-lpii_ffi"
-    }
+    args =
+      files_for(Path.join(File.cwd!(), "c_src/pii_shield_nif.c")) ++
+        base_flags ++
+        ["-I#{include_nif}", "-I#{include_hdr}", "-L#{lib_dir}"] ++
+        rpaths ++
+        ["-lpii_ffi", "-o", priv_nif]
 
-    files = [Path.expand("c_src/pii_shield_nif.c", File.cwd!())]
-    {output, status} =
-      System.cmd(
-        env["CC"],
-        files ++ String.split(env["CFLAGS"]) ++ String.split(env["LDFLAGS"]) ++ ["-o", priv_nif],
-        env: env
-      )
+    env = %{"CC" => System.get_env("CC", "cc")}
 
-    if status != 0, do: Mix.raise("piif NIF compile failed:\n#{output}")
+    {output, status} = System.cmd(env["CC"], args, env: env)
+
+    if status != 0, do: Mix.raise("pii_shield_nif compile failed:\n#{output}")
     Mix.shell().info("Compiled pii_shield_nif -> #{priv_nif}")
     :ok
   end
+
+  defp files_for(source), do: [source]
 
   defp find_pii_ffi do
     case System.get_env("PII_SHIELD_LIB_PATH") do

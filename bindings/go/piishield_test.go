@@ -2,7 +2,9 @@ package piishield
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -258,24 +260,30 @@ func TestStreamRehydratorSplitToken(t *testing.T) {
 
 func TestSetStatelessModeAndConcurrentReads(t *testing.T) {
 	v := requireVault(t)
-	v.SetStatelessMode(true)
+	if err := v.SetStatelessMode(true); err != nil {
+		t.Fatalf("SetStatelessMode: %v", err)
+	}
+	ok, err := v.IsStatelessMode()
+	if err != nil || !ok {
+		t.Fatalf("IsStatelessMode: %v ok=%v", err, ok)
+	}
 
 	redacted, err := v.Redact("NIK 3573012203950001")
 	if err != nil {
 		t.Fatalf("Redact: %v", err)
 	}
 	// Concurrent read-only rehydrations must not deadlock.
-	done := make(chan struct{})
+	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
+		wg.Add(1)
 		go func() {
-			defer close(done)
+			defer wg.Done()
 			if _, err := v.Rehydrate(redacted); err != nil {
 				t.Errorf("Rehydrate: %v", err)
 			}
 		}()
-		<-done
-		done = make(chan struct{})
 	}
+	wg.Wait()
 }
 
 func bytes32() []byte {
@@ -284,4 +292,134 @@ func bytes32() []byte {
 		b[i] = byte(100 + i)
 	}
 	return b
+}
+
+func TestCustomTOMLRejectsEmptySliceKey(t *testing.T) {
+	// []byte{} is a non-nil empty slice: it must fail closed, not select
+	// CSPRNG generation.
+	if _, err := NewVaultWithCustomTOML("", customTOML, []byte{}); err == nil {
+		t.Fatal("expected failure for empty non-nil key slice")
+	}
+}
+
+func TestNULBytesRejected(t *testing.T) {
+	v := requireVault(t)
+	for _, s := range []string{"a\x00b", "\x00"} {
+		if _, err := v.Redact(s); err == nil {
+			t.Fatal("expected error for NUL input")
+		}
+	}
+	if _, err := NewVaultWithLocales("global\x00"); err == nil {
+		t.Fatal("expected error for NUL in locales")
+	}
+}
+
+func TestClosedVaultReturnsErrVaultClosed(t *testing.T) {
+	v := requireVault(t)
+	redacted, err := v.Redact("NIK 3573012203950001")
+	if err != nil {
+		t.Fatalf("Redact: %v", err)
+	}
+	v.Close()
+	v.Close() // idempotent
+
+	if _, err := v.Redact("x"); err != ErrVaultClosed {
+		t.Fatalf("Redact after close: %v", err)
+	}
+	if _, err := v.Rehydrate(redacted); err != ErrVaultClosed {
+		t.Fatalf("Rehydrate after close: %v", err)
+	}
+	if _, err := v.IsStatelessMode(); err != ErrVaultClosed {
+		t.Fatalf("IsStatelessMode after close: %v", err)
+	}
+	if _, err := v.RehydrateForTool(redacted, InternalTrusted); err != ErrVaultClosed {
+		t.Fatalf("RehydrateForTool after close: %v", err)
+	}
+}
+
+func TestTwoPhaseSealAndClear(t *testing.T) {
+	v := requireVault(t)
+	if err := v.SetTokenFormat(TokenCompactHash); err != nil {
+		t.Fatalf("SetTokenFormat: %v", err)
+	}
+	if _, err := v.Redact("NIK 3573012203950001"); err != nil {
+		t.Fatalf("Redact: %v", err)
+	}
+	sealed, err := v.SealDirtySealedEntriesJSON("aad:go2p")
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if len(sealed) < 10 {
+		t.Fatalf("seal output too small: %q", sealed)
+	}
+	var tokenMap map[string]string
+	if err := json.Unmarshal([]byte(sealed), &tokenMap); err != nil {
+		t.Fatalf("seal json: %v", err)
+	}
+	tokens := make([]string, 0, len(tokenMap))
+	for tok := range tokenMap {
+		tokens = append(tokens, tok)
+	}
+	tokensJSON, _ := json.Marshal(tokens)
+	if err := v.ClearDirtyTokens(string(tokensJSON)); err != nil {
+		t.Fatalf("ClearDirtyTokens: %v", err)
+	}
+	again, err := v.SealDirtySealedEntriesJSON("aad:go2p")
+	if err != nil {
+		t.Fatalf("re-seal: %v", err)
+	}
+	if again != "{}" {
+		t.Fatalf("dirty set should be empty: %q", again)
+	}
+	if err := v.ClearDirtyTokens("not json"); err == nil {
+		t.Fatal("expected error for invalid token JSON")
+	}
+}
+
+func TestCustomTOMLCsprngStillRedacts(t *testing.T) {
+	v, err := NewVaultWithCustomTOML("global", customTOML, nil)
+	if err != nil {
+		t.Fatalf("NewVaultWithCustomTOML with nil key: %v", err)
+	}
+	defer v.Close()
+	redacted, err := v.Redact("ACC-123456")
+	if err != nil || !strings.Contains(redacted, "<CUSTOM_ACC_") {
+		t.Fatalf("csprng vault redact: %v %q", err, redacted)
+	}
+}
+
+func TestSealDeterministicTokenSet(t *testing.T) {
+	v := requireVault(t)
+	if err := v.SetTokenFormat(TokenCompactHash); err != nil {
+		t.Fatalf("SetTokenFormat: %v", err)
+	}
+	if _, err := v.Redact("NIK 3573012203950001"); err != nil {
+		t.Fatalf("Redact: %v", err)
+	}
+	a, err := v.SealDirtySealedEntriesJSON("aad:x")
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	b, err := v.SealDirtySealedEntriesJSON("aad:x")
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	var m1, m2 map[string]string
+	if err := json.Unmarshal([]byte(a), &m1); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if err := json.Unmarshal([]byte(b), &m2); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if !reflect.DeepEqual(keys(m1), keys(m2)) {
+		t.Fatalf("token set changed between seals: %v vs %v", keys(m1), keys(m2))
+	}
+}
+
+func keys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

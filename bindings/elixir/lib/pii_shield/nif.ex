@@ -13,10 +13,18 @@ defmodule PiiShield.Nif do
     vault_with_custom_toml: 3,
     vault_set_token_format: 2,
     vault_set_stateless_mode: 2,
+    vault_is_stateless_mode: 1,
     vault_redact: 2,
     vault_redact_json: 2,
     vault_rehydrate: 2,
     vault_rehydrate_for_tool: 3,
+    vault_export_sealed_entries_json: 2,
+    vault_drain_dirty_sealed_entries_json: 2,
+    vault_seal_dirty_sealed_entries_json: 2,
+    vault_clear_dirty_tokens: 2,
+    vault_import_sealed_entries_json: 3,
+    vault_export_sealed_state: 2,
+    vault_import_sealed_state: 3,
     stream_new: 0,
     stream_push_chunk: 3,
     stream_flush: 2
@@ -27,8 +35,19 @@ defmodule PiiShield.Nif do
   def load_nif do
     priv_dir =
       case :code.priv_dir(:pii_shield) do
-        # during mix compile the app path may not be on the code path yet
-        {:error, _} -> Path.join([File.cwd!(), "_build", "dev", "lib", "pii_shield", "priv"])
+        # Fallback used before the app is on the code path (tests/scripts):
+        # prefer the Mix app path when Mix is loaded, else a dev _build path.
+        {:error, _} ->
+          if Code.ensure_loaded?(Mix.Project) and function_exported?(Mix.Project, :app_path, 0) do
+            try do
+              Path.join(Mix.Project.app_path(), "priv")
+            rescue
+              _ -> Path.join([File.cwd!(), "_build", "dev", "lib", "pii_shield", "priv"])
+            end
+          else
+            Path.join([File.cwd!(), "_build", "dev", "lib", "pii_shield", "priv"])
+          end
+
         dir -> dir
       end
 
@@ -76,6 +95,9 @@ defmodule PiiShield.Nif do
   @spec vault_set_stateless_mode(reference(), integer()) :: :ok
   def vault_set_stateless_mode(_vault, _enabled), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec vault_is_stateless_mode(reference()) :: boolean()
+  def vault_is_stateless_mode(_vault), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec vault_redact(reference(), binary()) :: {:ok, String.t()} | {:error, atom()}
   def vault_redact(_vault, _text), do: :erlang.nif_error(:nif_not_loaded)
 
@@ -88,6 +110,31 @@ defmodule PiiShield.Nif do
   @spec vault_rehydrate_for_tool(reference(), binary(), atom()) ::
           {:ok, String.t()} | {:error, {:exfiltration_blocked, {:token, String.t()}}} | {:error, atom()}
   def vault_rehydrate_for_tool(_vault, _payload, _trust), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec vault_export_sealed_entries_json(reference(), binary()) ::
+          {:ok, String.t()} | {:error, atom()}
+  def vault_export_sealed_entries_json(_vault, _aad), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec vault_drain_dirty_sealed_entries_json(reference(), binary()) ::
+          {:ok, String.t()} | {:error, atom()}
+  def vault_drain_dirty_sealed_entries_json(_vault, _aad), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec vault_seal_dirty_sealed_entries_json(reference(), binary()) ::
+          {:ok, String.t()} | {:error, atom()}
+  def vault_seal_dirty_sealed_entries_json(_vault, _aad), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec vault_clear_dirty_tokens(reference(), binary()) :: boolean()
+  def vault_clear_dirty_tokens(_vault, _tokens_json), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec vault_import_sealed_entries_json(reference(), binary(), binary()) :: boolean()
+  def vault_import_sealed_entries_json(_vault, _json_map, _aad),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec vault_export_sealed_state(reference(), binary()) :: {:ok, String.t()} | {:error, atom()}
+  def vault_export_sealed_state(_vault, _aad), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec vault_import_sealed_state(reference(), binary(), binary()) :: boolean()
+  def vault_import_sealed_state(_vault, _sealed, _aad), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec stream_new() :: {:ok, reference()} | {:error, atom()}
   def stream_new, do: :erlang.nif_error(:nif_not_loaded)
