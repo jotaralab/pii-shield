@@ -47,6 +47,21 @@ jobs:
           cd bindings/go
           go vet ./...
           go test -race -v ./...
+      - name: Run Ruby SDK Tests
+        run: |
+          gem install ffi --no-document
+          cd bindings/ruby
+          ruby -Ilib:test test/test_pii_shield.rb
+      - name: Run Elixir SDK Tests
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+      - name: Elixir SDK mix compile & test
+        run: |
+          cd bindings/elixir
+          mix compile
+          mix test
 
   security-audit:
     name: Security & License Audit
