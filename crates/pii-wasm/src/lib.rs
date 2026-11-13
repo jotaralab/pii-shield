@@ -1,5 +1,25 @@
 use pii_core::{PiiCatalog, PiiSessionVault, SecurityPolicy, StreamingRehydrator, ToolTrustLevel};
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
+
+/// Parses a comma-separated locale CSV, rejecting empty segments the same way
+/// `pii-ffi`'s `locale_names_from_csv` does.
+fn locale_names_from_csv(locales: &str) -> Result<Vec<&str>, JsError> {
+    let segs = locales.split(',').map(|s| s.trim()).collect::<Vec<&str>>();
+    if segs.iter().any(|s| s.is_empty()) {
+        return Err(JsError::new(&format!(
+            "Invalid locales '{}': empty segments are not allowed (use 'global,id')",
+            locales
+        )));
+    }
+    Ok(segs)
+}
+
+fn catalog_from_locales(locales: &str) -> Result<PiiCatalog, JsError> {
+    let loc_vec = locale_names_from_csv(locales)?;
+    PiiCatalog::with_locales(&loc_vec)
+        .map_err(|e| JsError::new(&format!("Invalid locales '{}': {}", locales, e)))
+}
 
 #[wasm_bindgen]
 pub struct WasmPiiSession {
@@ -21,51 +41,56 @@ impl WasmPiiSession {
         }
     }
 
-    #[wasm_bindgen]
-    pub fn with_locales(locales: &str) -> Result<WasmPiiSession, JsValue> {
-        // Fail closed: empty locale lists and unknown locale names are
-        // rejected instead of silently producing a 0-rule (fail-open) vault
-        // or substituting the default catalog.
-        let loc_vec: Vec<&str> = locales
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if loc_vec.is_empty() {
-            return Err(JsValue::from_str(
-                "No valid locales specified: expected comma-separated names like 'global,id'",
-            ));
-        }
-        let catalog = PiiCatalog::with_locales(&loc_vec)
-            .map_err(|e| JsValue::from_str(&format!("Invalid locales '{}': {}", locales, e)))?;
-        Ok(Self {
-            inner: PiiSessionVault::from_catalog(catalog),
-        })
+    #[wasm_bindgen(js_name = withLocales)]
+    pub fn with_locales(locales: &str) -> Result<WasmPiiSession, JsError> {
+        let catalog = catalog_from_locales(locales)?;
+        // Fail closed: an empty (0-rule) catalog is rejected.
+        PiiSessionVault::try_from_catalog(catalog)
+            .map_err(|e| JsError::new(&format!("Failed to compile PII catalog: {}", e)))
+            .map(|inner| Self { inner })
     }
 
     #[wasm_bindgen(js_name = withLocalesAndKey)]
-    pub fn with_locales_and_key(locales: &str, key: &[u8]) -> Result<WasmPiiSession, JsValue> {
+    pub fn with_locales_and_key(locales: &str, key: &[u8]) -> Result<WasmPiiSession, JsError> {
         if key.len() != 32 {
-            return Err(JsValue::from_str("Session key must be exactly 32 bytes"));
+            return Err(JsError::new("Session key must be exactly 32 bytes"));
         }
-        let mut key_arr = [0u8; 32];
+        let mut key_arr = Zeroizing::new([0u8; 32]);
         key_arr.copy_from_slice(key);
 
-        let loc_vec: Vec<&str> = locales
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if loc_vec.is_empty() {
-            return Err(JsValue::from_str(
-                "No valid locales specified: expected comma-separated names like 'global,id'",
-            ));
+        let catalog = catalog_from_locales(locales)?;
+        PiiSessionVault::try_from_catalog_with_key(catalog, *key_arr)
+            .map_err(|e| JsError::new(&format!("Failed to compile PII catalog: {}", e)))
+            .map(|inner| Self { inner })
+    }
+
+    /// Builds a vault from custom TOML rules, optionally with a 32-byte key.
+    #[wasm_bindgen(js_name = withCustomToml)]
+    pub fn with_custom_toml(toml: &str, key: Option<Vec<u8>>) -> Result<WasmPiiSession, JsError> {
+        let mut catalog = PiiCatalog::new();
+        catalog
+            .merge_toml_str(toml)
+            .map_err(|e| JsError::new(&format!("Invalid TOML rules: {}", e)))?;
+        match key {
+            Some(key) => {
+                if key.len() != 32 {
+                    return Err(JsError::new("Session key must be exactly 32 bytes"));
+                }
+                // Zeroize the heap buffer once the key bytes are copied out.
+                let key = Zeroizing::new(key);
+                let key_arr = Zeroizing::new({
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&key);
+                    k
+                });
+                PiiSessionVault::try_from_catalog_with_key(catalog, *key_arr)
+                    .map_err(|e| JsError::new(&format!("Failed to compile PII catalog: {}", e)))
+                    .map(|inner| Self { inner })
+            }
+            None => PiiSessionVault::try_from_catalog(catalog)
+                .map_err(|e| JsError::new(&format!("Failed to compile PII catalog: {}", e)))
+                .map(|inner| Self { inner }),
         }
-        let catalog = PiiCatalog::with_locales(&loc_vec)
-            .map_err(|e| JsValue::from_str(&format!("Invalid locales '{}': {}", locales, e)))?;
-        Ok(Self {
-            inner: PiiSessionVault::from_catalog_with_key(catalog, key_arr),
-        })
     }
 
     #[wasm_bindgen(js_name = setStatelessMode)]
@@ -79,13 +104,20 @@ impl WasmPiiSession {
     }
 
     #[wasm_bindgen(js_name = setTokenFormat)]
-    pub fn set_token_format(&mut self, format_id: u8) {
+    pub fn set_token_format(&mut self, format_id: u8) -> Result<(), JsError> {
         let format = match format_id {
+            0 => pii_core::TokenFormat::Sequential,
             1 => pii_core::TokenFormat::CompactHash,
             2 => pii_core::TokenFormat::StatelessSealed,
-            _ => pii_core::TokenFormat::Sequential,
+            other => {
+                return Err(JsError::new(&format!(
+                    "Invalid token format id {}: expected 0 (sequential), 1 (compact-hash), or 2 (stateless-sealed)",
+                    other
+                )))
+            }
         };
         self.inner.set_token_format(format);
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = exportSealedEntriesJson)]
@@ -106,18 +138,18 @@ impl WasmPiiSession {
     }
 
     #[wasm_bindgen(js_name = clearDirtyTokens)]
-    pub fn clear_dirty_tokens(&mut self, tokens_json: &str) -> Result<(), JsValue> {
+    pub fn clear_dirty_tokens(&mut self, tokens_json: &str) -> Result<(), JsError> {
         let tokens: Vec<String> = serde_json::from_str(tokens_json)
-            .map_err(|e| JsValue::from_str(&format!("Invalid token list: {}", e)))?;
+            .map_err(|e| JsError::new(&format!("Invalid token list: {}", e)))?;
         self.inner.clear_dirty_tokens(&tokens);
         Ok(())
     }
 
     #[wasm_bindgen(js_name = importSealedEntriesJson)]
-    pub fn import_sealed_entries_json(&mut self, json_map: &str, aad: &str) -> Result<(), JsValue> {
+    pub fn import_sealed_entries_json(&mut self, json_map: &str, aad: &str) -> Result<(), JsError> {
         self.inner
             .import_sealed_entries_json(json_map, aad)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     #[wasm_bindgen(js_name = exportSealedState)]
@@ -126,10 +158,10 @@ impl WasmPiiSession {
     }
 
     #[wasm_bindgen(js_name = importSealedState)]
-    pub fn import_sealed_state(&mut self, sealed: &str, aad: &str) -> Result<(), JsValue> {
+    pub fn import_sealed_state(&mut self, sealed: &str, aad: &str) -> Result<(), JsError> {
         self.inner
             .import_sealed_state(sealed, aad)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     #[wasm_bindgen]
@@ -148,7 +180,7 @@ impl WasmPiiSession {
     }
 
     #[wasm_bindgen(js_name = rehydrateForTool)]
-    pub fn rehydrate_for_tool(&self, payload: &str, is_trusted: bool) -> Result<String, JsValue> {
+    pub fn rehydrate_for_tool(&self, payload: &str, is_trusted: bool) -> Result<String, JsError> {
         let trust_level = if is_trusted {
             ToolTrustLevel::InternalTrusted
         } else {
@@ -158,9 +190,9 @@ impl WasmPiiSession {
             .rehydrate_for_tool(payload, trust_level)
             .map_err(|e| match e {
                 pii_core::SecurityError::ExfiltrationBlocked { token } => {
-                    JsValue::from_str(&format!("PII Exfiltration Blocked: {}", token))
+                    JsError::new(&format!("PII Exfiltration Blocked: {}", token))
                 }
-                other => JsValue::from_str(&other.to_string()),
+                other => JsError::new(&other.to_string()),
             })
     }
 }

@@ -902,3 +902,110 @@ fn test_valkey_unreachable_at_startup_exits_2() {
         stderr
     );
 }
+
+/// Regression: blocked batch elements must produce their error responses on
+/// the host (proxy stdout), not on the child's stdin. Allowed elements are
+/// still forwarded to the child (mixed batches are split across channels).
+#[test]
+fn test_batch_blocked_errors_reach_host_not_child() {
+    let proxy_bin = env!("CARGO_BIN_EXE_pii-mcp-proxy");
+    let mock_bin = env!("CARGO_BIN_EXE_mock_mcp_server");
+
+    let mut proxy_proc = Command::new(proxy_bin)
+        .arg("--locales")
+        .arg("global,id")
+        .arg("--trusted-tools")
+        .arg("query_customer")
+        .arg("--")
+        .arg(mock_bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("Spawn proxy");
+
+    let mut stdin = proxy_proc.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(proxy_proc.stdout.take().expect("stdout"));
+    let mut buf = String::new();
+
+    // Seed a token by triggering outbound redaction.
+    let _ = writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"init_data"}}"#
+    );
+    stdin.flush().unwrap();
+    reader.read_line(&mut buf).unwrap();
+    assert!(buf.contains("<ID_NIK_1>"), "seed response: {}", buf);
+
+    // Mixed batch: one blocked (untrusted exfil), one allowed (trusted tool).
+    buf.clear();
+    let _ = writeln!(
+        stdin,
+        r#"[{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"untrusted_search","arguments":{{"q":"<ID_NIK_1>"}}}}}},{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"query_customer","arguments":{{"nik":"<ID_NIK_1>"}}}}}}]"#
+    );
+    stdin.flush().unwrap();
+
+    // First line from the host must be the per-element error array (id 2),
+    // NOT a forward of the whole batch to the child.
+    reader.read_line(&mut buf).unwrap();
+    assert!(
+        buf.contains("-32001"),
+        "blocked batch error must reach the host, got: {}",
+        buf
+    );
+    assert!(
+        !buf.contains("\"result\"") || buf.contains("-32001"),
+        "host must not receive the child's forwarded response in the error line: {}",
+        buf
+    );
+
+    // The allowed element is still forwarded to the child, which responds.
+    buf.clear();
+    reader.read_line(&mut buf).unwrap();
+    assert!(
+        buf.contains("\"id\":3") && buf.contains("<ID_NIK_1>"),
+        "allowed batch element must still be processed by the child, got: {}",
+        buf
+    );
+
+    drop(stdin);
+    let status = proxy_proc.wait().unwrap();
+    assert!(status.success());
+}
+
+/// Regression: if the child MCP server exits while the host keeps its stdin
+/// open, the proxy must still terminate (no deadlock on the blocked stdin
+/// read in thread 1).
+#[test]
+fn test_child_exit_does_not_deadlock_while_host_stdin_open() {
+    let proxy_bin = env!("CARGO_BIN_EXE_pii-mcp-proxy");
+
+    let mut proxy_proc = Command::new(proxy_bin)
+        .arg("--locales")
+        .arg("global,id")
+        .arg("--")
+        .arg("/bin/true") // exits immediately
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Spawn proxy");
+
+    // Deliberately keep the host's stdin open: thread 1 blocks on read(0).
+    let _stdin = proxy_proc.stdin.take().expect("stdin");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _watcher = std::thread::spawn(move || {
+        let status = proxy_proc.wait().expect("wait proxy");
+        let _ = tx.send(status);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(status) => {
+            assert!(
+                status.success() || status.code().is_some(),
+                "proxy exited cleanly after child death"
+            );
+        }
+        Err(_) => panic!("proxy deadlocked after child exit while host stdin stayed open"),
+    }
+}

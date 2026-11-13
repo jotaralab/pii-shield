@@ -216,14 +216,14 @@ impl PiiSessionVault {
     }
 
     /// Derives HKDF-style subkeys from session_key: K_mac and K_enc.
-    fn derive_subkeys(&self) -> ([u8; 32], [u8; 32]) {
+    fn derive_subkeys(&self) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
         let mut mac = HmacSha256::new_from_slice(&*self.session_key).expect("Key valid");
         mac.update(b"pii-shield-mac");
-        let k_mac = mac.finalize().into_bytes().into();
+        let k_mac = Zeroizing::new(mac.finalize().into_bytes().into());
 
         let mut enc = HmacSha256::new_from_slice(&*self.session_key).expect("Key valid");
         enc.update(b"pii-shield-enc");
-        let k_enc = enc.finalize().into_bytes().into();
+        let k_enc = Zeroizing::new(enc.finalize().into_bytes().into());
 
         (k_mac, k_enc)
     }
@@ -246,7 +246,7 @@ impl PiiSessionVault {
         let trimmed = raw_pii.trim().as_bytes();
 
         // 1. Compute 16-byte Synthetic IV (SIV) = HMAC(K_mac, prefix || 0x00 || plaintext)[0..16]
-        let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
         mac.update(tag_prefix.as_bytes());
         mac.update(&[0u8]);
         mac.update(trimmed);
@@ -258,7 +258,7 @@ impl PiiSessionVault {
         let mut ciphertext = Vec::with_capacity(trimmed.len());
         let mut block_idx = 0u32;
         while ciphertext.len() < trimmed.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&k_enc).expect("HMAC key valid");
+            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
             ctr_mac.update(&siv);
             ctr_mac.update(&block_idx.to_be_bytes());
             let ks_block = ctr_mac.finalize().into_bytes();
@@ -308,7 +308,7 @@ impl PiiSessionVault {
         let mut plaintext = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
         let mut block_idx = 0u32;
         while plaintext.len() < ciphertext.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&k_enc).expect("HMAC key valid");
+            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
             ctr_mac.update(siv);
             ctr_mac.update(&block_idx.to_be_bytes());
             let ks_block = ctr_mac.finalize().into_bytes();
@@ -324,7 +324,7 @@ impl PiiSessionVault {
         }
 
         // Verify Synthetic IV (SIV)
-        let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
         mac.update(tag_prefix.as_bytes());
         mac.update(&[0u8]);
         mac.update(&plaintext);
@@ -623,10 +623,12 @@ impl PiiSessionVault {
             });
         }
 
-        // Layer 2: Known session PII in reverse_map
+        // Layer 2: Known session PII in reverse_map (ASCII case-folded to
+        // match compute_hmac's case-insensitive matching).
+        let payload_folded = payload.to_ascii_lowercase();
         for (token, (_, raw_val)) in &self.reverse_map {
             let val = raw_val.as_str();
-            if val.len() >= 4 && payload.contains(val) {
+            if val.len() >= 4 && payload_folded.contains(&val.to_ascii_lowercase()) {
                 return Err(SecurityError::ExfiltrationBlocked {
                     token: token.clone(),
                 });
@@ -672,14 +674,14 @@ impl PiiSessionVault {
         }
     }
 
-    fn derive_state_subkeys(&self) -> ([u8; 32], [u8; 32]) {
+    fn derive_state_subkeys(&self) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
         let mut mac = HmacSha256::new_from_slice(&*self.session_key).expect("Key valid");
         mac.update(b"pii-shield-state-mac-v1");
-        let k_mac = mac.finalize().into_bytes().into();
+        let k_mac = Zeroizing::new(mac.finalize().into_bytes().into());
 
         let mut enc = HmacSha256::new_from_slice(&*self.session_key).expect("Key valid");
         enc.update(b"pii-shield-state-enc-v1");
-        let k_enc = enc.finalize().into_bytes().into();
+        let k_enc = Zeroizing::new(enc.finalize().into_bytes().into());
 
         (k_mac, k_enc)
     }
@@ -703,7 +705,7 @@ impl PiiSessionVault {
         plaintext.extend_from_slice(trimmed.as_bytes());
 
         // SIV = HMAC(K_state_mac, "PIIE1" || nonce || aad_len || aad || token_len || token || plaintext)[0..16]
-        let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
         mac.update(b"PIIE1");
         mac.update(&nonce);
         mac.update(&(aad.len() as u64).to_be_bytes());
@@ -718,7 +720,7 @@ impl PiiSessionVault {
         let mut ciphertext = Vec::with_capacity(plaintext.len());
         let mut block_idx = 0u32;
         while ciphertext.len() < plaintext.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&k_enc).expect("HMAC key valid");
+            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
             ctr_mac.update(&siv);
             ctr_mac.update(&nonce);
             ctr_mac.update(&block_idx.to_be_bytes());
@@ -766,7 +768,7 @@ impl PiiSessionVault {
         let mut plaintext = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
         let mut block_idx = 0u32;
         while plaintext.len() < ciphertext.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&k_enc).expect("HMAC key valid");
+            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
             ctr_mac.update(siv);
             ctr_mac.update(nonce);
             ctr_mac.update(&block_idx.to_be_bytes());
@@ -782,7 +784,7 @@ impl PiiSessionVault {
             block_idx += 1;
         }
 
-        let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
         mac.update(b"PIIE1");
         mac.update(nonce);
         mac.update(&(aad.len() as u64).to_be_bytes());
@@ -1011,7 +1013,7 @@ impl PiiSessionVault {
         let plaintext =
             Zeroizing::new(serde_json::to_vec(&snapshot).expect("Snapshot serializable"));
 
-        let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
         mac.update(b"PIIS1");
         mac.update(&nonce);
         mac.update(&(aad.len() as u64).to_be_bytes());
@@ -1024,7 +1026,7 @@ impl PiiSessionVault {
         let mut ciphertext = Vec::with_capacity(plaintext.len());
         let mut block_idx = 0u32;
         while ciphertext.len() < plaintext.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&k_enc).expect("HMAC key valid");
+            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
             ctr_mac.update(&siv);
             ctr_mac.update(&nonce);
             ctr_mac.update(&block_idx.to_be_bytes());
@@ -1068,7 +1070,7 @@ impl PiiSessionVault {
         let mut plaintext = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
         let mut block_idx = 0u32;
         while plaintext.len() < ciphertext.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&k_enc).expect("HMAC key valid");
+            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
             ctr_mac.update(siv);
             ctr_mac.update(nonce);
             ctr_mac.update(&block_idx.to_be_bytes());
@@ -1084,7 +1086,7 @@ impl PiiSessionVault {
             block_idx += 1;
         }
 
-        let mut mac = HmacSha256::new_from_slice(&k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
         mac.update(b"PIIS1");
         mac.update(nonce);
         mac.update(&(aad.len() as u64).to_be_bytes());
@@ -1384,6 +1386,21 @@ mod tests {
         assert!(vault
             .rehydrate_for_tool(sku, ToolTrustLevel::ExternalUntrusted)
             .is_ok());
+    }
+
+    #[test]
+    fn test_layer2_exfiltration_case_insensitive() {
+        let mut vault = us_vault();
+        let doc = r#"{"email":"Alice@Example.com"}"#;
+        let out = vault.redact_json(doc);
+        assert!(!out.contains("Alice@Example.com"));
+
+        // Mixed-case payload leaking the same PII must be blocked (Layer 2).
+        let payload = r#"{"to":"alice@example.com"}"#;
+        assert!(matches!(
+            vault.rehydrate_for_tool(payload, ToolTrustLevel::ExternalUntrusted),
+            Err(SecurityError::ExfiltrationBlocked { .. })
+        ));
     }
 
     #[test]

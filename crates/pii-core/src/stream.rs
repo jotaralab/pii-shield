@@ -45,7 +45,7 @@ impl StreamingRehydrator {
                 let is_valid_char =
                     ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_' || ch == ':';
 
-                if !is_valid_char || self.buffer.len() > 160 {
+                if !is_valid_char || self.buffer.len() > self.non_pii_buffer_cap() {
                     // Not a valid token character, immediately flush buffer + ch
                     output.push_str(&self.buffer);
                     output.push(ch);
@@ -60,6 +60,20 @@ impl StreamingRehydrator {
         }
 
         output
+    }
+
+    /// Tight cap for non-`<PII:` `<...>` sequences (HTML tags, prose like `< 5`).
+    const NON_PII_BUFFER_CAP: usize = 160;
+    /// Higher cap for sealed `<PII:...>` tokens, whose hex payload can exceed
+    /// 160 bytes for long PII values.
+    const SEALED_PII_BUFFER_CAP: usize = 2048;
+
+    fn non_pii_buffer_cap(&self) -> usize {
+        if self.buffer.starts_with("<PII:") {
+            Self::SEALED_PII_BUFFER_CAP
+        } else {
+            Self::NON_PII_BUFFER_CAP
+        }
     }
 
     pub fn flush(&mut self, vault: &PiiSessionVault) -> String {
@@ -110,6 +124,26 @@ mod tests {
         // Math: x < 5
         let c2 = stream.push_chunk("x < 5", &vault);
         assert_eq!(c2, "x < 5");
+    }
+
+    #[test]
+    fn test_streaming_stateless_sealed_long_token_split() {
+        let mut vault = PiiSessionVault::new(SecurityPolicy::IndonesiaUuPdpStrict);
+        vault.set_stateless_mode(true);
+        // >100-byte email so the sealed token far exceeds the 160-byte cap.
+        let email = format!("{}@jotaralab.example.com", "a".repeat(120));
+        let doc = format!("Dikirim ke {email} sekarang.");
+        let redacted = vault.redact(&doc);
+        assert!(redacted.contains("<PII:"));
+
+        let mut stream = StreamingRehydrator::new();
+        // Split the redacted document into ~8-byte pieces across chunks.
+        let mut got = String::new();
+        for chunk in redacted.chars().collect::<Vec<_>>().chunks(8) {
+            got.push_str(&stream.push_chunk(&chunk.iter().collect::<String>(), &vault));
+        }
+        got.push_str(&stream.flush(&vault));
+        assert_eq!(got, doc);
     }
 
     #[test]

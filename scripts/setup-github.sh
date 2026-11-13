@@ -26,7 +26,7 @@ else
     --homepage "https://jotaralab.com" \
     --source=. \
     --remote=origin \
-    --push || true
+    --push
 fi
 
 echo "🏷️ Adding repository topics..."
@@ -37,6 +37,6 @@ gh repo edit "${ORG}/${REPO}" \
   --add-topic "mcp" \
   --add-topic "rust" \
   --add-topic "webassembly" \
-  --add-topic "uu-pdp" || true
+  --add-topic "uu-pdp"
 
 echo "✅ Repository setup complete: https://github.com/${ORG}/${REPO}"

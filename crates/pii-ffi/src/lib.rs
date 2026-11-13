@@ -114,7 +114,7 @@ pub unsafe extern "C" fn pii_vault_new_with_key(
         if key.is_null() || key_len != 32 {
             return ptr::null_mut();
         }
-        let mut key_bytes = [0u8; 32];
+        let mut key_bytes = Zeroizing::new([0u8; 32]);
         ptr::copy_nonoverlapping(key, key_bytes.as_mut_ptr(), 32);
 
         // Strict policy validation: unknown ids fail closed.
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn pii_vault_new_with_key(
             1 => SecurityPolicy::StandardGlobal,
             _ => return ptr::null_mut(),
         };
-        let vault = PiiSessionVault::with_key(policy, key_bytes);
+        let vault = PiiSessionVault::with_key(policy, *key_bytes);
         Box::into_raw(Box::new(PiiVaultHandle(RwLock::new(vault))))
     }))
     .unwrap_or(ptr::null_mut())
@@ -139,7 +139,7 @@ pub unsafe extern "C" fn pii_vault_new_with_locales_and_key(
         if key.is_null() || key_len != 32 {
             return ptr::null_mut();
         }
-        let mut key_bytes = [0u8; 32];
+        let mut key_bytes = Zeroizing::new([0u8; 32]);
         ptr::copy_nonoverlapping(key, key_bytes.as_mut_ptr(), 32);
 
         let loc_vec = match locale_names_from_csv(locales) {
@@ -150,7 +150,7 @@ pub unsafe extern "C" fn pii_vault_new_with_locales_and_key(
             Ok(c) => c,
             Err(_) => return ptr::null_mut(),
         };
-        vault_from_catalog_fail_closed(catalog, Some(key_bytes))
+        vault_from_catalog_fail_closed(catalog, Some(*key_bytes))
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -220,9 +220,9 @@ pub unsafe extern "C" fn pii_vault_with_custom_toml(
             }
             Some(generated)
         } else if !key_ptr.is_null() && key_len == 32 {
-            let mut key_bytes = [0u8; 32];
+            let mut key_bytes = Zeroizing::new([0u8; 32]);
             ptr::copy_nonoverlapping(key_ptr, key_bytes.as_mut_ptr(), 32);
-            Some(key_bytes)
+            Some(*key_bytes)
         } else {
             return ptr::null_mut();
         };

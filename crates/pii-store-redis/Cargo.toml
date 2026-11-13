@@ -12,4 +12,4 @@ test-support = []
 
 [dependencies]
 pii-core = { path = "../pii-core" }
-redis = { version = "0.27", default-features = false, features = ["acl"] }
+redis = { version = "0.27", default-features = false, features = ["acl", "tls-rustls"] }
