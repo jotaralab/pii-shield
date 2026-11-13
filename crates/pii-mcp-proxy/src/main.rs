@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::env;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -44,6 +45,12 @@ pub enum InboundAction {
     BlockParseError,
     /// Blocked notification (no `id`): dropped without a response.
     Drop,
+    /// Blocked batch: per-element error responses go to the host (stdout)
+    /// while any allowed elements are still forwarded to the child.
+    BatchSplit {
+        to_child: Option<String>,
+        to_host: String,
+    },
 }
 
 /// Maximum inbound/outbound line size enforced by the proxy (16 MiB).
@@ -190,7 +197,8 @@ fn process_inbound_value(
             // the other elements. Blocked notifications (no `id`) are dropped
             // entirely.
             let mut any_blocked = false;
-            let mut results: Vec<Value> = Vec::with_capacity(arr.len());
+            let mut to_child: Vec<Value> = Vec::with_capacity(arr.len());
+            let mut to_host: Vec<Value> = Vec::with_capacity(arr.len());
             for elem in arr {
                 match elem {
                     Value::Object(map) => {
@@ -201,24 +209,35 @@ fn process_inbound_value(
                             Some(InboundAction::BlockWithError(err)) => {
                                 any_blocked = true;
                                 match serde_json::from_str::<Value>(&err) {
-                                    Ok(err_val) => results.push(err_val),
-                                    Err(_) => results.push(elem.take()),
+                                    Ok(err_val) => to_host.push(err_val),
+                                    Err(_) => to_host.push(elem.take()),
                                 }
                             }
                             Some(InboundAction::BlockParseError) => {
                                 any_blocked = true;
-                                results.push(parse_error_response(&Value::Null));
+                                to_host.push(parse_error_response(&Value::Null));
                             }
-                            _ => results.push(elem.take()),
+                            _ => to_child.push(elem.take()),
                         }
                     }
-                    other => results.push(other.take()),
+                    other => to_child.push(other.take()),
                 }
             }
             if any_blocked {
-                return InboundAction::Forward(serde_json::to_string(&results).unwrap_or_else(
-                    |_| "[]".to_string(),
-                ));
+                // Error responses must go to the host (stdout), not the child;
+                // allowed elements still reach the child so a mixed batch is
+                // split across both channels.
+                let to_host =
+                    serde_json::to_string(&to_host).unwrap_or_else(|_| "[]".to_string());
+                let to_child = if to_child.is_empty() {
+                    None
+                } else {
+                    Some(
+                        serde_json::to_string(&to_child)
+                            .unwrap_or_else(|_| "[]".to_string()),
+                    )
+                };
+                return InboundAction::BatchSplit { to_child, to_host };
             }
         }
         _ => {}
@@ -343,6 +362,22 @@ fn value_is_tools_call(val: &Value) -> bool {
     }
 }
 
+/// Returns true when the payload (single or batch element) is a request for
+/// any inbound-scanned method (`SCANNED_METHODS`), i.e. one whose `params` are
+/// scanned and may carry vault tokens.
+fn value_has_scanned_method(val: &Value) -> bool {
+    let is_scanned = |v: &Value| {
+        v.get("method")
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| SCANNED_METHODS.contains(&m))
+    };
+    match val {
+        Value::Object(_) => is_scanned(val),
+        Value::Array(arr) => arr.iter().any(is_scanned),
+        _ => false,
+    }
+}
+
 /// Returns true when the JSON-RPC payload (single or batch) is a `tools/call`.
 pub fn payload_is_tools_call(line: &str) -> bool {
     serde_json::from_str::<Value>(line.trim())
@@ -382,7 +417,7 @@ pub fn storage_sync_error_response(line: &str, detail: &str) -> String {
         Value::Array(arr) => {
             let errors: Vec<Value> = arr
                 .iter()
-                .filter(|v| value_is_tools_call(v))
+                .filter(|v| value_has_scanned_method(v))
                 .map(|v| sync_error_value(v.get("id").cloned().unwrap_or(Value::Null)))
                 .collect();
             if errors.is_empty() {
@@ -450,7 +485,7 @@ fn fetch_entries_for_value(
     store: &dyn PiiVaultStore<Error = String>,
     session_id: &str,
 ) -> Result<Option<Vec<(String, String)>>, String> {
-    if !value_is_tools_call(val) {
+    if !value_has_scanned_method(val) {
         return Ok(None);
     }
     store.get_entries(session_id).map(Some)
@@ -1267,6 +1302,14 @@ fn main() {
                     let _ = out.flush();
                 }
                 InboundAction::Drop => {}
+                InboundAction::BatchSplit { to_child, to_host } => {
+                    let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(fw) = to_child {
+                        let _ = writeln!(out, "{}", fw);
+                    }
+                    let _ = writeln!(out, "{}", to_host);
+                    let _ = out.flush();
+                }
             }
         }
         return;
@@ -1305,6 +1348,8 @@ fn main() {
     let stdout_t1 = Arc::clone(&stdout_arc);
     let store_t1 = store.clone();
     let session_id_t1 = session_id.clone();
+
+    let (t1_done_tx, t1_done_rx) = mpsc::channel::<()>();
 
     let t1 = thread::spawn(move || {
         let stdin = io::stdin();
@@ -1403,9 +1448,22 @@ fn main() {
                     let _ = out.flush();
                 }
                 InboundAction::Drop => {}
+                InboundAction::BatchSplit { to_child, to_host } => {
+                    if let Some(fw) = to_child {
+                        if writeln!(child_writer, "{}", fw).is_err()
+                            || child_writer.flush().is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let mut out = stdout_t1.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = writeln!(out, "{}", to_host);
+                    let _ = out.flush();
+                }
             }
         }
         // child_writer drops here, signaling EOF to child MCP server
+        let _ = t1_done_tx.send(());
     });
 
     // Thread 2: Child stdout -> Host stdout (with redaction + store flush).
@@ -1473,11 +1531,28 @@ fn main() {
         }
     });
 
-    // Reap the child, then join BOTH I/O threads before exiting so neither is
+    // Reap the child, then join the I/O threads before exiting so neither is
     // killed mid-write by `std::process::exit`. t2 stops on child EOF; t1's
     // writes then fail on the closed child stdin pipe and it exits too.
     let _ = t2.join();
     let child_status = child.wait();
+    // t1 blocks on host stdin, so it may never observe the child's death if
+    // the host keeps its stdin open. Joining unconditionally would hang the
+    // proxy forever — wait on the completion signal with a grace period, then
+    // force exit (the child is already reaped and t2 already flushed).
+    let child_exit = match &child_status {
+        Ok(status) if !status.success() => Some(status.code().unwrap_or(1)),
+        _ => None,
+    };
+    if t1_done_rx.recv_timeout(Duration::from_millis(500)).is_err() {
+        eprintln!(
+            "pii-mcp-proxy warning: inbound thread still blocked on host stdin after child exit; forcing shutdown"
+        );
+        match child_exit {
+            Some(code) => std::process::exit(code),
+            None => std::process::exit(0),
+        }
+    }
     let _ = t1.join();
     match child_status {
         Ok(status) if !status.success() => {
@@ -1496,7 +1571,7 @@ mod tests {
     fn test_read_line_bounded_oversized_line_fails_without_oom() {
         // 64 KiB cap: a 1 MiB line must error without buffering 1 MiB.
         let mut data: Vec<u8> = Vec::new();
-        data.extend(std::iter::repeat(b'a').take(1024 * 1024));
+        data.extend(std::iter::repeat_n(b'a', 1024 * 1024));
         data.push(b'\n');
         data.extend_from_slice(b"tiny\n");
         let mut reader = io::BufReader::new(&data[..]);
@@ -1586,14 +1661,20 @@ mod tests {
             {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"web_search","arguments":{"q":"<ID_NIK_1>"}}}
         ]"#;
         let action = process_inbound_line(batch, &mut vault, &acl);
-        let InboundAction::Forward(out) = action else {
-            panic!("mixed batch must forward a per-element result array");
+        let InboundAction::BatchSplit { to_child, to_host } = action else {
+            panic!("mixed batch must split per-element results");
         };
-        let val: Value = serde_json::from_str(&out).expect("valid JSON array");
-        let arr = val.as_array().expect("array response");
-        assert_eq!(arr.len(), 2);
-        assert!(arr[0].get("result").is_some() || arr[0].get("method").is_some());
-        assert_eq!(arr[1]["error"]["code"], -32001);
+        // The blocked element's error goes to the host…
+        let host_val: Value = serde_json::from_str(&to_host).expect("valid JSON array");
+        let host_arr = host_val.as_array().expect("array response");
+        assert_eq!(host_arr.len(), 1);
+        assert_eq!(host_arr[0]["error"]["code"], -32001);
+        // …and the allowed element is still forwarded to the child.
+        let child_out = to_child.expect("allowed element forwarded to child");
+        let child_val: Value = serde_json::from_str(&child_out).expect("valid JSON array");
+        let child_arr = child_val.as_array().expect("array response");
+        assert_eq!(child_arr.len(), 1);
+        assert!(child_arr[0].get("result").is_some() || child_arr[0].get("method").is_some());
     }
 
     #[test]
@@ -1606,13 +1687,20 @@ mod tests {
             {"jsonrpc":"2.0","method":"tools/call","params":{"name":"web_search","arguments":{"q":"<ID_NIK_1>"}}},
             {"jsonrpc":"2.0","id":5,"method":"ping"}
         ]"#;
-        let InboundAction::Forward(out) = process_inbound_line(batch, &mut vault, &acl) else {
+        let InboundAction::BatchSplit { to_child, to_host } =
+            process_inbound_line(batch, &mut vault, &acl)
+        else {
             panic!("batch with blocked notification must still return remaining elements");
         };
-        let val: Value = serde_json::from_str(&out).expect("valid JSON array");
+        // The ping is not blocked, so it is forwarded to the child; the host
+        // gets no error responses because the only blocked element was a
+        // notification (no `id`).
+        let child_out = to_child.expect("ping forwarded to child");
+        let child_val: Value = serde_json::from_str(&child_out).expect("valid JSON array");
+        assert_eq!(child_val.as_array().expect("array").len(), 1);
+        let val: Value = serde_json::from_str(&to_host).expect("valid JSON array");
         let arr = val.as_array().expect("array response");
-        assert_eq!(arr.len(), 1, "blocked notification dropped, ping kept");
-        assert_eq!(arr[0]["id"], Value::from(5));
+        assert!(arr.is_empty(), "blocked notification produces no host response");
     }
 
     #[test]
@@ -1733,14 +1821,31 @@ mod tests {
         let batch = r#"[
             {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"a"}},
             {"jsonrpc":"2.0","id":8,"method":"notifications/progress"},
-            {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"b"}}
+            {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"b"}},
+            {"jsonrpc":"2.0","id":10,"method":"resources/read","params":{"uri":"file:///x"}},
+            {"jsonrpc":"2.0","id":11,"method":"prompts/get","params":{"name":"p"}},
+            {"jsonrpc":"2.0","id":12,"method":"sampling/createMessage","params":{}},
+            {"jsonrpc":"2.0","id":13,"method":"ping"}
         ]"#;
         let response = storage_sync_error_response(batch, "offline");
         let val: Value = serde_json::from_str(&response).expect("valid JSON");
         let arr = val.as_array().expect("batch response array");
-        assert_eq!(arr.len(), 2, "one error per tools/call element");
+        assert_eq!(
+            arr.len(),
+            5,
+            "one error per scanned-method element, none for notifications/ping"
+        );
         let ids: Vec<&Value> = arr.iter().map(|v| &v["id"]).collect();
-        assert_eq!(ids, vec![&Value::from(7), &Value::from(9)]);
+        assert_eq!(
+            ids,
+            vec![
+                &Value::from(7),
+                &Value::from(9),
+                &Value::from(10),
+                &Value::from(11),
+                &Value::from(12)
+            ]
+        );
         assert!(arr.iter().all(|v| v["error"]["code"] == -32003));
 
         let single = storage_sync_error_response(

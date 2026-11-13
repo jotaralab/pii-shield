@@ -189,8 +189,11 @@ def main():
     lib.pii_vault_seal_dirty_sealed_entries_json.restype = VOID_P
     lib.pii_vault_clear_dirty_tokens.argtypes = [VOID_P, ctypes.c_char_p]
     lib.pii_vault_clear_dirty_tokens.restype = ctypes.c_bool
-    lib.pii_vault_redact(
-        v1, b"Contact bob@jotaralab.com about NIK 3573012203950001"
+    read_string(
+        lib,
+        lib.pii_vault_redact(
+            v1, b"Contact bob@jotaralab.com about NIK 3573012203950001"
+        ),
     )
     aad2 = b"session:python_turn_2"
     sealed_json = read_string(lib, lib.pii_vault_seal_dirty_sealed_entries_json(v1, aad2))

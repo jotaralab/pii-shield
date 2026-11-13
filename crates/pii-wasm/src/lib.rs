@@ -76,6 +76,8 @@ impl WasmPiiSession {
                 if key.len() != 32 {
                     return Err(JsError::new("Session key must be exactly 32 bytes"));
                 }
+                // Zeroize the heap buffer once the key bytes are copied out.
+                let key = Zeroizing::new(key);
                 let key_arr = Zeroizing::new({
                     let mut k = [0u8; 32];
                     k.copy_from_slice(&key);

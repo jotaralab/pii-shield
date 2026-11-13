@@ -166,8 +166,8 @@ int main(void) {
     char *state_blob = pii_vault_export_sealed_state(svault_a, aad2);
     assert(state_blob != NULL && strstr(state_blob, "PIIS1:") != NULL);
     // Wrong key must fail closed.
-    const unsigned char other_key[32];
-    memset((void *)other_key, 9, sizeof(other_key));
+    unsigned char other_key[32];
+    memset(other_key, 9, sizeof(other_key));
     struct PiiVaultHandle *svault_c = pii_vault_with_custom_toml("global", CUSTOM_TOML, other_key, sizeof(other_key));
     assert(svault_c != NULL);
     assert(!pii_vault_import_sealed_state(svault_c, state_blob, aad2));
