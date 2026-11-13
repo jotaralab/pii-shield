@@ -52,11 +52,17 @@ impl From<RedisError> for RedisStoreError {
 /// Default connect/read/write timeout for a single command round-trip.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Persistent Valkey/Redis connection implementing [`PiiVaultStore`].
+/// Maximum number of idle connections kept in the internal pool. Inbound
+/// (`t1`) and outbound (`t2`) traffic threads each grab their own socket, so
+/// they no longer serialize on a single connection.
+const MAX_IDLE_CONNECTIONS: usize = 8;
+
+/// Persistent Valkey/Redis connection pool implementing [`PiiVaultStore`].
 ///
-/// The socket is cached behind a `Mutex<Option<Connection>>` and transparently
-/// re-established when the server closes it, so the proxy never opens a new
-/// TCP/TLS connection per MCP message.
+/// Idle connections are cached in a bounded pool (`MAX_IDLE_CONNECTIONS`) and
+/// transparently re-established when the server closes them, so the proxy
+/// never opens a new TCP/TLS connection per MCP message while concurrent
+/// threads do not serialize on a single socket.
 pub struct RedisVaultStore {
     client: redis::Client,
     key_prefix: String,
@@ -64,7 +70,7 @@ pub struct RedisVaultStore {
     /// delete the session hash immediately.
     ttl_secs: i64,
     timeout: Duration,
-    conn: Mutex<Option<Connection>>,
+    pool: Mutex<Vec<Connection>>,
 }
 
 impl RedisVaultStore {
@@ -105,7 +111,7 @@ impl RedisVaultStore {
             key_prefix,
             ttl_secs,
             timeout,
-            conn: Mutex::new(None),
+            pool: Mutex::new(Vec::new()),
         })
     }
 
@@ -129,6 +135,24 @@ impl RedisVaultStore {
                 "session id must be non-empty".to_string(),
             ));
         }
+        // Session ids are interpolated into Redis keys ({prefix}:{session_id}),
+        // so characters that collide with the namespace separator or carry
+        // control bytes are rejected to prevent key-namespace collisions.
+        if session_id.len() > 256 {
+            return Err(RedisStoreError::Configuration(
+                "session id must be at most 256 bytes".to_string(),
+            ));
+        }
+        let invalid = session_id.contains(':')
+            || session_id
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control());
+        if invalid {
+            return Err(RedisStoreError::Configuration(
+                "session id must not contain ':', whitespace, or control characters"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -141,50 +165,56 @@ impl RedisVaultStore {
         Ok(conn)
     }
 
-    /// Runs `op` against the cached connection.
+    /// Runs `op` against a pooled connection.
     ///
-    /// A stale pooled socket (dropped by the server during idle/failover) is
-    /// retried exactly once on a fresh connection. Any failed command evicts
-    /// the connection so a half-written `MULTI` transaction or an unconsumed
-    /// RESP frame can never leak into the next session's request.
+    /// A connection is acquired from the pool (or freshly established), used
+    /// for exactly one command round-trip, and returned to the pool only on
+    /// success. A stale pooled socket (dropped by the server during idle/
+    /// failover) is retried exactly once on a fresh connection. Any failed
+    /// command evicts the connection so a half-written `MULTI` transaction or
+    /// an unconsumed RESP frame can never leak into the next session's
+    /// request.
     fn with_connection<T>(
         &self,
         op: impl Fn(&mut Connection) -> Result<T, RedisError>,
     ) -> Result<T, RedisStoreError> {
-        let mut guard = self
-            .conn
-            .lock()
-            .map_err(|_| RedisStoreError::Configuration("connection mutex poisoned".into()))?;
-
-        let was_cached = guard.is_some();
-        if !was_cached {
-            *guard = Some(self.connect()?);
-        }
-
-        let first = {
-            let conn = guard.as_mut().expect("connection initialized above");
-            op(conn)
+        // Acquire: pop an idle connection or connect a fresh one.
+        let (mut conn, was_cached) = {
+            let mut pool = self
+                .pool
+                .lock()
+                .map_err(|_| RedisStoreError::Configuration("connection mutex poisoned".into()))?;
+            match pool.pop() {
+                Some(c) => (c, true),
+                None => (self.connect()?, false),
+            }
         };
-        match first {
+
+        let first = op(&mut conn);
+        let result = match first {
             Ok(v) => Ok(v),
             Err(err) if was_cached && is_reconnectable(&err) => {
                 // Drop the stale pooled socket and retry once on a fresh one.
-                *guard = None;
-                let mut conn = self.connect()?;
-                match op(&mut conn) {
-                    Ok(v) => {
-                        *guard = Some(conn);
-                        Ok(v)
-                    }
-                    Err(retry_err) => Err(RedisStoreError::Redis(retry_err)),
+                let mut fresh = self.connect()?;
+                let retried = op(&mut fresh).map_err(RedisStoreError::Redis);
+                // Keep the fresh socket only if it is healthy.
+                if retried.is_ok() {
+                    conn = fresh;
+                }
+                retried
+            }
+            Err(err) => Err(RedisStoreError::Redis(err)),
+        };
+
+        // Return the connection to the pool only when it is healthy.
+        if result.is_ok() {
+            if let Ok(mut pool) = self.pool.lock() {
+                if pool.len() < MAX_IDLE_CONNECTIONS {
+                    pool.push(conn);
                 }
             }
-            Err(err) => {
-                // Never cache a connection that just failed.
-                *guard = None;
-                Err(RedisStoreError::Redis(err))
-            }
         }
+        result
     }
 }
 
@@ -301,6 +331,24 @@ mod tests {
         assert!(store
             .put_entries(" ", vec![("a".into(), "b".into())])
             .is_err());
+    }
+
+    #[test]
+    fn test_rejects_malicious_session_id() {
+        let server = MockValkey::start();
+        let store = store(&server);
+        // Namespace separator would collide with other keys.
+        assert!(store.get_entries("sess:1").is_err());
+        // Control characters / newlines.
+        assert!(store.get_entries("sess\n1").is_err());
+        assert!(store.get_entries("sess\t1").is_err());
+        // Whitespace inside the id.
+        assert!(store.get_entries("sess 1").is_err());
+        // Oversized ids are rejected.
+        let long_id = "a".repeat(257);
+        assert!(store.get_entries(&long_id).is_err());
+        // Sanity: a normal id still passes.
+        assert!(store.get_entries("sess-1").is_ok());
     }
 
     #[test]

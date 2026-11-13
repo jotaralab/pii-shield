@@ -9,6 +9,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 mod store;
 use store::ProxyStore;
@@ -35,9 +36,117 @@ impl ToolAcl {
     }
 }
 
+#[derive(Debug)]
 pub enum InboundAction {
     Forward(String),
     BlockWithError(String),
+    /// Malformed JSON inbound: fail closed with a JSON-RPC parse error.
+    BlockParseError,
+    /// Blocked notification (no `id`): dropped without a response.
+    Drop,
+}
+
+/// Maximum inbound/outbound line size enforced by the proxy (16 MiB).
+pub const DEFAULT_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Reads one newline-terminated line from `reader` without ever allocating
+/// more than `max_bytes` bytes (OOM-DoS guard for hostile stdin/stdout).
+///
+/// Returns `Ok(None)` at EOF with no pending bytes. If the line exceeds
+/// `max_bytes`, the remainder (through the next newline) is consumed and
+/// discarded — never buffered — and an error is returned so callers can fail
+/// closed.
+pub fn read_line_bounded<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(a) => a,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            // EOF: flush any final unterminated line.
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            let s = String::from_utf8_lossy(&buf);
+            return Ok(Some(s.into_owned()));
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        match newline {
+            Some(idx) => {
+                let take = idx + 1;
+                if buf.len() + take > max_bytes {
+                    reader.consume(take);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "line exceeds --max-line-bytes ({} bytes)",
+                            max_bytes
+                        ),
+                    ));
+                }
+                buf.extend_from_slice(&available[..take]);
+                reader.consume(take);
+                // Strip the trailing '\n' (and a preceding '\r') like `lines()`.
+                let mut len = buf.len();
+                if buf.last() == Some(&b'\n') {
+                    len -= 1;
+                    if len > 0 && buf[len - 1] == b'\r' {
+                        len -= 1;
+                    }
+                }
+                buf.truncate(len);
+                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            None => {
+                let take = available.len();
+                if buf.len() + take > max_bytes {
+                    // Oversized: drain through the next newline without
+                    // storing a single byte, then fail closed.
+                    reader.consume(take);
+                    let _ = discard_through_newline(reader)?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "line exceeds --max-line-bytes ({} bytes)",
+                            max_bytes
+                        ),
+                    ));
+                }
+                buf.extend_from_slice(available);
+                reader.consume(take);
+            }
+        }
+    }
+}
+
+/// Consumes bytes up to and including the next newline, buffering nothing.
+/// Returns false at EOF without a trailing newline.
+fn discard_through_newline<R: BufRead>(reader: &mut R) -> io::Result<bool> {
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(a) => a,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            return Ok(false);
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                reader.consume(idx + 1);
+                return Ok(true);
+            }
+            None => {
+                let len = available.len();
+                reader.consume(len);
+            }
+        }
+    }
 }
 
 /// Processes an inbound JSON-RPC request (Host stdin -> Child stdin),
@@ -54,8 +163,9 @@ pub fn process_inbound_line(
 
     match serde_json::from_str::<Value>(trimmed) {
         Ok(val) => process_inbound_value(val, line, vault, acl),
-        // If not valid JSON, forward as-is
-        Err(_) => InboundAction::Forward(line.to_string()),
+        // Malformed JSON must never bypass exfiltration scanning: fail closed
+        // with a JSON-RPC parse error instead of forwarding verbatim.
+        Err(_) => InboundAction::BlockParseError,
     }
 }
 
@@ -69,18 +179,46 @@ fn process_inbound_value(
     match &mut val {
         Value::Object(map) => {
             if let Some(action) = process_single_inbound_request(map, vault, acl) {
-                return action;
+                return match action {
+                    InboundAction::Drop => InboundAction::Drop,
+                    other => other,
+                };
             }
         }
         Value::Array(arr) => {
+            // Per-element results: a blocked batch element must not discard
+            // the other elements. Blocked notifications (no `id`) are dropped
+            // entirely.
+            let mut any_blocked = false;
+            let mut results: Vec<Value> = Vec::with_capacity(arr.len());
             for elem in arr {
-                if let Value::Object(map) = elem {
-                    if let Some(InboundAction::BlockWithError(err)) =
-                        process_single_inbound_request(map, vault, acl)
-                    {
-                        return InboundAction::BlockWithError(err);
+                match elem {
+                    Value::Object(map) => {
+                        match process_single_inbound_request(map, vault, acl) {
+                            Some(InboundAction::Drop) => {
+                                any_blocked = true;
+                            }
+                            Some(InboundAction::BlockWithError(err)) => {
+                                any_blocked = true;
+                                match serde_json::from_str::<Value>(&err) {
+                                    Ok(err_val) => results.push(err_val),
+                                    Err(_) => results.push(elem.take()),
+                                }
+                            }
+                            Some(InboundAction::BlockParseError) => {
+                                any_blocked = true;
+                                results.push(parse_error_response(&Value::Null));
+                            }
+                            _ => results.push(elem.take()),
+                        }
                     }
+                    other => results.push(other.take()),
                 }
+            }
+            if any_blocked {
+                return InboundAction::Forward(serde_json::to_string(&results).unwrap_or_else(
+                    |_| "[]".to_string(),
+                ));
             }
         }
         _ => {}
@@ -90,71 +228,105 @@ fn process_inbound_value(
     InboundAction::Forward(out_str)
 }
 
+/// JSON-RPC parse error response (-32700) emitted when an inbound line is not
+/// valid JSON — malformed payloads must fail closed.
+fn parse_error_response(id: &Value) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32700,
+            "message": "Parse error"
+        }
+    })
+}
+
+/// MCP request methods whose `params` may carry PII / vault tokens and are
+/// therefore scanned inbound (exfiltration check + rehydration).
+const SCANNED_METHODS: [&str; 4] = [
+    "tools/call",
+    "resources/read",
+    "prompts/get",
+    "sampling/createMessage",
+];
+
 fn process_single_inbound_request(
     map: &mut serde_json::Map<String, Value>,
     vault: &mut PiiSessionVault,
     acl: &ToolAcl,
 ) -> Option<InboundAction> {
-    if map.get("method").and_then(|v| v.as_str()) == Some("tools/call") {
-        let tool_name = map
-            .get("params")
-            .and_then(|p| p.get("name"))
-            .and_then(|n| n.as_str())
-            .unwrap_or("");
+    let method = map.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if !SCANNED_METHODS.contains(&method) {
+        return None;
+    }
+    let tool_name = map
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or(method);
 
-        let trust_level = acl.get_trust_level(tool_name);
-        let id_val = map.get("id").cloned().unwrap_or(Value::Null);
+    let trust_level = acl.get_trust_level(tool_name);
+    let id_val = map.get("id").cloned().unwrap_or(Value::Null);
+    let has_id = map.get("id").is_some();
 
-        if let Some(params) = map.get_mut("params") {
-            // Structured error response helper keeps the per-field loop below
-            // readable while preserving the original JSON-RPC id.
-            let blocked = |err: &SecurityError| -> String {
-                match err {
-                    SecurityError::ExfiltrationBlocked { token } => serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id_val,
-                        "error": {
-                            "code": -32001,
-                            "message": "PII exfiltration blocked for untrusted tool",
-                            "data": { "token": token }
-                        }
-                    })
-                    .to_string(),
-                    other => serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id_val,
-                        "error": {
-                            "code": -32002,
-                            "message": other.to_string(),
-                        }
-                    })
-                    .to_string(),
-                }
-            };
+    if let Some(params) = map.get_mut("params") {
+        // Structured error response helper keeps the per-field loop below
+        // readable while preserving the original JSON-RPC id.
+        let blocked = |err: &SecurityError| -> String {
+            match err {
+                SecurityError::ExfiltrationBlocked { token } => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id_val,
+                    "error": {
+                        "code": -32001,
+                        "message": "PII exfiltration blocked for untrusted tool",
+                        "data": { "token": token }
+                    }
+                })
+                .to_string(),
+                other => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id_val,
+                    "error": {
+                        "code": -32002,
+                        "message": other.to_string(),
+                    }
+                })
+                .to_string(),
+            }
+        };
+        // Blocked notifications (no `id`) must not receive a JSON-RPC error
+        // response: the request is silently dropped instead.
+        let respond_blocked = |err: &SecurityError| -> InboundAction {
+            if has_id {
+                InboundAction::BlockWithError(blocked(err))
+            } else {
+                InboundAction::Drop
+            }
+        };
 
-            // Rehydrate/check every field of `params`, not just `arguments`.
-            // `_meta`, sibling fields, and non-object params could otherwise
-            // smuggle raw PII or tokens past trust checks. `name` is the tool
-            // identifier, so it never carries PII.
-            match params {
-                Value::Object(obj) => {
-                    for (key, value) in obj.iter_mut() {
-                        // Trusted tools keep their tool identifier untouched;
-                        // untrusted calls still scan `name` for exfiltration.
-                        if key == "name" && trust_level == ToolTrustLevel::InternalTrusted {
-                            continue;
-                        }
-                        if let Err(err) =
-                            vault.rehydrate_json_value_with_key(value, trust_level, Some(key))
-                        {
-                            return Some(InboundAction::BlockWithError(blocked(&err)));
-                        }
+        // Rehydrate/check every field of `params`, not just `arguments`.
+        // `_meta`, sibling fields, and non-object params could otherwise
+        // smuggle raw PII or tokens past trust checks. `name` is the tool
+        // identifier, so it never carries PII.
+        match params {
+            Value::Object(obj) => {
+                for (key, value) in obj.iter_mut() {
+                    // Trusted tools keep their tool identifier untouched;
+                    // untrusted calls still scan `name` for exfiltration.
+                    if key == "name" && trust_level == ToolTrustLevel::InternalTrusted {
+                        continue;
+                    }
+                    if let Err(err) =
+                        vault.rehydrate_json_value_with_key(value, trust_level, Some(key))
+                    {
+                        return Some(respond_blocked(&err));
                     }
                 }
-                other => {
-                    if let Err(err) = vault.rehydrate_json_value(other, trust_level) {
-                        return Some(InboundAction::BlockWithError(blocked(&err)));
-                    }
+            }
+            other => {
+                if let Err(err) = vault.rehydrate_json_value(other, trust_level) {
+                    return Some(respond_blocked(&err));
                 }
             }
         }
@@ -178,14 +350,13 @@ pub fn payload_is_tools_call(line: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn sync_error_value(id: Value, detail: &str) -> Value {
+fn sync_error_value(id: Value) -> Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {
             "code": -32003,
-            "message": "PII vault store synchronization failed",
-            "data": { "detail": detail }
+            "message": "PII vault store synchronization failed"
         }
     })
 }
@@ -193,27 +364,34 @@ fn sync_error_value(id: Value, detail: &str) -> Value {
 /// Fail-closed JSON-RPC error returned when the distributed store cannot be
 /// synchronized before an inbound tool call. Batch requests get one error per
 /// `tools/call` element so the client can correlate responses by id.
+///
+/// Raw store error strings are logged to stderr only — they must never leak
+/// internal topology or credentials into the JSON-RPC channel.
 pub fn storage_sync_error_response(line: &str, detail: &str) -> String {
+    eprintln!(
+        "pii-mcp-proxy error: vault store synchronization failed: {}",
+        detail
+    );
     let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
-        return sync_error_value(Value::Null, detail).to_string();
+        return sync_error_value(Value::Null).to_string();
     };
     match val {
         Value::Object(map) => {
-            sync_error_value(map.get("id").cloned().unwrap_or(Value::Null), detail).to_string()
+            sync_error_value(map.get("id").cloned().unwrap_or(Value::Null)).to_string()
         }
         Value::Array(arr) => {
             let errors: Vec<Value> = arr
                 .iter()
                 .filter(|v| value_is_tools_call(v))
-                .map(|v| sync_error_value(v.get("id").cloned().unwrap_or(Value::Null), detail))
+                .map(|v| sync_error_value(v.get("id").cloned().unwrap_or(Value::Null)))
                 .collect();
             if errors.is_empty() {
-                sync_error_value(Value::Null, detail).to_string()
+                sync_error_value(Value::Null).to_string()
             } else {
                 Value::Array(errors).to_string()
             }
         }
-        _ => sync_error_value(Value::Null, detail).to_string(),
+        _ => sync_error_value(Value::Null).to_string(),
     }
 }
 
@@ -417,6 +595,12 @@ pub struct ProxyConfig {
     pub session_id: Option<String>,
     /// TTL applied to the session hash on every write.
     pub session_ttl: u64,
+    /// Maximum bytes per inbound/outbound line (OOM-DoS guard).
+    pub max_line_bytes: usize,
+    /// Distributed store hash key prefix.
+    pub store_key_prefix: String,
+    /// Distributed store connect/read/write timeout.
+    pub store_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -459,13 +643,41 @@ pub fn parse_cli_and_env(
     let mut valkey_url: Option<String> = None;
     let mut session_id: Option<String> = None;
     let mut session_ttl: Option<u64> = None;
+    let mut max_line_bytes: Option<usize> = None;
+    let mut store_key_prefix: Option<String> = None;
+    let mut store_timeout_ms: Option<u64> = None;
     let mut child_cmd_start: Option<usize> = None;
+
+    /// Flags that consume a value. A value starting with `-` is only treated
+    /// as a missing flag value when it matches one of these known flags (or
+    /// the `--` separator); otherwise a legit `-`-prefixed value is accepted.
+    const KNOWN_VALUE_FLAGS: [&str; 11] = [
+        "--trusted-tools",
+        "--locales",
+        "--rules-file",
+        "--token-format",
+        "--valkey-url",
+        "--redis-url",
+        "--session-id",
+        "--session-ttl",
+        "--max-line-bytes",
+        "--store-key-prefix",
+        "--store-timeout",
+    ];
 
     fn next_value(args: &[String], i: usize) -> Result<&str, String> {
         match args.get(i + 1).map(|s| s.as_str()) {
-            // A value that looks like another flag means the argument was
-            // omitted; never swallow it.
-            Some(val) if !val.starts_with('-') => Ok(val),
+            // A value that looks like another known flag (or the child-command
+            // separator) means the argument was omitted; never swallow it.
+            // Any other `-`-prefixed token is accepted as a real value.
+            Some(val)
+                if !val.starts_with('-')
+                    || !KNOWN_VALUE_FLAGS.contains(&val)
+                        && val != "--"
+                        && !val.starts_with("--") =>
+            {
+                Ok(val)
+            }
             _ => Err(format!("Missing value for flag '{}'", args[i])),
         }
     }
@@ -561,6 +773,36 @@ pub fn parse_cli_and_env(
                 session_ttl = Some(ttl);
                 i += 1;
             }
+            "--max-line-bytes" => {
+                let raw = next_value(args, i)?;
+                let n: usize = raw.trim().parse().map_err(|_| {
+                    format!("Invalid --max-line-bytes '{}': expected bytes", raw)
+                })?;
+                if n == 0 {
+                    return Err("--max-line-bytes must be greater than zero".to_string());
+                }
+                max_line_bytes = Some(n);
+                i += 1;
+            }
+            "--store-key-prefix" => {
+                let raw = next_value(args, i)?;
+                if raw.trim().is_empty() {
+                    return Err("--store-key-prefix must not be empty".to_string());
+                }
+                store_key_prefix = Some(raw.trim().to_string());
+                i += 1;
+            }
+            "--store-timeout" => {
+                let raw = next_value(args, i)?;
+                let ms: u64 = raw.trim().parse().map_err(|_| {
+                    format!("Invalid --store-timeout '{}': expected milliseconds", raw)
+                })?;
+                if ms == 0 {
+                    return Err("--store-timeout must be greater than zero".to_string());
+                }
+                store_timeout_ms = Some(ms);
+                i += 1;
+            }
             "--help" | "-h" => return Ok(ProxyAction::Help),
             "--version" | "-V" => return Ok(ProxyAction::Version),
             "--" => {
@@ -637,8 +879,48 @@ pub fn parse_cli_and_env(
             session_ttl = Some(ttl);
         }
     }
+    if max_line_bytes.is_none() {
+        if let Some(raw) = env_vars.get("PII_SHIELD_MAX_LINE_BYTES") {
+            let n: usize = raw.trim().parse().map_err(|_| {
+                format!(
+                    "Invalid PII_SHIELD_MAX_LINE_BYTES '{}': expected bytes",
+                    raw
+                )
+            })?;
+            if n == 0 {
+                return Err("PII_SHIELD_MAX_LINE_BYTES must be greater than zero".to_string());
+            }
+            max_line_bytes = Some(n);
+        }
+    }
+    if store_key_prefix.is_none() {
+        if let Some(raw) = env_vars.get("PII_SHIELD_STORE_KEY_PREFIX") {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return Err("PII_SHIELD_STORE_KEY_PREFIX is set but empty".to_string());
+            }
+            store_key_prefix = Some(raw.to_string());
+        }
+    }
+    if store_timeout_ms.is_none() {
+        if let Some(raw) = env_vars.get("PII_SHIELD_STORE_TIMEOUT") {
+            let ms: u64 = raw.trim().parse().map_err(|_| {
+                format!(
+                    "Invalid PII_SHIELD_STORE_TIMEOUT '{}': expected milliseconds",
+                    raw
+                )
+            })?;
+            if ms == 0 {
+                return Err("PII_SHIELD_STORE_TIMEOUT must be greater than zero".to_string());
+            }
+            store_timeout_ms = Some(ms);
+        }
+    }
     let session_ttl_configured = session_ttl.is_some();
     let session_ttl = session_ttl.unwrap_or(3600);
+    let max_line_bytes = max_line_bytes.unwrap_or(DEFAULT_MAX_LINE_BYTES);
+    let store_key_prefix = store_key_prefix.unwrap_or_else(|| ProxyStore::default_key_prefix().to_string());
+    let store_timeout = Duration::from_millis(store_timeout_ms.unwrap_or(ProxyStore::default_timeout_millis()));
 
     // Env / CLI token format resolution
     if token_format.is_none() {
@@ -784,6 +1066,9 @@ pub fn parse_cli_and_env(
         valkey_url,
         session_id,
         session_ttl,
+        max_line_bytes,
+        store_key_prefix,
+        store_timeout,
     }))
 }
 
@@ -839,6 +1124,9 @@ OPTIONS:
                                distributed session persistence across pods
     --session-id <id>          Shared session id used as the store hash key
     --session-ttl <secs>       TTL applied to the session hash [default: 3600]
+    --max-line-bytes <bytes>   Maximum inbound/outbound line size [default: 16777216]
+    --store-key-prefix <pfx>   Redis/Valkey hash key prefix [default: pii:v1]
+    --store-timeout <ms>       Redis/Valkey connect/read/write timeout [default: 500]
     -h, --help                 Show this help
     -V, --version              Show version
 
@@ -849,6 +1137,9 @@ ENVIRONMENT:
     PII_SHIELD_VALKEY_URL      Alias for --valkey-url (PII_SHIELD_REDIS_URL accepted)
     PII_SHIELD_SESSION_ID      Alias for --session-id
     PII_SHIELD_SESSION_TTL     Alias for --session-ttl
+    PII_SHIELD_MAX_LINE_BYTES  Alias for --max-line-bytes
+    PII_SHIELD_STORE_KEY_PREFIX Alias for --store-key-prefix
+    PII_SHIELD_STORE_TIMEOUT   Alias for --store-timeout
 
 Fail-closed: unknown flags, invalid rules, unknown locales, or an empty catalog
 exits with status code 2. Running without a child command enters STDIO filter
@@ -901,7 +1192,12 @@ fn main() {
     // Distributed store: startup hydration is mandatory (fail closed).
     let store: Option<Arc<ProxyStore>> = match config.valkey_url.as_deref() {
         Some(url) => {
-            let s = match ProxyStore::redis(url, config.session_ttl) {
+            let s = match ProxyStore::redis(
+                url,
+                config.session_ttl,
+                &config.store_key_prefix,
+                config.store_timeout,
+            ) {
                 Ok(s) => s,
                 Err(msg) => {
                     eprintln!("pii-mcp-proxy error: {}", msg);
@@ -928,9 +1224,23 @@ fn main() {
     if config.stdio_filter || config.child_cmd.is_none() {
         let stdin = io::stdin();
         let stdout = Arc::new(Mutex::new(io::stdout()));
+        let mut reader = stdin.lock();
+        let max_line_bytes = config.max_line_bytes;
 
-        for line in stdin.lock().lines() {
-            let Ok(payload) = line else { break };
+        loop {
+            let payload = match read_line_bounded(&mut reader, max_line_bytes) {
+                Ok(Some(p)) => p,
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("pii-mcp-proxy error: {}", e);
+                    // Fail closed: emit a JSON-RPC error and skip the
+                    // oversized line (the remainder was already drained).
+                    let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = writeln!(out, "{}", parse_error_response(&Value::Null));
+                    let _ = out.flush();
+                    continue;
+                }
+            };
             let action = process_inbound_line_synced(
                 &payload,
                 &mut vault,
@@ -942,15 +1252,21 @@ fn main() {
             );
             match action {
                 InboundAction::Forward(fw) => {
-                    let mut out = stdout.lock().unwrap();
+                    let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = writeln!(out, "{}", fw);
                     let _ = out.flush();
                 }
                 InboundAction::BlockWithError(err) => {
-                    let mut out = stdout.lock().unwrap();
+                    let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = writeln!(out, "{}", err);
                     let _ = out.flush();
                 }
+                InboundAction::BlockParseError => {
+                    let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = writeln!(out, "{}", parse_error_response(&Value::Null));
+                    let _ = out.flush();
+                }
+                InboundAction::Drop => {}
             }
         }
         return;
@@ -980,6 +1296,7 @@ fn main() {
 
     let vault_arc = Arc::new(Mutex::new(vault));
     let stdout_arc = Arc::new(Mutex::new(io::stdout()));
+    let max_line_bytes = config.max_line_bytes;
 
     // Thread 1: Host stdin -> Child stdin (with exfiltration check).
     // Remote store reads happen *before* taking the vault lock so a slow
@@ -992,9 +1309,22 @@ fn main() {
     let t1 = thread::spawn(move || {
         let stdin = io::stdin();
         let mut child_writer = io::BufWriter::new(child_stdin);
+        let mut host_reader = stdin.lock();
 
-        for line in stdin.lock().lines() {
-            let Ok(payload) = line else { break };
+        loop {
+            let payload = match read_line_bounded(&mut host_reader, max_line_bytes) {
+                Ok(Some(p)) => p,
+                Ok(None) => break,
+                Err(e) => {
+                    // Oversized inbound line: fail closed with a JSON-RPC
+                    // error instead of buffering it (OOM-DoS guard).
+                    eprintln!("pii-mcp-proxy error: {}", e);
+                    let mut out = stdout_t1.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = writeln!(out, "{}", parse_error_response(&Value::Null));
+                    let _ = out.flush();
+                    continue;
+                }
+            };
 
             // Parse the inbound line once and reuse it for store detection,
             // fail-closed responses, and request processing.
@@ -1013,7 +1343,7 @@ fn main() {
             ) {
                 if is_tools_call {
                     let err_resp = storage_sync_error_response(&payload, &e);
-                    let mut out = stdout_t1.lock().unwrap();
+                    let mut out = stdout_t1.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = writeln!(out, "{}", err_resp);
                     let _ = out.flush();
                     continue;
@@ -1030,7 +1360,7 @@ fn main() {
                         Ok(entries) => entries,
                         Err(e) => {
                             let err_resp = storage_sync_error_response(&payload, &e);
-                            let mut out = stdout_t1.lock().unwrap();
+                            let mut out = stdout_t1.lock().unwrap_or_else(|e| e.into_inner());
                             let _ = writeln!(out, "{}", err_resp);
                             let _ = out.flush();
                             continue;
@@ -1042,7 +1372,7 @@ fn main() {
 
             let action = match parsed {
                 Some(val) => {
-                    let mut v = vault_t1.lock().unwrap();
+                    let mut v = vault_t1.lock().unwrap_or_else(|e| e.into_inner());
                     process_inbound_value_prefetched(
                         val,
                         &payload,
@@ -1052,9 +1382,8 @@ fn main() {
                         session_id_t1.as_deref().unwrap_or(""),
                     )
                 }
-                // Empty/invalid JSON is forwarded verbatim, as in
-                // `process_inbound_line`.
-                None => InboundAction::Forward(payload.clone()),
+                // Malformed JSON must never bypass exfiltration scanning.
+                None => InboundAction::BlockParseError,
             };
 
             match action {
@@ -1064,10 +1393,16 @@ fn main() {
                     }
                 }
                 InboundAction::BlockWithError(err_resp) => {
-                    let mut out = stdout_t1.lock().unwrap();
+                    let mut out = stdout_t1.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = writeln!(out, "{}", err_resp);
                     let _ = out.flush();
                 }
+                InboundAction::BlockParseError => {
+                    let mut out = stdout_t1.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = writeln!(out, "{}", parse_error_response(&Value::Null));
+                    let _ = out.flush();
+                }
+                InboundAction::Drop => {}
             }
         }
         // child_writer drops here, signaling EOF to child MCP server
@@ -1081,14 +1416,24 @@ fn main() {
     let stdout_t2 = Arc::clone(&stdout_arc);
     let store_t2 = store;
     let session_id_t2 = session_id;
+    let max_line_bytes_t2 = max_line_bytes;
 
     let t2 = thread::spawn(move || {
-        let reader = BufReader::new(child_stdout);
-        for line in reader.lines() {
-            let Ok(payload) = line else { break };
+        let mut reader = BufReader::new(child_stdout);
+        loop {
+            let payload = match read_line_bounded(&mut reader, max_line_bytes_t2) {
+                Ok(Some(p)) => p,
+                Ok(None) => break,
+                Err(e) => {
+                    // Oversized child output: drop the line (fail closed,
+                    // never buffer it) and keep draining the stream.
+                    eprintln!("pii-mcp-proxy error: {}", e);
+                    continue;
+                }
+            };
 
             let redacted = {
-                let mut v = vault_t2.lock().unwrap();
+                let mut v = vault_t2.lock().unwrap_or_else(|e| e.into_inner());
                 process_outbound_line(&payload, &mut v)
             };
 
@@ -1107,7 +1452,7 @@ fn main() {
                 );
             }
 
-            let mut out = stdout_t2.lock().unwrap();
+            let mut out = stdout_t2.lock().unwrap_or_else(|e| e.into_inner());
             let _ = writeln!(out, "{}", redacted);
             let _ = out.flush();
         }
@@ -1128,23 +1473,212 @@ fn main() {
         }
     });
 
-    // Join the child->host reader first (it stops on child EOF), reap the
-    // child, and propagate a non-zero child exit code immediately — this
-    // avoids blocking on t1 if the child died while host stdin is still open.
+    // Reap the child, then join BOTH I/O threads before exiting so neither is
+    // killed mid-write by `std::process::exit`. t2 stops on child EOF; t1's
+    // writes then fail on the closed child stdin pipe and it exits too.
     let _ = t2.join();
-    match child.wait() {
+    let child_status = child.wait();
+    let _ = t1.join();
+    match child_status {
         Ok(status) if !status.success() => {
             std::process::exit(status.code().unwrap_or(1));
         }
         Ok(_) => {}
         Err(_) => {}
     }
-    let _ = t1.join();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_read_line_bounded_oversized_line_fails_without_oom() {
+        // 64 KiB cap: a 1 MiB line must error without buffering 1 MiB.
+        let mut data: Vec<u8> = Vec::new();
+        data.extend(std::iter::repeat(b'a').take(1024 * 1024));
+        data.push(b'\n');
+        data.extend_from_slice(b"tiny\n");
+        let mut reader = io::BufReader::new(&data[..]);
+        let err = read_line_bounded(&mut reader, 64 * 1024).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Stream stays in sync: the next line reads cleanly after the drain.
+        assert_eq!(
+            read_line_bounded(&mut reader, 64 * 1024).unwrap(),
+            Some("tiny".to_string())
+        );
+        assert!(read_line_bounded(&mut reader, 64 * 1024).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_read_line_bounded_split_lines() {
+        let mut data: Vec<u8> = Vec::new();
+        data.extend(b"partial");
+        let mut reader = io::BufReader::new(&data[..]);
+        assert_eq!(
+            read_line_bounded(&mut reader, 1024).unwrap(),
+            Some("partial".to_string())
+        );
+        assert!(read_line_bounded(&mut reader, 1024).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_malformed_json_inbound_fails_closed_32700() {
+        let mut vault = PiiSessionVault::new(pii_core::SecurityPolicy::IndonesiaUuPdpStrict);
+        let acl = ToolAcl::new(Vec::new(), false);
+        match process_inbound_line("not-json{", &mut vault, &acl) {
+            InboundAction::BlockParseError => {}
+            other => panic!("malformed JSON must fail closed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resources_read_exfiltration_blocked() {
+        let mut vault = PiiSessionVault::new(pii_core::SecurityPolicy::IndonesiaUuPdpStrict);
+        let _ = vault.redact("User 3573012203950001");
+        let acl = ToolAcl::new(Vec::new(), false);
+
+        let req = r#"{"jsonrpc":"2.0","id":11,"method":"resources/read","params":{"uri":"file:///x?nik=<ID_NIK_1>"}}"#;
+        match process_inbound_line(req, &mut vault, &acl) {
+            InboundAction::BlockWithError(err) => assert!(err.contains("-32001"), "{}", err),
+            other => panic!("resources/read exfiltration must be blocked: {:?}", other),
+        }
+
+        // prompts/get and sampling/createMessage are covered too.
+        for method in ["prompts/get", "sampling/createMessage"] {
+            let req = format!(
+                r#"{{"jsonrpc":"2.0","id":12,"method":"{}","params":{{"q":"<ID_NIK_1>"}}}}"#,
+                method
+            );
+            assert!(
+                matches!(
+                    process_inbound_line(&req, &mut vault, &acl),
+                    InboundAction::BlockWithError(_)
+                ),
+                "{} exfiltration must be blocked",
+                method
+            );
+        }
+    }
+
+    #[test]
+    fn test_blocked_notification_is_dropped_not_responded() {
+        let mut vault = PiiSessionVault::new(pii_core::SecurityPolicy::IndonesiaUuPdpStrict);
+        let _ = vault.redact("User 3573012203950001");
+        let acl = ToolAcl::new(Vec::new(), false);
+
+        // Notification: no `id` at all.
+        let req = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"web_search","arguments":{"q":"<ID_NIK_1>"}}}"#;
+        match process_inbound_line(req, &mut vault, &acl) {
+            InboundAction::Drop => {}
+            other => panic!("blocked notification must be dropped, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mixed_batch_partial_block_returns_array() {
+        let mut vault = PiiSessionVault::new(pii_core::SecurityPolicy::IndonesiaUuPdpStrict);
+        let _ = vault.redact("User 3573012203950001");
+        let acl = ToolAcl::new(vec!["query_db".to_string()], false);
+
+        let batch = r#"[
+            {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_db","arguments":{"nik":"<ID_NIK_1>"}}},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"web_search","arguments":{"q":"<ID_NIK_1>"}}}
+        ]"#;
+        let action = process_inbound_line(batch, &mut vault, &acl);
+        let InboundAction::Forward(out) = action else {
+            panic!("mixed batch must forward a per-element result array");
+        };
+        let val: Value = serde_json::from_str(&out).expect("valid JSON array");
+        let arr = val.as_array().expect("array response");
+        assert_eq!(arr.len(), 2);
+        assert!(arr[0].get("result").is_some() || arr[0].get("method").is_some());
+        assert_eq!(arr[1]["error"]["code"], -32001);
+    }
+
+    #[test]
+    fn test_batch_blocked_notification_element_is_dropped() {
+        let mut vault = PiiSessionVault::new(pii_core::SecurityPolicy::IndonesiaUuPdpStrict);
+        let _ = vault.redact("User 3573012203950001");
+        let acl = ToolAcl::new(Vec::new(), false);
+
+        let batch = r#"[
+            {"jsonrpc":"2.0","method":"tools/call","params":{"name":"web_search","arguments":{"q":"<ID_NIK_1>"}}},
+            {"jsonrpc":"2.0","id":5,"method":"ping"}
+        ]"#;
+        let InboundAction::Forward(out) = process_inbound_line(batch, &mut vault, &acl) else {
+            panic!("batch with blocked notification must still return remaining elements");
+        };
+        let val: Value = serde_json::from_str(&out).expect("valid JSON array");
+        let arr = val.as_array().expect("array response");
+        assert_eq!(arr.len(), 1, "blocked notification dropped, ping kept");
+        assert_eq!(arr[0]["id"], Value::from(5));
+    }
+
+    #[test]
+    fn test_next_value_accepts_dash_prefixed_non_flag_values() {
+        let env = test_env(&[("PII_SHIELD_SESSION_KEY", "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb")]);
+        let args: Vec<String> = ["pii-mcp-proxy", "--rules-file", "-weird-name.toml", "--token-format", "stateless-sealed"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Should parse the value rather than erroring on the leading '-'.
+        let result = parse_cli_and_env(&args, &env);
+        match result {
+            Ok(ProxyAction::Run(cfg)) => {
+                assert!(cfg.rules_files.contains(&"-weird-name.toml".to_string()));
+            }
+            Ok(_) => panic!("expected Run"),
+            Err(e) => panic!("dash-prefixed value must be accepted: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_max_line_bytes_config() {
+        let env = test_env(&[("PII_SHIELD_SESSION_KEY", "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb")]);
+        let args: Vec<String> = [
+            "pii-mcp-proxy",
+            "--max-line-bytes",
+            "1024",
+            "--stdio-filter",
+            "--token-format",
+            "stateless-sealed",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let action = parse_cli_and_env(&args, &env).expect("valid config");
+        match action {
+            ProxyAction::Run(cfg) => assert_eq!(cfg.max_line_bytes, 1024),
+            _ => panic!("expected Run"),
+        }
+
+        // Env alias.
+        let mut env = test_env(&[("PII_SHIELD_SESSION_KEY", "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb")]);
+        env.insert(
+            "PII_SHIELD_MAX_LINE_BYTES".to_string(),
+            "4096".to_string(),
+        );
+        let args: Vec<String> = ["pii-mcp-proxy", "--stdio-filter", "--token-format", "stateless-sealed"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        match parse_cli_and_env(&args, &env).expect("valid config") {
+            ProxyAction::Run(cfg) => assert_eq!(cfg.max_line_bytes, 4096),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn test_storage_sync_error_response_omits_raw_detail() {
+        let single = storage_sync_error_response(
+            r#"{"jsonrpc":"2.0","id":"req-1","method":"tools/call","params":{"name":"a"}}"#,
+            "connection refused to redis://internal:6379",
+        );
+        let val: Value = serde_json::from_str(&single).expect("valid JSON");
+        assert!(val["error"].get("data").is_none(), "no raw detail leakage");
+        assert_eq!(val["id"], Value::from("req-1"));
+    }
 
     #[test]
     fn test_process_inbound_trusted_vs_untrusted() {
@@ -1160,6 +1694,7 @@ mod tests {
                 assert!(fw.contains("3573012203950001"));
             }
             InboundAction::BlockWithError(_) => panic!("Trusted tool must not be blocked"),
+            _ => panic!("unexpected action"),
         }
 
         // Untrusted tool call blocked with JSON-RPC -32001 error
@@ -1170,6 +1705,7 @@ mod tests {
                 assert!(err.contains("PII exfiltration blocked"));
             }
             InboundAction::Forward(_) => panic!("Untrusted tool call must be blocked"),
+            _ => {}
         }
     }
 
@@ -1188,6 +1724,7 @@ mod tests {
             InboundAction::Forward(fw) => {
                 panic!("token hidden in params.name must be blocked: {}", fw)
             }
+            _ => {}
         }
     }
 
@@ -1446,6 +1983,7 @@ mod tests {
                 assert!(fw.contains("3573012203950001"), "got {}", fw);
             }
             InboundAction::BlockWithError(e) => panic!("trusted tool blocked: {}", e),
+            _ => {}
         }
 
         // An untrusted tool on Pod B must still be blocked after hydration.
@@ -1462,6 +2000,7 @@ mod tests {
         ) {
             InboundAction::BlockWithError(e) => assert!(e.contains("-32001"), "got {}", e),
             InboundAction::Forward(_) => panic!("untrusted tool must be blocked"),
+            _ => {}
         }
     }
 
@@ -1491,6 +2030,7 @@ mod tests {
                 assert!(e.contains(r#""id":7"#));
             }
             InboundAction::Forward(_) => panic!("store failure must fail closed"),
+            _ => {}
         }
 
         // Non-tools/call payloads never touch the store.

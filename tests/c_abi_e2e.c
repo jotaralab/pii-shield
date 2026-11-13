@@ -45,9 +45,24 @@ int main(void) {
 
     // 4. Test tool rehydration: tokens inside the *redacted* input for an
     //    untrusted tool come back redacted; a trusted tool sees plaintext.
-    const char *tool_call = "{\"nik\":\"<ID_NIK_1>\"}";
+    //    Use the actual token emitted by `pii_vault_redact` rather than a
+    //    hardcoded token id.
+    char token[128];
+    {
+        const char *start = strstr(redacted, "<ID_NIK_");
+        assert(start != NULL);
+        const char *end = strchr(start, '>');
+        assert(end != NULL);
+        size_t tlen = (size_t)(end - start + 1);
+        assert(tlen < sizeof(token));
+        memcpy(token, start, tlen);
+        token[tlen] = '\0';
+    }
+    char tool_call[256];
+    snprintf(tool_call, sizeof(tool_call), "{\"nik\":\"%s\"}", token);
     char *tool_rehydrated = pii_vault_rehydrate_for_tool(vault, tool_call, true);
     assert(tool_rehydrated != NULL);
+    assert(strstr(tool_rehydrated, "3573012203950001") != NULL);
 
     // 4b. Custom TOML keyed with the explicit shared key (keyed path) and
     //     cross-vault rehydration. Stateless sealed tokens carry their
@@ -133,6 +148,43 @@ int main(void) {
     assert(pii_vault_clear_dirty_tokens(vault, tokens_json));
     char *sealed2 = pii_vault_seal_dirty_sealed_entries_json(vault, aad);
     assert(sealed2 != NULL && strcmp(sealed2, "{}") == 0);
+    pii_string_free(sealed);
+    pii_string_free(sealed2);
+
+    // 6c-1. export/import sealed state round-trip into a fresh vault sharing
+    //     the same 32-byte key (state envelopes are keyed, so a vault with a
+    //     different key must fail closed).
+    struct PiiVaultHandle *svault_a = pii_vault_with_custom_toml("global", CUSTOM_TOML, key32, sizeof(key32));
+    assert(svault_a != NULL);
+    struct PiiVaultHandle *svault_b = pii_vault_with_custom_toml("global", CUSTOM_TOML, key32, sizeof(key32));
+    assert(svault_b != NULL);
+    pii_vault_set_token_format(svault_a, 1);
+    pii_vault_set_token_format(svault_b, 1);
+    char *kred2 = pii_vault_redact(svault_a, "Account ACC-123456 opened");
+    assert(kred2 != NULL && strstr(kred2, "<CUSTOM_ACC_") != NULL);
+    const char *aad2 = "session:c_abi_state";
+    char *state_blob = pii_vault_export_sealed_state(svault_a, aad2);
+    assert(state_blob != NULL && strstr(state_blob, "PIIS1:") != NULL);
+    // Wrong key must fail closed.
+    const unsigned char other_key[32];
+    memset((void *)other_key, 9, sizeof(other_key));
+    struct PiiVaultHandle *svault_c = pii_vault_with_custom_toml("global", CUSTOM_TOML, other_key, sizeof(other_key));
+    assert(svault_c != NULL);
+    assert(!pii_vault_import_sealed_state(svault_c, state_blob, aad2));
+    // Same key imports and rehydrates.
+    assert(pii_vault_import_sealed_state(svault_b, state_blob, aad2));
+    char *srehydrated = pii_vault_rehydrate(svault_b, kred2);
+    assert(srehydrated != NULL);
+    assert(strcmp(srehydrated, "Account ACC-123456 opened") == 0);
+    pii_string_free(state_blob);
+
+    // 6c-2. redact_json redacts PII inside JSON payloads.
+    char *json_redacted = pii_vault_redact_json(
+        vault, "{\"email\":\"budi@contoh.id\",\"note\":\"NIK 3573012203950001\"}");
+    assert(json_redacted != NULL);
+    assert(strstr(json_redacted, "budi@contoh.id") == NULL);
+    assert(strstr(json_redacted, "3573012203950001") == NULL);
+    assert(strstr(json_redacted, "<EMAIL_") != NULL);
 
     // 6c. is_stateless_mode toggles.
     pii_vault_set_stateless_mode(vault, true);
@@ -170,6 +222,9 @@ int main(void) {
     pii_string_free(redacted);
     pii_string_free(rehydrated);
     pii_string_free(tool_rehydrated);
+    pii_string_free(json_redacted);
+    pii_string_free(kred2);
+    pii_string_free(srehydrated);
     pii_string_free(acc_redacted);
     pii_string_free(acc_rehydrated);
     pii_string_free(c1);
@@ -179,6 +234,9 @@ int main(void) {
     free(joined);
     pii_stream_free(stream);
     pii_vault_free(vault);
+    pii_vault_free(svault_a);
+    pii_vault_free(svault_b);
+    pii_vault_free(svault_c);
     pii_vault_free(cvault);
     pii_vault_free(kvault);
     pii_vault_free(kvault2);

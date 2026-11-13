@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 pii-core = { path = "../pii-core" }
 wasm-bindgen = "0.2"
 serde_json.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }

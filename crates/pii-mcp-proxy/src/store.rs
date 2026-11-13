@@ -2,6 +2,7 @@
 
 use pii_core::{InMemoryVaultStore, PiiVaultStore};
 use pii_store_redis::{RedisVaultStore, DEFAULT_TIMEOUT};
+use std::time::Duration;
 
 /// Default Redis/Valkey key prefix for sealed session hashes.
 pub const DEFAULT_KEY_PREFIX: &str = "pii:v1";
@@ -22,10 +23,25 @@ impl ProxyStore {
         ProxyStore::Memory(InMemoryVaultStore::new())
     }
 
-    pub fn redis(url: &str, ttl_secs: u64) -> Result<Self, String> {
-        RedisVaultStore::new(url, DEFAULT_KEY_PREFIX, ttl_secs, DEFAULT_TIMEOUT)
+    pub fn redis(
+        url: &str,
+        ttl_secs: u64,
+        key_prefix: &str,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        RedisVaultStore::new(url, key_prefix, ttl_secs, timeout)
             .map(|s| ProxyStore::Redis(Box::new(s)))
             .map_err(|e| e.to_string())
+    }
+
+    /// Default Redis/Valkey key prefix for sealed session hashes.
+    pub fn default_key_prefix() -> &'static str {
+        DEFAULT_KEY_PREFIX
+    }
+
+    /// Default store timeout in milliseconds.
+    pub fn default_timeout_millis() -> u64 {
+        DEFAULT_TIMEOUT.as_millis() as u64
     }
 }
 

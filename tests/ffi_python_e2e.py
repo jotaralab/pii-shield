@@ -184,7 +184,65 @@ def main():
     lib.pii_vault_free(vc)
     print("[Python FFI E2E] Custom TOML rules working")
 
-    # 7. Cleanup memory cleanly
+    # 7. Two-phase dirty sync: seal without clearing, then clear by tokens.
+    lib.pii_vault_seal_dirty_sealed_entries_json.argtypes = [VOID_P, ctypes.c_char_p]
+    lib.pii_vault_seal_dirty_sealed_entries_json.restype = VOID_P
+    lib.pii_vault_clear_dirty_tokens.argtypes = [VOID_P, ctypes.c_char_p]
+    lib.pii_vault_clear_dirty_tokens.restype = ctypes.c_bool
+    lib.pii_vault_redact(
+        v1, b"Contact bob@jotaralab.com about NIK 3573012203950001"
+    )
+    aad2 = b"session:python_turn_2"
+    sealed_json = read_string(lib, lib.pii_vault_seal_dirty_sealed_entries_json(v1, aad2))
+    sealed_map = json.loads(sealed_json)
+    assert len(sealed_map) >= 1
+    for sealed in sealed_map.values():
+        assert sealed.startswith("PIIE1:")
+    tokens_json = json.dumps(list(sealed_map.keys())).encode("utf-8")
+    assert lib.pii_vault_clear_dirty_tokens(v1, tokens_json)
+    sealed_empty = read_string(lib, lib.pii_vault_seal_dirty_sealed_entries_json(v1, aad2))
+    assert json.loads(sealed_empty) == {}, sealed_empty
+    print("[Python FFI E2E] Two-phase dirty sync working")
+
+    # 8. export/import sealed state across pods sharing the same key.
+    lib.pii_vault_export_sealed_state.argtypes = [VOID_P, ctypes.c_char_p]
+    lib.pii_vault_export_sealed_state.restype = VOID_P
+    lib.pii_vault_import_sealed_state.argtypes = [VOID_P, ctypes.c_char_p, ctypes.c_char_p]
+    lib.pii_vault_import_sealed_state.restype = ctypes.c_bool
+    aad3 = b"session:python_state"
+    state_blob = read_string(lib, lib.pii_vault_export_sealed_state(v1, aad3))
+    assert state_blob.startswith("PIIS1:"), state_blob
+    v3 = lib.pii_vault_new_with_key(0, cluster_key, len(cluster_key))
+    assert v3 is not None
+    assert lib.pii_vault_import_sealed_state(v3, state_blob.encode("utf-8"), aad3)
+    rehydrated3 = read_string(lib, lib.pii_vault_rehydrate(v3, masked_py.encode("utf-8")))
+    assert rehydrated3 == raw_prompt, rehydrated3
+    # Wrong key must fail closed.
+    bad_key = b"9" * 32
+    v_bad = lib.pii_vault_new_with_key(0, bad_key, len(bad_key))
+    assert v_bad is not None
+    assert not lib.pii_vault_import_sealed_state(v_bad, state_blob.encode("utf-8"), aad3)
+    lib.pii_vault_free(v3)
+    lib.pii_vault_free(v_bad)
+    print("[Python FFI E2E] Sealed state export/import working")
+
+    # 9. Stateless mode toggle + fail-closed new_with_locales.
+    lib.pii_vault_set_stateless_mode.argtypes = [VOID_P, ctypes.c_bool]
+    lib.pii_vault_set_stateless_mode.restype = None
+    lib.pii_vault_is_stateless_mode.argtypes = [VOID_P]
+    lib.pii_vault_is_stateless_mode.restype = ctypes.c_bool
+    assert not lib.pii_vault_is_stateless_mode(v1)
+    lib.pii_vault_set_stateless_mode(v1, True)
+    assert lib.pii_vault_is_stateless_mode(v1)
+    lib.pii_vault_set_stateless_mode(v1, False)
+    assert not lib.pii_vault_is_stateless_mode(v1)
+
+    lib.pii_vault_new_with_locales.argtypes = [ctypes.c_char_p]
+    assert lib.pii_vault_new_with_locales(b"global_typo") is None, \
+        "unknown locale must fail closed"
+    print("[Python FFI E2E] Stateless mode toggle + fail-closed locales working")
+
+    # 10. Cleanup memory cleanly
     lib.pii_vault_free(v1)
     lib.pii_vault_free(v2)
     print("[Python FFI E2E] All foreign-language C-ABI tests passed successfully with 0 leaked strings!")
