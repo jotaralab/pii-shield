@@ -36,30 +36,30 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 fn tools() -> Vec<Value> {
     vec![
-    json!({
-        "name": "redact_text",
-        "description": "Detects PII in free text and replaces it with stable, reversible tokens.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Text to redact"},
-                "session_id": {"type": "string", "description": "Optional session identifier for consistent tokens"}
-            },
-            "required": ["text"]
-        }
-    }),
-    json!({
-        "name": "rehydrate_text",
-        "description": "Restores the original values for PII tokens embedded in text.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Text containing PII tokens"},
-                "session_id": {"type": "string", "description": "Optional session identifier used at redaction time"}
-            },
-            "required": ["text"]
-        }
-    }),
+        json!({
+            "name": "redact_text",
+            "description": "Detects PII in free text and replaces it with stable, reversible tokens.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Text to redact"},
+                    "session_id": {"type": "string", "description": "Optional session identifier for consistent tokens"}
+                },
+                "required": ["text"]
+            }
+        }),
+        json!({
+            "name": "rehydrate_text",
+            "description": "Restores the original values for PII tokens embedded in text.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Text containing PII tokens"},
+                    "session_id": {"type": "string", "description": "Optional session identifier used at redaction time"}
+                },
+                "required": ["text"]
+            }
+        }),
     ]
 }
 
@@ -139,8 +139,12 @@ async fn perform_request(state: Arc<AppState>, headers: HeaderMap, body: Value) 
             Err(err) => return Json(error_response(req.id, -32001, &err)).into_response(),
         },
         other => {
-            return Json(error_response(req.id, -32601, &format!("Method not found: {other}")))
-                .into_response()
+            return Json(error_response(
+                req.id,
+                -32601,
+                &format!("Method not found: {other}"),
+            ))
+            .into_response()
         }
     };
 
@@ -171,16 +175,13 @@ async fn call_tool(
         .map(|s| s.to_string())
         .or_else(|| session_id.map(|s| s.to_string()));
 
-    if let Err(msg) = validate_session(state, session_id.as_deref()) {
-        return Err(msg);
-    }
+    validate_session(state, session_id.as_deref())?;
 
-    let mut vault =
-        build_vault(&state.cfg).map_err(|e| format!("vault init failed: {e}"))?;
+    let mut vault = build_vault(&state.cfg).map_err(|e| format!("vault init failed: {e}"))?;
 
-    if state.store.is_some() && session_id.is_some() {
-        let sid = session_id.clone().unwrap();
-        let store = Arc::clone(state.store.as_ref().unwrap());
+    if let (Some(store), Some(sid)) = (state.store.as_ref(), session_id.as_ref()) {
+        let sid = sid.clone();
+        let store = Arc::clone(store);
         let sid_task = sid.clone();
         let entries = tokio::task::spawn_blocking(move || store.get_entries(&sid_task))
             .await
@@ -194,8 +195,8 @@ async fn call_tool(
     let content = match tool {
         "redact_text" => {
             let redacted = vault.redact(&text);
-            if state.store.is_some() && session_id.is_some() {
-                flush(state, &mut vault, session_id.as_ref().unwrap()).await?;
+            if let Some(sid) = session_id.as_ref().filter(|_| state.store.is_some()) {
+                flush(state, &mut vault, sid).await?;
             }
             json!({"redacted_text": redacted})
         }
@@ -217,11 +218,11 @@ fn validate_session(state: &AppState, session_id: Option<&str>) -> Result<(), St
     if let Some(id) = session_id {
         if id.is_empty()
             || id.len() > 128
-            || id.chars().any(|c| c == ':' || c.is_whitespace() || c.is_control())
+            || id
+                .chars()
+                .any(|c| c == ':' || c.is_whitespace() || c.is_control())
         {
-            return Err(
-                "session_id must be 1-128 chars without ':' or whitespace".to_string(),
-            );
+            return Err("session_id must be 1-128 chars without ':' or whitespace".to_string());
         }
         if state.store.is_none() {
             // Session affinity is meaningless without shared state; log only.
@@ -256,8 +257,7 @@ async fn flush(
 async fn handle_get(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>> + Send> {
-    Sse::new(endpoint_event_stream(state.shutdown.clone()))
-        .keep_alive(KeepAlive::default())
+    Sse::new(endpoint_event_stream(state.shutdown.clone())).keep_alive(KeepAlive::default())
 }
 
 fn endpoint_event_stream(

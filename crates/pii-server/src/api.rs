@@ -71,7 +71,10 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Response {
 
 async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         state.prometheus.render(),
     )
         .into_response()
@@ -88,11 +91,7 @@ struct TextRequest {
 }
 
 fn invalid_session(msg: &str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error": msg})),
-    )
-        .into_response()
+    (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
 }
 
 fn internal(msg: &str) -> Response {
@@ -103,20 +102,14 @@ fn internal(msg: &str) -> Response {
         .into_response()
 }
 
-async fn redact(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<TextRequest>,
-) -> Response {
+async fn redact(State(state): State<Arc<AppState>>, Json(req): Json<TextRequest>) -> Response {
     let started = Instant::now();
     let response = perform_redact(&state, req).await;
     record(&state, "redact".to_string(), &response, started, true);
     response
 }
 
-async fn rehydrate(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<TextRequest>,
-) -> Response {
+async fn rehydrate(State(state): State<Arc<AppState>>, Json(req): Json<TextRequest>) -> Response {
     let started = Instant::now();
     let response = perform_rehydrate(&state, req).await;
     record(&state, "rehydrate".to_string(), &response, started, false);
@@ -156,7 +149,7 @@ fn record(
 pub struct DetectionsCount(Vec<(pii_core::EntityType, u64)>);
 
 async fn perform_redact(state: &AppState, req: TextRequest) -> Response {
-    if let Err(resp) = validate_session(&state, &req.session_id) {
+    if let Some(resp) = validate_session(state, &req.session_id) {
         return resp;
     }
 
@@ -177,7 +170,7 @@ async fn perform_redact(state: &AppState, req: TextRequest) -> Response {
     // Load prior session entries so tokens stay consistent across calls.
     let session_id = req.session_id.clone().unwrap_or_else(|| "_anon".into());
     if state.store.is_some() && req.session_id.is_some() {
-        if let Err(resp) = load_session(state, &mut vault, &session_id).await {
+        if let Some(resp) = load_session(state, &mut vault, &session_id).await {
             return resp;
         }
     }
@@ -185,7 +178,7 @@ async fn perform_redact(state: &AppState, req: TextRequest) -> Response {
     let redacted_text = vault.redact(&req.text);
 
     if state.store.is_some() && req.session_id.is_some() {
-        if let Err(resp) = flush_session(state, &mut vault, &session_id).await {
+        if let Some(resp) = flush_session(state, &mut vault, &session_id).await {
             return resp;
         }
     }
@@ -200,7 +193,7 @@ async fn perform_redact(state: &AppState, req: TextRequest) -> Response {
 }
 
 async fn perform_rehydrate(state: &AppState, req: TextRequest) -> Response {
-    if let Err(resp) = validate_session(&state, &req.session_id) {
+    if let Some(resp) = validate_session(state, &req.session_id) {
         return resp;
     }
 
@@ -211,7 +204,7 @@ async fn perform_rehydrate(state: &AppState, req: TextRequest) -> Response {
 
     let session_id = req.session_id.clone().unwrap_or_else(|| "_anon".into());
     if state.store.is_some() && req.session_id.is_some() {
-        if let Err(resp) = load_session(state, &mut vault, &session_id).await {
+        if let Some(resp) = load_session(state, &mut vault, &session_id).await {
             return resp;
         }
     }
@@ -222,13 +215,15 @@ async fn perform_rehydrate(state: &AppState, req: TextRequest) -> Response {
 }
 
 /// Session IDs are used directly as store keys; reject anything dangerous.
-fn validate_session(state: &AppState, session_id: &Option<String>) -> Result<(), Response> {
+fn validate_session(state: &AppState, session_id: &Option<String>) -> Option<Response> {
     if let Some(id) = session_id {
         if id.is_empty()
             || id.len() > 128
-            || id.chars().any(|c| c == ':' || c.is_whitespace() || c.is_control())
+            || id
+                .chars()
+                .any(|c| c == ':' || c.is_whitespace() || c.is_control())
         {
-            return Err(invalid_session(
+            return Some(invalid_session(
                 "session_id must be 1-128 chars without ':' or whitespace",
             ));
         }
@@ -237,53 +232,59 @@ fn validate_session(state: &AppState, session_id: &Option<String>) -> Result<(),
         // Session affinity is meaningless without shared state; accept but log.
         tracing::debug!("session_id provided without a shared store; ignoring");
     }
-    Ok(())
+    None
 }
 
 async fn load_session(
     state: &AppState,
     vault: &mut pii_core::PiiSessionVault,
     session_id: &str,
-) -> Result<(), Response> {
+) -> Option<Response> {
     let store = state.store.as_ref().expect("checked");
     let store = Arc::clone(store);
     let sid = session_id.to_string();
-    let entries = tokio::task::spawn_blocking(move || store.get_entries(&sid))
-        .await
-        .map_err(|_| internal("session load task failed"))?
-        .map_err(|e| {
+    let entries = match tokio::task::spawn_blocking(move || store.get_entries(&sid)).await {
+        Ok(Ok(entries)) => entries,
+        Ok(Err(e)) => {
             tracing::warn!(?e, "redis session load failed");
-            internal("session load failed")
-        })?;
+            return Some(internal("session load failed"));
+        }
+        Err(_) => return Some(internal("session load task failed")),
+    };
 
-    vault
-        .import_sealed_entries(entries.iter().map(|(t, v)| (t.as_str(), v.as_str())), session_id)
-        .map_err(|e| internal(&format!("session import failed: {e:?}")))?;
-    Ok(())
+    if let Err(e) = vault.import_sealed_entries(
+        entries.iter().map(|(t, v)| (t.as_str(), v.as_str())),
+        session_id,
+    ) {
+        return Some(internal(&format!("session import failed: {e:?}")));
+    }
+    None
 }
 
 async fn flush_session(
     state: &AppState,
     vault: &mut pii_core::PiiSessionVault,
     session_id: &str,
-) -> Result<(), Response> {
+) -> Option<Response> {
     let store = state.store.as_ref().expect("checked");
     let sealed = vault.seal_dirty_entries(session_id);
     if sealed.is_empty() {
-        return Ok(());
+        return None;
     }
     let dirty_tokens: Vec<String> = sealed.iter().map(|(t, _)| t.clone()).collect();
     let store = Arc::clone(store);
     let sid = session_id.to_string();
-    tokio::task::spawn_blocking(move || store.put_entries(&sid, sealed))
-        .await
-        .map_err(|_| internal("session flush task failed"))?
-        .map_err(|e| {
-            tracing::warn!(?e, "redis session flush failed");
-            internal("session flush failed")
-        })?;
+    let flush_result =
+        match tokio::task::spawn_blocking(move || store.put_entries(&sid, sealed)).await {
+            Ok(result) => result,
+            Err(_) => return Some(internal("session flush task failed")),
+        };
+    if let Err(e) = flush_result {
+        tracing::warn!(?e, "redis session flush failed");
+        return Some(internal("session flush failed"));
+    }
     vault.clear_dirty_tokens(&dirty_tokens);
-    Ok(())
+    None
 }
 
 #[cfg(test)]
@@ -296,7 +297,12 @@ mod tests {
         let state = Arc::new(test_state());
         let app = router(state);
         let res = app
-            .oneshot(axum::http::Request::builder().uri("/healthz").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);

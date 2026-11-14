@@ -9,8 +9,8 @@ homepage.workspace = true
 description = "HTTP/JSON + MCP Streamable HTTP server exposing pii-core redaction and rehydration for Kubernetes deployments."
 
 [dependencies]
-pii-core = { path = "../pii-core" }
-pii-store-redis = { path = "../pii-store-redis" }
+pii-core = { path = "../pii-core", version = "0.1.0" }
+pii-store-redis = { path = "../pii-store-redis", version = "0.1.0" }
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }

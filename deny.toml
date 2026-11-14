@@ -11,6 +11,10 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
+# rustls-pemfile is a thin, stable wrapper around rustls-pki-types' PEM code;
+# it is pulled in transitively by redis 0.27's tls-rustls feature. Ignore the
+# unmaintained advisory until redis drops the dependency.
+ignore = ["RUSTSEC-2025-0134"]
 
 [licenses]
 version = 2
@@ -23,6 +27,9 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "CC0-1.0",
+    "ISC",
+    "Zlib",
+    "ISC",
 ]
 
 [bans]

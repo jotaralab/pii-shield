@@ -55,9 +55,8 @@ async fn run() -> Result<(), String> {
     // Graceful shutdown on SIGTERM (Kubernetes) or SIGINT.
     let shutdown_tx = state.shutdown_tx.clone();
     let shutdown = async move {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
         let sigint = tokio::signal::ctrl_c();
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("SIGTERM received; draining"),

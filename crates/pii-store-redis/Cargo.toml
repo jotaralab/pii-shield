@@ -11,5 +11,5 @@ description = "Valkey / Redis backed PiiVaultStore adapter for pii-shield multi-
 test-support = []
 
 [dependencies]
-pii-core = { path = "../pii-core" }
+pii-core = { path = "../pii-core", version = "0.1.0" }
 redis = { version = "0.27", default-features = false, features = ["acl", "tls-rustls"] }

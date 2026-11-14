@@ -10,7 +10,7 @@ description = "WebAssembly bindings for pii-shield (Browser & Cloudflare Workers
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pii-core = { path = "../pii-core" }
+pii-core = { path = "../pii-core", version = "0.1.0" }
 wasm-bindgen = "0.2"
 serde_json.workspace = true
 zeroize.workspace = true

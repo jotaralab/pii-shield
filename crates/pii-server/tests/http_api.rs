@@ -80,7 +80,12 @@ async fn readyz_ready_without_store() {
 #[tokio::test]
 async fn metrics_exposes_prometheus_format() {
     let response = app()
-        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -96,8 +101,14 @@ async fn redact_and_rehydrate_round_trip() {
     let (status, body) = post_json("/v1/redact", json!({"text": text})).await;
     assert_eq!(status, StatusCode::OK);
     let redacted = body["redacted_text"].as_str().unwrap();
-    assert!(!redacted.contains("ada@example.com"), "raw PII leaked: {redacted}");
-    assert!(redacted.contains("<PII:EMAIL:"), "expected token: {redacted}");
+    assert!(
+        !redacted.contains("ada@example.com"),
+        "raw PII leaked: {redacted}"
+    );
+    assert!(
+        redacted.contains("<PII:EMAIL:"),
+        "expected token: {redacted}"
+    );
     assert!(body["entities"].is_array());
 
     let (status, body) = post_json("/v1/rehydrate", json!({"text": redacted})).await;
@@ -153,7 +164,11 @@ async fn mcp_initialize_and_tool_call_round_trip() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["result"]["serverInfo"]["name"], "pii-shield");
 
-    let (status, body) = post_json("/mcp", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).await;
+    let (status, body) = post_json(
+        "/mcp",
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let names: Vec<&str> = body["result"]["tools"]
         .as_array()
@@ -177,7 +192,10 @@ async fn mcp_initialize_and_tool_call_round_trip() {
     let content = body["result"]["content"][0]["text"].as_str().unwrap();
     let parsed: Value = serde_json::from_str(content).unwrap();
     let redacted = parsed["redacted_text"].as_str().unwrap();
-    assert!(!redacted.contains("bob@example.com"), "raw PII leaked: {redacted}");
+    assert!(
+        !redacted.contains("bob@example.com"),
+        "raw PII leaked: {redacted}"
+    );
 
     let (status, body) = post_json(
         "/mcp",
@@ -215,7 +233,11 @@ async fn mcp_rejects_invalid_session_id() {
 
 #[tokio::test]
 async fn mcp_unknown_method_returns_json_rpc_error() {
-    let (status, body) = post_json("/mcp", json!({"jsonrpc": "2.0", "id": 9, "method": "bogus/method"})).await;
+    let (status, body) = post_json(
+        "/mcp",
+        json!({"jsonrpc": "2.0", "id": 9, "method": "bogus/method"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["error"]["code"], -32601);
 }

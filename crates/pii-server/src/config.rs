@@ -48,7 +48,8 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr = parse_bind_addr(env_opt("PII_BIND_ADDR")?, "0.0.0.0:8080")?;
 
-        let token_format_raw = env_opt("PII_TOKEN_FORMAT")?.unwrap_or_else(|| "stateless-sealed".into());
+        let token_format_raw =
+            env_opt("PII_TOKEN_FORMAT")?.unwrap_or_else(|| "stateless-sealed".into());
         let token_format = match token_format_raw.as_str() {
             "stateless-sealed" => TokenFormat::StatelessSealed,
             "redis" => TokenFormat::CompactHash,
@@ -72,7 +73,10 @@ impl Config {
             None => 1_048_576,
         };
 
-        let log_format = match env_opt("PII_LOG_FORMAT")?.unwrap_or_else(|| "json".into()).as_str() {
+        let log_format = match env_opt("PII_LOG_FORMAT")?
+            .unwrap_or_else(|| "json".into())
+            .as_str()
+        {
             "json" => LogFormat::Json,
             "pretty" => LogFormat::Pretty,
             other => {
@@ -152,7 +156,9 @@ fn parse_seal_key(
         .map_err(|_| ConfigError("PII_SEAL_KEY: key must be exactly 32 bytes".into()))?;
 
     if key.iter().all(|b| *b == 0) {
-        return Err(ConfigError("PII_SEAL_KEY: all-zero key is not allowed".into()));
+        return Err(ConfigError(
+            "PII_SEAL_KEY: all-zero key is not allowed".into(),
+        ));
     }
 
     Ok(Some(zeroize::Zeroizing::new(key)))
@@ -202,14 +208,18 @@ mod tests {
 
     #[test]
     fn hex_seal_key() {
-        let key = parse_seal_key(Some(HEX_KEY.into()), "stateless-sealed").unwrap().unwrap();
+        let key = parse_seal_key(Some(HEX_KEY.into()), "stateless-sealed")
+            .unwrap()
+            .unwrap();
         assert_eq!(key.as_ref(), &[0xa1u8; 32]);
     }
 
     #[test]
     fn base64_seal_key() {
         let value = base64::encode(&[0xa1u8; 32]);
-        let key = parse_seal_key(Some(value), "stateless-sealed").unwrap().unwrap();
+        let key = parse_seal_key(Some(value), "stateless-sealed")
+            .unwrap()
+            .unwrap();
         assert_eq!(key.as_ref(), &[0xa1u8; 32]);
     }
 
@@ -253,8 +263,16 @@ mod tests {
                 let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
                 out.push(ALPHABET[(n >> 18) as usize & 63] as char);
                 out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-                out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-                out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+                out.push(if chunk.len() > 1 {
+                    ALPHABET[(n >> 6) as usize & 63] as char
+                } else {
+                    '='
+                });
+                out.push(if chunk.len() > 2 {
+                    ALPHABET[n as usize & 63] as char
+                } else {
+                    '='
+                });
             }
             out
         }

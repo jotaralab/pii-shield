@@ -929,10 +929,7 @@ fn test_batch_blocked_errors_reach_host_not_child() {
     let mut buf = String::new();
 
     // Seed a token by triggering outbound redaction.
-    let _ = writeln!(
-        stdin,
-        r#"{{"jsonrpc":"2.0","id":1,"method":"init_data"}}"#
-    );
+    let _ = writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"init_data"}}"#);
     stdin.flush().unwrap();
     reader.read_line(&mut buf).unwrap();
     assert!(buf.contains("<ID_NIK_1>"), "seed response: {}", buf);
