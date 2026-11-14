@@ -126,9 +126,15 @@ class TestPiiShield < Test::Unit::TestCase
     begin
       assert_raise(ArgumentError) { vault.redact("a\x00b") }
       assert_raise(ArgumentError) { vault.rehydrate("\x00") }
+      assert_raise(ArgumentError) { vault.import_sealed_entries_json("{\x00}", "aad") }
+      assert_raise(ArgumentError) { vault.import_sealed_entries_json("{}", "aad\x00") }
+      assert_raise(ArgumentError) { vault.import_sealed_state("PIIS1:\x00", "aad") }
+      assert_raise(ArgumentError) { vault.import_sealed_state("PIIS1:AA", "aad\x00") }
       bad = String.new("caf\xC3".b)
       bad.force_encoding(Encoding::UTF_8)
       assert_raise(ArgumentError) { vault.redact(bad) }
+      assert_raise(ArgumentError) { vault.import_sealed_entries_json(bad, "aad") }
+      assert_raise(ArgumentError) { vault.import_sealed_state(bad, "aad") }
     ensure
       vault.close
     end

@@ -214,11 +214,11 @@ pub unsafe extern "C" fn pii_vault_with_custom_toml(
 
         // 4. Key policy — validated now, CSPRNG generation only on success.
         let key: Option<[u8; 32]> = if key_ptr.is_null() && key_len == 0 {
-            let mut generated = [0u8; 32];
-            if getrandom::getrandom(&mut generated).is_err() {
+            let mut generated = Zeroizing::new([0u8; 32]);
+            if getrandom::getrandom(&mut *generated).is_err() {
                 return ptr::null_mut();
             }
-            Some(generated)
+            Some(*generated)
         } else if !key_ptr.is_null() && key_len == 32 {
             let mut key_bytes = Zeroizing::new([0u8; 32]);
             ptr::copy_nonoverlapping(key_ptr, key_bytes.as_mut_ptr(), 32);

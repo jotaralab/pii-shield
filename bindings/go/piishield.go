@@ -203,6 +203,9 @@ func NewVaultWithCustomTOML(localesCSV string, customTOML string, key []byte) (*
 // Close releases the native vault. Close is idempotent and safe for
 // concurrent use.
 func (v *Vault) Close() {
+	if v == nil {
+		return
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.handle == nil {
@@ -214,8 +217,11 @@ func (v *Vault) Close() {
 }
 
 func (v *Vault) locked() (*C.struct_PiiVaultHandle, error) {
+	if v == nil {
+		return nil, ErrVaultClosed
+	}
 	v.mu.RLock()
-	if v == nil || v.handle == nil {
+	if v.handle == nil {
 		v.mu.RUnlock()
 		return nil, ErrVaultClosed
 	}
@@ -490,6 +496,9 @@ func NewStreamRehydrator() (*StreamRehydrator, error) {
 }
 
 func (s *StreamRehydrator) Close() {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.handle == nil {
@@ -501,6 +510,9 @@ func (s *StreamRehydrator) Close() {
 }
 
 func (s *StreamRehydrator) PushChunk(v *Vault, chunk string) (string, error) {
+	if s == nil {
+		return "", ErrVaultClosed
+	}
 	cs, err := cString(chunk)
 	if err != nil {
 		return "", err
@@ -523,6 +535,9 @@ func (s *StreamRehydrator) PushChunk(v *Vault, chunk string) (string, error) {
 }
 
 func (s *StreamRehydrator) Flush(v *Vault) (string, error) {
+	if s == nil {
+		return "", ErrVaultClosed
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.handle == nil {

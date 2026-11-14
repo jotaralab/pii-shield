@@ -8,14 +8,14 @@ use pii_core::TokenFormat;
 use std::net::SocketAddr;
 
 /// Resolved startup configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Socket address to bind (e.g. `0.0.0.0:8080` in Kubernetes,
     /// `127.0.0.1:8080` as a localhost sidecar).
     pub bind_addr: SocketAddr,
     /// Token format: stateless-sealed (self-contained tokens) or redis.
     pub token_format: TokenFormat,
-    /// 32-byte session key for `stateless-sealed` mode.
+    /// 32-byte session key for `stateless-sealed` and `redis` modes.
     pub seal_key: Option<zeroize::Zeroizing<[u8; 32]>>,
     /// Redis connection URL, required when `token_format` is `redis`.
     pub redis_url: Option<String>,
@@ -23,6 +23,22 @@ pub struct Config {
     pub max_body_bytes: usize,
     /// Log output format: `json` (default) or `pretty`.
     pub log_format: LogFormat,
+    /// Enabled PII rule locales (default: `global,id,us,eu,sg`).
+    pub locales: Vec<String>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("bind_addr", &self.bind_addr)
+            .field("token_format", &self.token_format)
+            .field("seal_key", &self.seal_key.as_ref().map(|_| "<redacted>"))
+            .field("redis_url", &self.redis_url.as_ref().map(|_| "<redacted>"))
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("log_format", &self.log_format)
+            .field("locales", &self.locales)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,11 +64,12 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr = parse_bind_addr(env_opt("PII_BIND_ADDR")?, "0.0.0.0:8080")?;
 
-        let token_format_raw =
-            env_opt("PII_TOKEN_FORMAT")?.unwrap_or_else(|| "stateless-sealed".into());
+        let token_format_raw = env_opt("PII_TOKEN_FORMAT")?
+            .or(env_opt("PII_SHIELD_TOKEN_FORMAT")?)
+            .unwrap_or_else(|| "stateless-sealed".into());
         let token_format = match token_format_raw.as_str() {
             "stateless-sealed" => TokenFormat::StatelessSealed,
-            "redis" => TokenFormat::CompactHash,
+            "redis" | "compact-hash" => TokenFormat::CompactHash,
             other => {
                 return Err(ConfigError(format!(
                     "PII_TOKEN_FORMAT: unknown value '{other}' (expected 'stateless-sealed' or 'redis')"
@@ -60,18 +77,43 @@ impl Config {
             }
         };
 
-        let seal_key = parse_seal_key(env_opt("PII_SEAL_KEY")?, token_format_raw.as_str())?;
-        let redis_url = match token_format_raw.as_str() {
-            "redis" => Some(env_required("PII_REDIS_URL")?),
+        let raw_seal_key = env_opt("PII_SEAL_KEY")?.or(env_opt("PII_SHIELD_SESSION_KEY")?);
+        let seal_key = parse_seal_key(raw_seal_key, token_format_raw.as_str())?;
+        let redis_url = match token_format {
+            TokenFormat::CompactHash => Some(
+                env_opt("PII_REDIS_URL")?
+                    .or(env_opt("PII_SHIELD_REDIS_URL")?)
+                    .or(env_opt("PII_SHIELD_VALKEY_URL")?)
+                    .ok_or_else(|| ConfigError("PII_REDIS_URL is required but not set".into()))?,
+            ),
             _ => None,
         };
 
+        const MAX_ALLOWED_BODY_BYTES: usize = 64 * 1024 * 1024;
         let max_body_bytes = match env_opt("PII_MAX_BODY_BYTES")? {
-            Some(v) => v
-                .parse::<usize>()
-                .map_err(|_| ConfigError("PII_MAX_BODY_BYTES: not a valid usize".into()))?,
+            Some(v) => {
+                let parsed = v
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError("PII_MAX_BODY_BYTES: not a valid usize".into()))?;
+                if parsed == 0 || parsed > MAX_ALLOWED_BODY_BYTES {
+                    return Err(ConfigError(format!(
+                        "PII_MAX_BODY_BYTES: must be between 1 and {MAX_ALLOWED_BODY_BYTES}"
+                    )));
+                }
+                parsed
+            }
             None => 1_048_576,
         };
+
+        let locales_raw = env_opt("PII_LOCALES")?.unwrap_or_else(|| "global,id,us,eu,sg".into());
+        let locales: Vec<String> = locales_raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if locales.is_empty() {
+            return Err(ConfigError("PII_LOCALES must not be empty".into()));
+        }
 
         let log_format = match env_opt("PII_LOG_FORMAT")?
             .unwrap_or_else(|| "json".into())
@@ -93,6 +135,7 @@ impl Config {
             redis_url,
             max_body_bytes,
             log_format,
+            locales,
         })
     }
 }
@@ -109,10 +152,6 @@ fn env_opt(name: &str) -> Result<Option<String>, ConfigError> {
     }
 }
 
-fn env_required(name: &str) -> Result<String, ConfigError> {
-    env_opt(name)?.ok_or_else(|| ConfigError(format!("{name} is required but not set")))
-}
-
 fn parse_bind_addr(raw: Option<String>, default: &str) -> Result<SocketAddr, ConfigError> {
     let value = raw.unwrap_or_else(|| default.to_string());
     value
@@ -127,15 +166,21 @@ fn parse_seal_key(
     raw: Option<String>,
     _token_format: &str,
 ) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, ConfigError> {
-    let key_bytes: Vec<u8> = match raw {
+    let raw = raw.map(zeroize::Zeroizing::new);
+    let key_bytes: zeroize::Zeroizing<Vec<u8>> = match raw {
         Some(value) => {
             if value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()) {
-                hex::decode(&value).map_err(|_| ConfigError("PII_SEAL_KEY: invalid hex".into()))?
+                zeroize::Zeroizing::new(
+                    hex::decode(value.as_str())
+                        .map_err(|_| ConfigError("PII_SEAL_KEY: invalid hex".into()))?,
+                )
             } else if value.len() == 44 && value.ends_with('=') {
-                base64_decode(&value)
-                    .map_err(|_| ConfigError("PII_SEAL_KEY: invalid base64".into()))?
+                zeroize::Zeroizing::new(
+                    base64_decode(value.as_str())
+                        .map_err(|_| ConfigError("PII_SEAL_KEY: invalid base64".into()))?,
+                )
             } else if value.len() == 32 {
-                value.into_bytes()
+                zeroize::Zeroizing::new(value.as_bytes().to_vec())
             } else {
                 return Err(ConfigError(
                     "PII_SEAL_KEY: expected 64-char hex, base64 (44 chars), or 32 raw bytes \
@@ -144,16 +189,20 @@ fn parse_seal_key(
                 ));
             }
         }
-        None => Vec::new(),
+        None => zeroize::Zeroizing::new(Vec::new()),
     };
 
     if key_bytes.is_empty() {
         return Err(ConfigError("PII_SEAL_KEY is required but not set".into()));
     }
 
-    let key: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| ConfigError("PII_SEAL_KEY: key must be exactly 32 bytes".into()))?;
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    if key_bytes.len() != 32 {
+        return Err(ConfigError(
+            "PII_SEAL_KEY: key must be exactly 32 bytes".into(),
+        ));
+    }
+    key.copy_from_slice(&key_bytes);
 
     if key.iter().all(|b| *b == 0) {
         return Err(ConfigError(
@@ -161,7 +210,7 @@ fn parse_seal_key(
         ));
     }
 
-    Ok(Some(zeroize::Zeroizing::new(key)))
+    Ok(Some(key))
 }
 
 /// Minimal std-alphabet base64 decoder (avoids pulling a new dependency).
@@ -200,6 +249,13 @@ mod tests {
             redis_url: None,
             max_body_bytes: 1_048_576,
             log_format: LogFormat::Json,
+            locales: vec![
+                "global".into(),
+                "id".into(),
+                "us".into(),
+                "eu".into(),
+                "sg".into(),
+            ],
         };
         assert_eq!(cfg.bind_addr.to_string(), "0.0.0.0:8080");
         assert!(cfg.redis_url.is_none());

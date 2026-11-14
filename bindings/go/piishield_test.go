@@ -423,3 +423,19 @@ func keys(m map[string]string) []string {
 	}
 	return out
 }
+
+func TestNilReceiverReturnsErrVaultClosed(t *testing.T) {
+	var v *Vault
+	v.Close()
+	if _, err := v.Redact("test"); err != ErrVaultClosed {
+		t.Fatalf("expected ErrVaultClosed on nil Vault.Redact, got %v", err)
+	}
+	var s *StreamRehydrator
+	s.Close()
+	if _, err := s.PushChunk(v, "chunk"); err != ErrVaultClosed {
+		t.Fatalf("expected ErrVaultClosed on nil StreamRehydrator.PushChunk, got %v", err)
+	}
+	if _, err := s.Flush(v); err != ErrVaultClosed {
+		t.Fatalf("expected ErrVaultClosed on nil StreamRehydrator.Flush, got %v", err)
+	}
+}

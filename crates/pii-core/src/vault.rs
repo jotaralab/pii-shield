@@ -107,22 +107,56 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// Session-scoped bi-directional pseudonymization vault.
 /// Ensures consistent entity tokens across multi-turn agent loops while wiping raw PII on Drop.
 pub struct PiiSessionVault {
-    scanner: PiiScanner,
+    scanner: std::sync::Arc<PiiScanner>,
     forward_map: AHashMap<[u8; 32], String>,
     reverse_map: AHashMap<String, (EntityType, Zeroizing<String>)>,
     counters: AHashMap<EntityType, u64>,
     dirty_tokens: Vec<String>,
     session_key: Zeroizing<[u8; 32]>,
+    k_mac: Zeroizing<[u8; 32]>,
+    k_enc: Zeroizing<[u8; 32]>,
+    k_state_mac: Zeroizing<[u8; 32]>,
+    k_state_enc: Zeroizing<[u8; 32]>,
     policy: SecurityPolicy,
     token_format: TokenFormat,
+    aad_scope: Option<String>,
+}
+
+const MAX_SEALED_TOKEN_BYTES: usize = 2048;
+const MAX_SEALED_ENTRY_BYTES: usize = 8192;
+const MAX_SEALED_STATE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_JSON_NESTING_DEPTH: usize = 8;
+
+fn derive_token_subkeys(key: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+    let mut mac = HmacSha256::new_from_slice(key).expect("Key valid");
+    mac.update(b"pii-shield-mac");
+    let k_mac = Zeroizing::new(mac.finalize().into_bytes().into());
+
+    let mut enc = HmacSha256::new_from_slice(key).expect("Key valid");
+    enc.update(b"pii-shield-enc");
+    let k_enc = Zeroizing::new(enc.finalize().into_bytes().into());
+
+    (k_mac, k_enc)
+}
+
+fn derive_state_subkeys_from(key: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+    let mut mac = HmacSha256::new_from_slice(key).expect("Key valid");
+    mac.update(b"pii-shield-state-mac-v1");
+    let k_mac = Zeroizing::new(mac.finalize().into_bytes().into());
+
+    let mut enc = HmacSha256::new_from_slice(key).expect("Key valid");
+    enc.update(b"pii-shield-state-enc-v1");
+    let k_enc = Zeroizing::new(enc.finalize().into_bytes().into());
+
+    (k_mac, k_enc)
 }
 
 impl PiiSessionVault {
     /// Creates a new session vault using OS CSPRNG for session key generation.
     pub fn new(policy: SecurityPolicy) -> Self {
-        let mut key_bytes = [0u8; 32];
-        getrandom::getrandom(&mut key_bytes).expect("OS CSPRNG unavailable");
-        Self::with_key(policy, key_bytes)
+        let mut key_bytes = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut *key_bytes).expect("OS CSPRNG unavailable");
+        Self::with_key(policy, *key_bytes)
     }
 
     /// Creates a vault with an explicit 32-byte key (for deterministic testing or multi-process sharing).
@@ -136,8 +170,21 @@ impl PiiSessionVault {
                     .expect("Builtin catalogs valid")
             }
         };
-        let scanner = PiiScanner::from_catalog(&catalog).expect("Scanner compilation valid");
+        let scanner = std::sync::Arc::new(
+            PiiScanner::from_catalog(&catalog).expect("Scanner compilation valid"),
+        );
+        Self::from_shared_scanner_with_key(scanner, key, policy)
+    }
 
+    /// Creates a vault reusing a pre-compiled shared [`PiiScanner`] in $O(1)$ time
+    /// without recompiling regex DFAs.
+    pub fn from_shared_scanner_with_key(
+        scanner: std::sync::Arc<PiiScanner>,
+        key: [u8; 32],
+        policy: SecurityPolicy,
+    ) -> Self {
+        let (k_mac, k_enc) = derive_token_subkeys(&key);
+        let (k_state_mac, k_state_enc) = derive_state_subkeys_from(&key);
         Self {
             scanner,
             forward_map: AHashMap::new(),
@@ -145,16 +192,21 @@ impl PiiSessionVault {
             counters: AHashMap::new(),
             dirty_tokens: Vec::new(),
             session_key: Zeroizing::new(key),
+            k_mac,
+            k_enc,
+            k_state_mac,
+            k_state_enc,
             policy,
             token_format: TokenFormat::Sequential,
+            aad_scope: None,
         }
     }
 
     /// Creates a vault from an explicit PiiCatalog and OS CSPRNG key.
     pub fn from_catalog(catalog: PiiCatalog) -> Self {
-        let mut key_bytes = [0u8; 32];
-        getrandom::getrandom(&mut key_bytes).expect("OS CSPRNG unavailable");
-        Self::try_from_catalog_with_key(catalog, key_bytes).expect("Scanner compilation valid")
+        let mut key_bytes = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut *key_bytes).expect("OS CSPRNG unavailable");
+        Self::try_from_catalog_with_key(catalog, *key_bytes).expect("Scanner compilation valid")
     }
 
     /// Creates a vault from an explicit PiiCatalog and explicit 32-byte key.
@@ -165,25 +217,34 @@ impl PiiSessionVault {
     /// Fallibly creates a vault from an explicit PiiCatalog and OS CSPRNG key,
     /// returning an error instead of panicking when the catalog fails to compile.
     pub fn try_from_catalog(catalog: PiiCatalog) -> Result<Self, String> {
-        let mut key_bytes = [0u8; 32];
-        getrandom::getrandom(&mut key_bytes).expect("OS CSPRNG unavailable");
-        Self::try_from_catalog_with_key(catalog, key_bytes)
+        let mut key_bytes = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut *key_bytes).expect("OS CSPRNG unavailable");
+        Self::try_from_catalog_with_key(catalog, *key_bytes)
     }
 
     /// Fallibly creates a vault from an explicit PiiCatalog and explicit 32-byte key,
     /// returning an error instead of panicking when the catalog fails to compile.
     pub fn try_from_catalog_with_key(catalog: PiiCatalog, key: [u8; 32]) -> Result<Self, String> {
-        let scanner = PiiScanner::from_catalog(&catalog)?;
-        Ok(Self {
+        let scanner = std::sync::Arc::new(PiiScanner::from_catalog(&catalog)?);
+        Ok(Self::from_shared_scanner_with_key(
             scanner,
-            forward_map: AHashMap::new(),
-            reverse_map: AHashMap::new(),
-            counters: AHashMap::new(),
-            dirty_tokens: Vec::new(),
-            session_key: Zeroizing::new(key),
-            policy: SecurityPolicy::IndonesiaUuPdpStrict,
-            token_format: TokenFormat::Sequential,
-        })
+            key,
+            SecurityPolicy::IndonesiaUuPdpStrict,
+        ))
+    }
+
+    /// Binds an optional session/tenant scope (`aad`) into `StatelessSealed` tokens.
+    pub fn set_aad_scope(&mut self, aad: Option<String>) {
+        let normalized = aad.filter(|s| !s.is_empty());
+        if self.aad_scope != normalized {
+            self.forward_map.clear();
+            self.aad_scope = normalized;
+        }
+    }
+
+    /// Returns the active session/tenant scope for `StatelessSealed` tokens.
+    pub fn aad_scope(&self) -> Option<&str> {
+        self.aad_scope.as_deref()
     }
 
     /// Returns the active token format.
@@ -193,7 +254,10 @@ impl PiiSessionVault {
 
     /// Sets the active token format (Sequential, CompactHash, StatelessSealed).
     pub fn set_token_format(&mut self, format: TokenFormat) {
-        self.token_format = format;
+        if self.token_format != format {
+            self.forward_map.clear();
+            self.token_format = format;
+        }
     }
 
     /// Checks whether stateless sealed-token mode is active.
@@ -204,28 +268,15 @@ impl PiiSessionVault {
     /// Enables or disables stateless sealed-token mode.
     pub fn set_stateless_mode(&mut self, enabled: bool) {
         if enabled {
-            self.token_format = TokenFormat::StatelessSealed;
+            self.set_token_format(TokenFormat::StatelessSealed);
         } else {
-            self.token_format = TokenFormat::Sequential;
+            self.set_token_format(TokenFormat::Sequential);
         }
     }
 
     /// Policy associated with this vault session.
     pub fn policy(&self) -> SecurityPolicy {
         self.policy
-    }
-
-    /// Derives HKDF-style subkeys from session_key: K_mac and K_enc.
-    fn derive_subkeys(&self) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
-        let mut mac = HmacSha256::new_from_slice(&*self.session_key).expect("Key valid");
-        mac.update(b"pii-shield-mac");
-        let k_mac = Zeroizing::new(mac.finalize().into_bytes().into());
-
-        let mut enc = HmacSha256::new_from_slice(&*self.session_key).expect("Key valid");
-        enc.update(b"pii-shield-enc");
-        let k_enc = Zeroizing::new(enc.finalize().into_bytes().into());
-
-        (k_mac, k_enc)
     }
 
     /// Domain-separated HMAC calculation without allocating intermediate strings.
@@ -242,12 +293,16 @@ impl PiiSessionVault {
 
     /// Deterministic HMAC-SHA256-SIV sealed token creation (<PII:PREFIX:UPPER_HEX>).
     fn create_sealed_token(&self, tag_prefix: &str, raw_pii: &str) -> String {
-        let (k_mac, k_enc) = self.derive_subkeys();
         let trimmed = raw_pii.trim().as_bytes();
 
-        // 1. Compute 16-byte Synthetic IV (SIV) = HMAC(K_mac, prefix || 0x00 || plaintext)[0..16]
-        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
+        // 1. Compute 16-byte Synthetic IV (SIV)
+        let mut mac = HmacSha256::new_from_slice(&*self.k_mac).expect("HMAC key valid");
         mac.update(tag_prefix.as_bytes());
+        if let Some(ref aad) = self.aad_scope {
+            mac.update(&[0x01u8]);
+            mac.update(&(aad.len() as u64).to_be_bytes());
+            mac.update(aad.as_bytes());
+        }
         mac.update(&[0u8]);
         mac.update(trimmed);
         let siv_full = mac.finalize().into_bytes();
@@ -258,7 +313,7 @@ impl PiiSessionVault {
         let mut ciphertext = Vec::with_capacity(trimmed.len());
         let mut block_idx = 0u32;
         while ciphertext.len() < trimmed.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
+            let mut ctr_mac = HmacSha256::new_from_slice(&*self.k_enc).expect("HMAC key valid");
             ctr_mac.update(&siv);
             ctr_mac.update(&block_idx.to_be_bytes());
             let ks_block = ctr_mac.finalize().into_bytes();
@@ -284,7 +339,10 @@ impl PiiSessionVault {
 
     /// Decrypts a stateless sealed token (<PII:PREFIX:UPPER_HEX>) into out.
     fn decrypt_sealed_token_into(&self, token: &str, out: &mut String) -> bool {
-        if !token.starts_with("<PII:") || !token.ends_with('>') {
+        if token.len() > MAX_SEALED_TOKEN_BYTES
+            || !token.starts_with("<PII:")
+            || !token.ends_with('>')
+        {
             return false;
         }
         let inner = &token[5..token.len() - 1];
@@ -301,14 +359,13 @@ impl PiiSessionVault {
             return false;
         }
 
-        let (k_mac, k_enc) = self.derive_subkeys();
         let (siv, ciphertext) = payload.split_at(16);
 
         // Decrypt ciphertext using K_enc counter-mode
         let mut plaintext = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
         let mut block_idx = 0u32;
         while plaintext.len() < ciphertext.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
+            let mut ctr_mac = HmacSha256::new_from_slice(&*self.k_enc).expect("HMAC key valid");
             ctr_mac.update(siv);
             ctr_mac.update(&block_idx.to_be_bytes());
             let ks_block = ctr_mac.finalize().into_bytes();
@@ -324,8 +381,13 @@ impl PiiSessionVault {
         }
 
         // Verify Synthetic IV (SIV)
-        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*self.k_mac).expect("HMAC key valid");
         mac.update(tag_prefix.as_bytes());
+        if let Some(ref aad) = self.aad_scope {
+            mac.update(&[0x01u8]);
+            mac.update(&(aad.len() as u64).to_be_bytes());
+            mac.update(aad.as_bytes());
+        }
         mac.update(&[0u8]);
         mac.update(&plaintext);
         let expected_siv_full = mac.finalize().into_bytes();
@@ -344,10 +406,6 @@ impl PiiSessionVault {
 
     fn get_or_insert_token(&mut self, entity_type: EntityType, raw_pii: &str) -> String {
         let tag_prefix = entity_type.as_tag_prefix().to_string();
-        if self.token_format == TokenFormat::StatelessSealed {
-            return self.create_sealed_token(&tag_prefix, raw_pii);
-        }
-
         let digest = self.compute_hmac(&tag_prefix, raw_pii);
         if let Some(existing) = self.forward_map.get(&digest) {
             return existing.clone();
@@ -361,21 +419,24 @@ impl PiiSessionVault {
             }
             TokenFormat::CompactHash => {
                 let num = u64::from_be_bytes(digest[..8].try_into().unwrap());
-                let base_code = encode_base36(num % 2_176_782_336, 6);
+                let base_code = encode_base36(num % 2_821_109_907_456, 8);
                 let mut candidate = format!("<{}_{}>", tag_prefix, base_code);
-                if let Some((existing_entity, existing_raw)) = self.reverse_map.get(&candidate) {
-                    // HMAC tokens are case-folded, so two case variants of the
-                    // same address may legitimately map to this token.
-                    if existing_entity != &entity_type
-                        || !existing_raw.as_str().eq_ignore_ascii_case(raw_pii.trim())
-                    {
-                        let ext_code = encode_base36(num % 2_821_109_907_456, 8);
-                        candidate = format!("<{}_{}>", tag_prefix, ext_code);
-                    }
+                let collides =
+                    |c: &str, map: &AHashMap<String, (EntityType, Zeroizing<String>)>| {
+                        map.get(c).is_some_and(|(existing_entity, existing_raw)| {
+                            existing_entity != &entity_type
+                                || !existing_raw.as_str().eq_ignore_ascii_case(raw_pii.trim())
+                        })
+                    };
+                let mut suffix = 1u64;
+                while collides(&candidate, &self.reverse_map) {
+                    let alt_code = encode_base36(num.wrapping_add(suffix) % 2_821_109_907_456, 8);
+                    candidate = format!("<{}_{}>", tag_prefix, alt_code);
+                    suffix += 1;
                 }
                 candidate
             }
-            TokenFormat::StatelessSealed => unreachable!(),
+            TokenFormat::StatelessSealed => self.create_sealed_token(&tag_prefix, raw_pii),
         };
 
         self.forward_map.insert(digest, token.clone());
@@ -383,7 +444,9 @@ impl PiiSessionVault {
             token.clone(),
             (entity_type, Zeroizing::new(raw_pii.trim().to_string())),
         );
-        self.dirty_tokens.push(token.clone());
+        if self.token_format != TokenFormat::StatelessSealed {
+            self.dirty_tokens.push(token.clone());
+        }
 
         token
     }
@@ -391,6 +454,34 @@ impl PiiSessionVault {
     /// Scrubs raw text and replaces detected PII with typed session-consistent tokens.
     pub fn redact(&mut self, input: &str) -> String {
         self.redact_with_key(input, None)
+    }
+
+    /// Scrubs raw text and returns both the redacted string and the detected
+    /// [`crate::scanner::EntityMatch`] spans in a single scan pass.
+    pub fn redact_with_matches(
+        &mut self,
+        input: &str,
+    ) -> (String, Vec<crate::scanner::EntityMatch>) {
+        let matches = self.scanner.scan_with_context(input, None);
+        if matches.is_empty() {
+            return (input.to_string(), matches);
+        }
+
+        let mut out = String::with_capacity(input.len());
+        let mut last_idx = 0;
+
+        for m in &matches {
+            if m.start < last_idx {
+                continue;
+            }
+            out.push_str(&input[last_idx..m.start]);
+            let raw_slice = &input[m.start..m.end];
+            let token = self.get_or_insert_token(m.entity_type.clone(), raw_slice);
+            out.push_str(&token);
+            last_idx = m.end;
+        }
+        out.push_str(&input[last_idx..]);
+        (out, matches)
     }
 
     /// Like [`PiiSessionVault::redact`], but also treats `key_context` (a
@@ -419,9 +510,9 @@ impl PiiSessionVault {
         out
     }
 
-    /// Recursively redacts all string leaves inside a serde_json::Value AST,
-    /// leaving JSON keys, numbers, booleans, and null untouched.
-    /// Also handles nested JSON-in-JSON string leaves.
+    /// Recursively redacts all string leaves and PII-bearing object keys inside
+    /// a `serde_json::Value` AST, leaving JSON numbers, booleans, and null untouched.
+    /// Also handles nested JSON-in-JSON string leaves up to `MAX_JSON_NESTING_DEPTH`.
     /// The immediate parent object key is threaded through as qualifying
     /// context, so `{"driver_license": "A1234567"}` is redacted even though
     /// the leaf value itself carries no prose keyword.
@@ -437,25 +528,44 @@ impl PiiSessionVault {
         value: &mut serde_json::Value,
         parent_key: Option<&str>,
     ) {
+        self.redact_json_value_with_key_depth(value, parent_key, 0);
+    }
+
+    fn redact_json_value_with_key_depth(
+        &mut self,
+        value: &mut serde_json::Value,
+        parent_key: Option<&str>,
+        depth: usize,
+    ) {
         match value {
             serde_json::Value::Object(map) => {
-                for (k, v) in map {
-                    self.redact_json_value_with_key(v, Some(k));
+                let entries: Vec<(String, serde_json::Value)> =
+                    std::mem::take(map).into_iter().collect();
+                for (k, mut v) in entries {
+                    self.redact_json_value_with_key_depth(&mut v, Some(&k), depth);
+                    let redacted_k = self.redact_with_key(&k, parent_key);
+                    map.insert(redacted_k, v);
                 }
             }
             serde_json::Value::Array(arr) => {
                 for elem in arr {
-                    self.redact_json_value_with_key(elem, parent_key);
+                    self.redact_json_value_with_key_depth(elem, parent_key, depth);
                 }
             }
             serde_json::Value::String(s) => {
-                // Check if string leaf itself is nested JSON
-                if (s.starts_with('{') && s.ends_with('}'))
-                    || (s.starts_with('[') && s.ends_with(']'))
+                // Check if string leaf itself is nested JSON (bounded depth)
+                let trimmed = s.trim();
+                if depth < MAX_JSON_NESTING_DEPTH
+                    && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+                        || (trimmed.starts_with('[') && trimmed.ends_with(']')))
                 {
-                    if let Ok(mut inner_val) = serde_json::from_str::<serde_json::Value>(s) {
+                    if let Ok(mut inner_val) = serde_json::from_str::<serde_json::Value>(trimmed) {
                         // Nested JSON-in-JSON inherits the parent key context.
-                        self.redact_json_value_with_key(&mut inner_val, parent_key);
+                        self.redact_json_value_with_key_depth(
+                            &mut inner_val,
+                            parent_key,
+                            depth + 1,
+                        );
                         if let Ok(serialized) = serde_json::to_string(&inner_val) {
                             *s = serialized;
                             return;
@@ -468,8 +578,8 @@ impl PiiSessionVault {
         }
     }
 
-    /// Redacts raw PII in string leaves of a JSON payload without corrupting
-    /// unquoted numbers, object keys, or structural tokens.
+    /// Redacts raw PII in string leaves and PII-bearing object keys of a JSON
+    /// payload without corrupting unquoted numbers or structural tokens.
     /// If payload is not valid JSON, falls back to plain string redact.
     pub fn redact_json(&mut self, payload: &str) -> String {
         if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(payload) {
@@ -492,6 +602,9 @@ impl PiiSessionVault {
                 let start = i;
                 let mut end = None;
                 for (j, &b) in bytes.iter().enumerate().skip(start + 1) {
+                    if j - start >= MAX_SEALED_TOKEN_BYTES {
+                        break;
+                    }
                     if b == b'>' {
                         end = Some(j);
                         break;
@@ -509,10 +622,14 @@ impl PiiSessionVault {
                     }
                 }
             }
-            // Append current char boundary
-            let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-            out.push_str(&text[i..i + ch_len]);
-            i += ch_len;
+            // Advance in bulk up to the next '<' (guaranteed char boundary).
+            let step = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            let next = text[i + step..]
+                .find('<')
+                .map(|off| i + step + off)
+                .unwrap_or(text.len());
+            out.push_str(&text[i..next]);
+            i = next;
         }
 
         out
@@ -521,12 +638,12 @@ impl PiiSessionVault {
     /// Looks up or decrypts a single token, appending the raw value into out.
     /// Returns true if the token was recognized and rehydrated.
     pub fn rehydrate_token_into(&self, token: &str, out: &mut String) -> bool {
+        if token.starts_with("<PII:") {
+            return self.decrypt_sealed_token_into(token, out);
+        }
         if let Some((_, val)) = self.reverse_map.get(token) {
             out.push_str(val.as_str());
             return true;
-        }
-        if token.starts_with("<PII:") {
-            return self.decrypt_sealed_token_into(token, out);
         }
         false
     }
@@ -555,24 +672,39 @@ impl PiiSessionVault {
         trust_level: ToolTrustLevel,
         parent_key: Option<&str>,
     ) -> Result<(), SecurityError> {
+        self.rehydrate_json_value_with_key_depth(value, trust_level, parent_key, 0)
+    }
+
+    fn rehydrate_json_value_with_key_depth(
+        &self,
+        value: &mut serde_json::Value,
+        trust_level: ToolTrustLevel,
+        parent_key: Option<&str>,
+        depth: usize,
+    ) -> Result<(), SecurityError> {
         match value {
             serde_json::Value::String(s) => {
                 // Nested JSON-in-JSON string leaves inherit `parent_key`, and
                 // are recursed into BEFORE the trust-level branch so that an
                 // ExternalUntrusted caller cannot hide a value inside a nested
                 // array/object string.
-                if (s.starts_with('{') && s.ends_with('}'))
-                    || (s.starts_with('[') && s.ends_with(']'))
+                let trimmed = s.trim();
+                if depth < MAX_JSON_NESTING_DEPTH
+                    && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+                        || (trimmed.starts_with('[') && trimmed.ends_with(']')))
                 {
-                    if let Ok(mut inner_val) = serde_json::from_str::<serde_json::Value>(s) {
-                        self.rehydrate_json_value_with_key(
+                    if let Ok(mut inner_val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        self.rehydrate_json_value_with_key_depth(
                             &mut inner_val,
                             trust_level,
                             parent_key,
+                            depth + 1,
                         )?;
-                        if let Ok(serialized) = serde_json::to_string(&inner_val) {
-                            *s = serialized;
-                            return Ok(());
+                        if trust_level == ToolTrustLevel::InternalTrusted {
+                            if let Ok(serialized) = serde_json::to_string(&inner_val) {
+                                *s = serialized;
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -582,14 +714,36 @@ impl PiiSessionVault {
                     *s = self.rehydrate(s);
                 }
             }
+            serde_json::Value::Number(n) => {
+                if trust_level == ToolTrustLevel::ExternalUntrusted {
+                    let num_str = n.to_string();
+                    self.check_exfiltration_with_key(&num_str, parent_key)?;
+                }
+            }
             serde_json::Value::Array(arr) => {
                 for elem in arr {
-                    self.rehydrate_json_value_with_key(elem, trust_level, parent_key)?;
+                    self.rehydrate_json_value_with_key_depth(elem, trust_level, parent_key, depth)?;
                 }
             }
             serde_json::Value::Object(map) => {
-                for (k, v) in map {
-                    self.rehydrate_json_value_with_key(v, trust_level, Some(k))?;
+                if trust_level == ToolTrustLevel::ExternalUntrusted {
+                    for (k, v) in map {
+                        self.check_exfiltration_with_key(k, parent_key)?;
+                        self.rehydrate_json_value_with_key_depth(v, trust_level, Some(k), depth)?;
+                    }
+                } else {
+                    let entries: Vec<(String, serde_json::Value)> =
+                        std::mem::take(map).into_iter().collect();
+                    for (k, mut v) in entries {
+                        self.rehydrate_json_value_with_key_depth(
+                            &mut v,
+                            trust_level,
+                            Some(&k),
+                            depth,
+                        )?;
+                        let rehydrated_k = self.rehydrate(&k);
+                        map.insert(rehydrated_k, v);
+                    }
                 }
             }
             _ => {}
@@ -674,18 +828,6 @@ impl PiiSessionVault {
         }
     }
 
-    fn derive_state_subkeys(&self) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
-        let mut mac = HmacSha256::new_from_slice(&*self.session_key).expect("Key valid");
-        mac.update(b"pii-shield-state-mac-v1");
-        let k_mac = Zeroizing::new(mac.finalize().into_bytes().into());
-
-        let mut enc = HmacSha256::new_from_slice(&*self.session_key).expect("Key valid");
-        enc.update(b"pii-shield-state-enc-v1");
-        let k_enc = Zeroizing::new(enc.finalize().into_bytes().into());
-
-        (k_mac, k_enc)
-    }
-
     fn seal_entry_bytes(
         &self,
         entity_prefix: &str,
@@ -693,7 +835,6 @@ impl PiiSessionVault {
         token: &str,
         aad: &str,
     ) -> String {
-        let (k_mac, k_enc) = self.derive_state_subkeys();
         let mut nonce = [0u8; 16];
         getrandom::getrandom(&mut nonce).expect("OS CSPRNG unavailable");
 
@@ -705,7 +846,7 @@ impl PiiSessionVault {
         plaintext.extend_from_slice(trimmed.as_bytes());
 
         // SIV = HMAC(K_state_mac, "PIIE1" || nonce || aad_len || aad || token_len || token || plaintext)[0..16]
-        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*self.k_state_mac).expect("HMAC key valid");
         mac.update(b"PIIE1");
         mac.update(&nonce);
         mac.update(&(aad.len() as u64).to_be_bytes());
@@ -720,7 +861,8 @@ impl PiiSessionVault {
         let mut ciphertext = Vec::with_capacity(plaintext.len());
         let mut block_idx = 0u32;
         while ciphertext.len() < plaintext.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
+            let mut ctr_mac =
+                HmacSha256::new_from_slice(&*self.k_state_enc).expect("HMAC key valid");
             ctr_mac.update(&siv);
             ctr_mac.update(&nonce);
             ctr_mac.update(&block_idx.to_be_bytes());
@@ -749,7 +891,7 @@ impl PiiSessionVault {
         token: &str,
         aad: &str,
     ) -> Result<(EntityType, Zeroizing<String>), SecurityError> {
-        if !sealed.starts_with("PIIE1:") {
+        if sealed.len() > MAX_SEALED_ENTRY_BYTES || !sealed.starts_with("PIIE1:") {
             return Err(SecurityError::InvalidStateBlob);
         }
         let hex_str = &sealed[6..];
@@ -760,7 +902,6 @@ impl PiiSessionVault {
             return Err(SecurityError::InvalidStateBlob);
         }
 
-        let (k_mac, k_enc) = self.derive_state_subkeys();
         let nonce = &payload[..16];
         let siv = &payload[16..32];
         let ciphertext = &payload[32..];
@@ -768,7 +909,8 @@ impl PiiSessionVault {
         let mut plaintext = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
         let mut block_idx = 0u32;
         while plaintext.len() < ciphertext.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
+            let mut ctr_mac =
+                HmacSha256::new_from_slice(&*self.k_state_enc).expect("HMAC key valid");
             ctr_mac.update(siv);
             ctr_mac.update(nonce);
             ctr_mac.update(&block_idx.to_be_bytes());
@@ -784,7 +926,7 @@ impl PiiSessionVault {
             block_idx += 1;
         }
 
-        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*self.k_state_mac).expect("HMAC key valid");
         mac.update(b"PIIE1");
         mac.update(nonce);
         mac.update(&(aad.len() as u64).to_be_bytes());
@@ -984,7 +1126,6 @@ impl PiiSessionVault {
 
     /// Exports full session state into a single encrypted envelope (PIIS1).
     pub fn export_sealed_state(&self, aad: &str) -> String {
-        let (k_mac, k_enc) = self.derive_state_subkeys();
         let mut nonce = [0u8; 16];
         getrandom::getrandom(&mut nonce).expect("OS CSPRNG unavailable");
 
@@ -994,7 +1135,7 @@ impl PiiSessionVault {
             .map(|(token, (entity, raw))| VaultSnapshotEntry {
                 entity: entity.as_tag_prefix().to_string(),
                 token: token.clone(),
-                raw: raw.as_str().to_string(),
+                raw: raw.clone(),
             })
             .collect();
 
@@ -1013,7 +1154,7 @@ impl PiiSessionVault {
         let plaintext =
             Zeroizing::new(serde_json::to_vec(&snapshot).expect("Snapshot serializable"));
 
-        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*self.k_state_mac).expect("HMAC key valid");
         mac.update(b"PIIS1");
         mac.update(&nonce);
         mac.update(&(aad.len() as u64).to_be_bytes());
@@ -1026,7 +1167,8 @@ impl PiiSessionVault {
         let mut ciphertext = Vec::with_capacity(plaintext.len());
         let mut block_idx = 0u32;
         while ciphertext.len() < plaintext.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
+            let mut ctr_mac =
+                HmacSha256::new_from_slice(&*self.k_state_enc).expect("HMAC key valid");
             ctr_mac.update(&siv);
             ctr_mac.update(&nonce);
             ctr_mac.update(&block_idx.to_be_bytes());
@@ -1051,7 +1193,7 @@ impl PiiSessionVault {
 
     /// Restores full session state from an encrypted envelope (PIIS1).
     pub fn import_sealed_state(&mut self, sealed: &str, aad: &str) -> Result<(), SecurityError> {
-        if !sealed.starts_with("PIIS1:") {
+        if sealed.len() > MAX_SEALED_STATE_BYTES || !sealed.starts_with("PIIS1:") {
             return Err(SecurityError::InvalidStateBlob);
         }
         let hex_str = &sealed[6..];
@@ -1062,7 +1204,6 @@ impl PiiSessionVault {
             return Err(SecurityError::InvalidStateBlob);
         }
 
-        let (k_mac, k_enc) = self.derive_state_subkeys();
         let nonce = &payload[..16];
         let siv = &payload[16..32];
         let ciphertext = &payload[32..];
@@ -1070,7 +1211,8 @@ impl PiiSessionVault {
         let mut plaintext = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
         let mut block_idx = 0u32;
         while plaintext.len() < ciphertext.len() {
-            let mut ctr_mac = HmacSha256::new_from_slice(&*k_enc).expect("HMAC key valid");
+            let mut ctr_mac =
+                HmacSha256::new_from_slice(&*self.k_state_enc).expect("HMAC key valid");
             ctr_mac.update(siv);
             ctr_mac.update(nonce);
             ctr_mac.update(&block_idx.to_be_bytes());
@@ -1086,7 +1228,7 @@ impl PiiSessionVault {
             block_idx += 1;
         }
 
-        let mut mac = HmacSha256::new_from_slice(&*k_mac).expect("HMAC key valid");
+        let mut mac = HmacSha256::new_from_slice(&*self.k_state_mac).expect("HMAC key valid");
         mac.update(b"PIIS1");
         mac.update(nonce);
         mac.update(&(aad.len() as u64).to_be_bytes());
@@ -1153,18 +1295,18 @@ impl PiiSessionVault {
             seen_digests.insert(digest, entry.token.clone());
         }
 
-        for entry in snapshot.entries {
+        for entry in &snapshot.entries {
             let entity_type = EntityType::from_tag_prefix(&entry.entity);
-            let digest = self.compute_hmac(&entry.entity, &entry.raw);
+            let digest = self.compute_hmac(&entry.entity, entry.raw.as_str());
             self.forward_map.insert(digest, entry.token.clone());
             self.reverse_map
-                .insert(entry.token, (entity_type, Zeroizing::new(entry.raw)));
+                .insert(entry.token.clone(), (entity_type, entry.raw.clone()));
         }
 
-        for (entity_prefix, remote_count) in snapshot.counters {
-            let entity_type = EntityType::from_tag_prefix(&entity_prefix);
+        for (entity_prefix, remote_count) in &snapshot.counters {
+            let entity_type = EntityType::from_tag_prefix(entity_prefix);
             let cur = self.counters.entry(entity_type).or_insert(0);
-            *cur = (*cur).max(remote_count);
+            *cur = (*cur).max(*remote_count);
         }
 
         Ok(())
@@ -1210,11 +1352,29 @@ impl PiiSessionVault {
     }
 }
 
+fn serialize_zeroizing_string<S: serde::Serializer>(
+    val: &Zeroizing<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(val.as_str())
+}
+
+fn deserialize_zeroizing_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Zeroizing<String>, D::Error> {
+    let s = <String as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(Zeroizing::new(s))
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct VaultSnapshotEntry {
     entity: String,
     token: String,
-    raw: String,
+    #[serde(
+        serialize_with = "serialize_zeroizing_string",
+        deserialize_with = "deserialize_zeroizing_string"
+    )]
+    raw: Zeroizing<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1784,29 +1944,148 @@ mod tests {
         let restored = vault_b.rehydrate(&scrubbed);
         assert_eq!(restored, "NIK: 3573012203950001");
     }
-}
 
-#[test]
-fn test_try_from_catalog_fails_on_invalid_regex() {
-    // Bypass merge_toml_str's own regex validation to exercise the scanner path.
-    let catalog = crate::catalog::PiiCatalog {
-        rules: vec![crate::catalog::PiiRuleSpec {
-            id: "BAD".to_string(),
-            tag_prefix: "BAD".to_string(),
-            description: String::new(),
-            regex: "(unbalanced[".to_string(),
-            validator: "none".to_string(),
-            priority: 50,
-            context_keywords: vec![],
-            require_context: false,
-            valid_samples: vec![],
-            invalid_samples: vec![],
-        }],
-    };
-    let res = PiiSessionVault::try_from_catalog(catalog);
-    let msg = match res {
-        Ok(_) => panic!("try_from_catalog must fail closed on bad regex"),
-        Err(e) => e,
-    };
-    assert!(msg.contains("BAD"), "Error must identify the rule: {}", msg);
+    #[test]
+    fn test_try_from_catalog_fails_on_invalid_regex() {
+        // Bypass merge_toml_str's own regex validation to exercise the scanner path.
+        let catalog = crate::catalog::PiiCatalog {
+            rules: vec![crate::catalog::PiiRuleSpec {
+                id: "BAD".to_string(),
+                tag_prefix: "BAD".to_string(),
+                description: String::new(),
+                regex: "(unbalanced[".to_string(),
+                validator: "none".to_string(),
+                priority: 50,
+                context_keywords: vec![],
+                require_context: false,
+                valid_samples: vec![],
+                invalid_samples: vec![],
+            }],
+        };
+        let res = PiiSessionVault::try_from_catalog(catalog);
+        let msg = match res {
+            Ok(_) => panic!("try_from_catalog must fail closed on bad regex"),
+            Err(e) => e,
+        };
+        assert!(msg.contains("BAD"), "Error must identify the rule: {}", msg);
+    }
+
+    #[test]
+    fn test_from_shared_scanner_does_not_recompile() {
+        let catalog = PiiCatalog::with_locales(&["global", "id", "us", "eu", "sg"]).unwrap();
+        let scanner = std::sync::Arc::new(PiiScanner::from_catalog(&catalog).unwrap());
+        let key = [42u8; 32];
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            let vault = PiiSessionVault::from_shared_scanner_with_key(
+                std::sync::Arc::clone(&scanner),
+                key,
+                SecurityPolicy::StandardGlobal,
+            );
+            assert!(std::sync::Arc::ptr_eq(&vault.scanner, &scanner));
+            std::hint::black_box(&vault);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "1000 shared-scanner vaults took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_exfiltration_blocked_in_json_object_key() {
+        let mut vault = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, [7u8; 32]);
+        let redacted = vault.redact("NIK 3573012203950001 and fitra@jotaralab.com");
+        assert!(redacted.contains("<ID_NIK_1>"));
+
+        for payload in [
+            r#"{"<ID_NIK_1>": 1}"#,
+            r#"{"<PII:ID_NIK:AABB>": 1}"#,
+            r#"{"fitra@jotaralab.com": 1}"#,
+        ] {
+            let res = vault.rehydrate_for_tool(payload, ToolTrustLevel::ExternalUntrusted);
+            assert!(
+                matches!(res, Err(SecurityError::ExfiltrationBlocked { .. })),
+                "expected ExfiltrationBlocked for {payload}, got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exfiltration_blocked_in_nested_json_string_key_and_number() {
+        let mut vault = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, [7u8; 32]);
+        let redacted = vault.redact("NIK 3573012203950001");
+        assert!(redacted.contains("<ID_NIK_1>"));
+
+        for payload in [
+            r#"{"q": "{\"<ID_NIK_1>\": 1}"}"#,
+            r#"{"q": "  {\"<ID_NIK_1>\": 1}  "}"#,
+            r#"{"q": "[3573012203950001]"}"#,
+            r#"{"nik": 3573012203950001}"#,
+        ] {
+            let res = vault.rehydrate_for_tool(payload, ToolTrustLevel::ExternalUntrusted);
+            assert!(
+                matches!(res, Err(SecurityError::ExfiltrationBlocked { .. })),
+                "expected ExfiltrationBlocked for {payload}, got {res:?}"
+            );
+        }
+
+        // Verify deeply nested JSON-in-JSON exceeding MAX_JSON_NESTING_DEPTH still blocks via raw fallback
+        let mut deep = r#"{"k":"<ID_NIK_1>"}"#.to_string();
+        for _ in 0..10 {
+            deep = serde_json::json!({ "nested": deep }).to_string();
+        }
+        assert!(matches!(
+            vault.rehydrate_for_tool(&deep, ToolTrustLevel::ExternalUntrusted),
+            Err(SecurityError::ExfiltrationBlocked { .. })
+        ));
+    }
+
+    #[test]
+    fn test_stateless_sealed_aad_scope_prevents_cross_session_rehydration() {
+        let key = [11u8; 32];
+        let mut vault_a = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        vault_a.set_token_format(TokenFormat::StatelessSealed);
+        vault_a.set_aad_scope(Some("sess-A".to_string()));
+
+        let scrubbed = vault_a.redact("user@example.com");
+        assert!(scrubbed.starts_with("<PII:EMAIL:"));
+        assert_eq!(vault_a.rehydrate(&scrubbed), "user@example.com");
+
+        let mut vault_b = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        vault_b.set_token_format(TokenFormat::StatelessSealed);
+        vault_b.set_aad_scope(Some("sess-B".to_string()));
+        assert_eq!(vault_b.rehydrate(&scrubbed), scrubbed);
+
+        let mut vault_none = PiiSessionVault::with_key(SecurityPolicy::IndonesiaUuPdpStrict, key);
+        vault_none.set_token_format(TokenFormat::StatelessSealed);
+        assert_eq!(vault_none.rehydrate(&scrubbed), scrubbed);
+    }
+
+    #[test]
+    fn test_stateless_sealed_populates_layer2_and_rehydrate_token() {
+        let mut vault = PiiSessionVault::with_key(SecurityPolicy::StandardGlobal, [13u8; 32]);
+        vault.set_token_format(TokenFormat::StatelessSealed);
+        let scrubbed = vault.redact("Driver license: A1234567");
+        assert!(scrubbed.starts_with("Driver license: <PII:US_CA_DL:"));
+        let token = scrubbed.strip_prefix("Driver license: ").unwrap();
+        assert_eq!(vault.rehydrate_token(token), Some("A1234567"));
+
+        let blocked =
+            vault.rehydrate_for_tool(r#"{"q": "A1234567"}"#, ToolTrustLevel::ExternalUntrusted);
+        assert!(matches!(
+            blocked,
+            Err(SecurityError::ExfiltrationBlocked { .. })
+        ));
+    }
+
+    #[test]
+    fn test_rehydrate_ignores_oversized_sealed_token_without_decrypting() {
+        let vault = PiiSessionVault::with_key(SecurityPolicy::StandardGlobal, [15u8; 32]);
+        let huge = format!("<PII:EMAIL:{}>", "41".repeat(50_000));
+        let started = std::time::Instant::now();
+        let out = vault.rehydrate(&huge);
+        assert_eq!(out, huge);
+        assert!(started.elapsed() < std::time::Duration::from_millis(5));
+    }
 }

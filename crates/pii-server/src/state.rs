@@ -10,8 +10,8 @@ use tokio::sync::watch;
 /// Immutable state shared by all handlers.
 pub struct AppState {
     pub cfg: Arc<Config>,
-    /// Shared scanner used to report detected entities in API responses.
-    pub scanner: PiiScanner,
+    /// Shared pre-compiled scanner reused across all per-request vaults in O(1).
+    pub scanner: Arc<PiiScanner>,
     /// Optional Redis-backed vault store (token format `redis`).
     pub store: Option<Arc<RedisVaultStore>>,
     /// Prometheus registry handle for `GET /metrics`.
@@ -26,7 +26,10 @@ pub struct AppState {
 impl AppState {
     /// Builds the application state, failing fast on any invalid setup.
     pub fn build(cfg: Config) -> Result<Self, String> {
-        let scanner = PiiScanner::from_catalog(&build_catalog()?)?;
+        let locale_refs: Vec<&str> = cfg.locales.iter().map(String::as_str).collect();
+        let catalog =
+            PiiCatalog::with_locales(&locale_refs).map_err(|e| format!("catalog: {e:?}"))?;
+        let scanner = Arc::new(PiiScanner::from_catalog(&catalog)?);
 
         let store = match &cfg.redis_url {
             Some(url) => {
@@ -52,41 +55,56 @@ impl AppState {
     }
 }
 
-/// Removes credentials (anything between `scheme://` and the last `@`)
-/// before a connection URL may appear in logs.
+/// Removes credentials (anything between `scheme://` and the last `@`, as well
+/// as `password=...` query parameters) before a connection URL may appear in logs.
 pub fn redact_url(url: &str) -> String {
-    match url.find("://") {
+    let mut sanitized = match url.find("://") {
         Some(scheme_end) => match url.rfind('@') {
             Some(at) if at > scheme_end => {
                 format!("{}<redacted>@{}", &url[..scheme_end + 3], &url[at + 1..])
             }
             _ => url.to_string(),
         },
-        None => url.to_string(),
-    }
-}
-
-fn build_catalog() -> Result<PiiCatalog, String> {
-    PiiCatalog::with_locales(&["global", "us", "eu", "sg"]).map_err(|e| format!("catalog: {e:?}"))
-}
-
-/// Creates a fresh [`PiiSessionVault`] from the resolved configuration.
-///
-/// In `stateless-sealed` mode the session key comes from `PII_SEAL_KEY` and
-/// tokens are self-contained, so a per-request vault needs no shared state.
-/// In `redis` mode callers additionally load/flush entries via
-/// [`PiiSessionVault::load_from_store`] / [`PiiSessionVault::flush_to_store`].
-pub fn build_vault(cfg: &Config) -> Result<PiiSessionVault, String> {
-    let mut vault = match &cfg.seal_key {
-        Some(key) => PiiSessionVault::try_from_catalog_with_key(build_catalog()?, **key)
-            .map_err(|e| format!("vault: {e}"))?,
-        None => PiiSessionVault::try_from_catalog(build_catalog()?)
-            .map_err(|e| format!("vault: {e}"))?,
+        None => return "<redacted-url>".to_string(),
     };
-    vault.set_token_format(cfg.token_format);
-    if cfg.token_format == TokenFormat::StatelessSealed {
+    if let Some(q_idx) = sanitized.find('?') {
+        let base = sanitized[..q_idx].to_string();
+        let query = &sanitized[q_idx + 1..];
+        let masked_params: Vec<String> = query
+            .split('&')
+            .map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                let k = parts.next().unwrap_or("");
+                if k.eq_ignore_ascii_case("password") || k.eq_ignore_ascii_case("auth") {
+                    format!("{k}=<redacted>")
+                } else {
+                    pair.to_string()
+                }
+            })
+            .collect();
+        sanitized = format!("{base}?{}", masked_params.join("&"));
+    }
+    sanitized
+}
+
+/// Creates a fresh [`PiiSessionVault`] from `AppState` in O(1) time by
+/// sharing the pre-compiled [`PiiScanner`].
+pub fn build_vault(state: &AppState, session_id: Option<&str>) -> Result<PiiSessionVault, String> {
+    let key = state
+        .cfg
+        .seal_key
+        .as_ref()
+        .ok_or_else(|| "PII_SEAL_KEY is not configured".to_string())?;
+    let mut vault = PiiSessionVault::from_shared_scanner_with_key(
+        Arc::clone(&state.scanner),
+        **key,
+        pii_core::SecurityPolicy::StandardGlobal,
+    );
+    vault.set_token_format(state.cfg.token_format);
+    if state.cfg.token_format == TokenFormat::StatelessSealed {
         vault.set_stateless_mode(true);
     }
+    vault.set_aad_scope(session_id.map(str::to_string));
     Ok(vault)
 }
 
@@ -105,6 +123,10 @@ mod tests {
             "rediss://<redacted>@host:6380/2"
         );
         assert_eq!(redact_url("redis://redis:6379"), "redis://redis:6379");
-        assert_eq!(redact_url("plain-value"), "plain-value");
+        assert_eq!(
+            redact_url("redis://redis:6379?password=secret&db=0"),
+            "redis://redis:6379?password=<redacted>&db=0"
+        );
+        assert_eq!(redact_url("plain-value"), "<redacted-url>");
     }
 }

@@ -174,6 +174,33 @@ defmodule PiiShieldTest do
     end
   end
 
+  test "nil locales use default global,id catalog in vault_new and vault_new_with_custom_toml" do
+    case native_available?() do
+      false ->
+        :ok
+
+      true ->
+        v_key = PiiShield.vault_new!(nil, @key)
+        assert PiiShield.redact(v_key, "NIK 3573012203950001") =~ "<ID_NIK_"
+
+        custom_toml = """
+        locale = "custom"
+        name = "Custom"
+        [[rules]]
+        id = "CUSTOM_ACC"
+        tag_prefix = "CUSTOM_ACC"
+        description = "Custom account"
+        regex = "ACC-[0-9]{6}"
+        validator = "none"
+        priority = 90
+        """
+
+        v_toml = PiiShield.vault_new_with_custom_toml!(nil, custom_toml, @key)
+        assert PiiShield.redact(v_toml, "NIK 3573012203950001 and ACC-123456") =~ "<ID_NIK_"
+        assert PiiShield.redact(v_toml, "ACC-123456") =~ "<CUSTOM_ACC_"
+    end
+  end
+
   # ---- helpers ----------------------------------------------------------------
 
   defp labels(sealed_json) do

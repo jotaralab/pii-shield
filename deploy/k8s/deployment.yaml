@@ -18,8 +18,12 @@ spec:
         app.kubernetes.io/name: pii-shield
         app.kubernetes.io/component: server
     spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35
       securityContext:
         runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -27,6 +31,9 @@ spec:
           image: pii-shield:local
           imagePullPolicy: IfNotPresent
           securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:

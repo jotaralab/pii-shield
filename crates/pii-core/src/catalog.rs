@@ -128,24 +128,51 @@ impl PiiCatalog {
     }
 
     /// Loads built-in catalogs for the specified locales (e.g. &["global", "id"]).
+    ///
+    /// Merges all requested locale TOMLs first and compiles the combined
+    /// scanner once at the end to avoid redundant intermediate DFA builds.
     pub fn with_locales(locales: &[&str]) -> Result<Self, CatalogError> {
-        let mut catalog = Self::new();
+        let mut staged = Self::new();
         for &loc in locales {
-            match loc {
-                "global" => catalog.merge_toml_str(GLOBAL_TOML)?,
-                "id" => catalog.merge_toml_str(ID_TOML)?,
-                "us" => catalog.merge_toml_str(US_TOML)?,
-                "eu" => catalog.merge_toml_str(EU_TOML)?,
-                "sg" => catalog.merge_toml_str(SG_TOML)?,
+            let toml_str = match loc {
+                "global" => GLOBAL_TOML,
+                "id" => ID_TOML,
+                "us" => US_TOML,
+                "eu" => EU_TOML,
+                "sg" => SG_TOML,
                 other => return Err(CatalogError::UnknownLocale(other.to_string())),
+            };
+            staged.stage_toml_str(toml_str)?;
+        }
+        if !staged.rules.is_empty() {
+            if let Err(err) = crate::scanner::PiiScanner::from_catalog(&staged) {
+                return Err(CatalogError::InvalidRegex(err));
             }
         }
-        Ok(catalog)
+        Ok(staged)
     }
 
     /// Merges rules from a TOML string into the catalog, enforcing sanity limits.
     /// Atomic: on any validation error the catalog is left untouched.
     pub fn merge_toml_str(&mut self, toml_str: &str) -> Result<(), CatalogError> {
+        let mut staged = self.clone();
+        staged.stage_toml_str(toml_str)?;
+
+        // Phase 3: fail fast on regexes the combined catalog cannot compile
+        // (also enforces combined multi-pattern NFA/DFA size limits). The
+        // error string already identifies the offending rule id.
+        if let Err(err) = crate::scanner::PiiScanner::from_catalog(&staged) {
+            return Err(CatalogError::InvalidRegex(err));
+        }
+
+        // Phase 4: atomic commit.
+        self.rules = staged.rules;
+        Ok(())
+    }
+
+    /// Parses, validates, and stages a TOML string into `self` without
+    /// compiling the regex scanner yet.
+    fn stage_toml_str(&mut self, toml_str: &str) -> Result<(), CatalogError> {
         let parsed: LocaleCatalog = toml::from_str(toml_str)?;
 
         // Phase 1: validate every incoming spec before mutating anything.
@@ -193,17 +220,6 @@ impl PiiCatalog {
             }
         }
 
-        // Phase 3: fail fast on regexes the combined catalog cannot compile
-        // (also enforces combined multi-pattern NFA/DFA size limits). The
-        // error string already identifies the offending rule id.
-        let staged_catalog = PiiCatalog {
-            rules: staged.clone(),
-        };
-        if let Err(err) = crate::scanner::PiiScanner::from_catalog(&staged_catalog) {
-            return Err(CatalogError::InvalidRegex(err));
-        }
-
-        // Phase 4: atomic commit.
         self.rules = staged;
         Ok(())
     }

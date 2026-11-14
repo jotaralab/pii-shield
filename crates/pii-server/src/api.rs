@@ -51,7 +51,7 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Response {
                 tracing::warn!(?err, "readyz: redis ping failed");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"status": "not_ready", "error": err.to_string()})),
+                    Json(json!({"status": "not_ready", "error": "redis unavailable"})),
                 )
                     .into_response()
             }
@@ -153,7 +153,23 @@ async fn perform_redact(state: &AppState, req: TextRequest) -> Response {
         return resp;
     }
 
-    let matches = state.scanner.scan(&req.text);
+    let mut vault = match build_vault(state, req.session_id.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "vault init failed");
+            return internal("vault initialization failed");
+        }
+    };
+
+    // Load prior session entries so tokens stay consistent across calls.
+    let session_id = req.session_id.as_deref().unwrap_or("_anon");
+    if state.store.is_some() {
+        if let Some(resp) = load_session(state, &mut vault, session_id).await {
+            return resp;
+        }
+    }
+
+    let (redacted_text, matches) = vault.redact_with_matches(&req.text);
     let mut counts: Vec<(pii_core::EntityType, u64)> = Vec::new();
     for m in &matches {
         match counts.iter_mut().find(|(t, _)| t == &m.entity_type) {
@@ -162,23 +178,8 @@ async fn perform_redact(state: &AppState, req: TextRequest) -> Response {
         }
     }
 
-    let mut vault = match build_vault(&state.cfg) {
-        Ok(v) => v,
-        Err(e) => return internal(&format!("vault init failed: {e}")),
-    };
-
-    // Load prior session entries so tokens stay consistent across calls.
-    let session_id = req.session_id.clone().unwrap_or_else(|| "_anon".into());
-    if state.store.is_some() && req.session_id.is_some() {
-        if let Some(resp) = load_session(state, &mut vault, &session_id).await {
-            return resp;
-        }
-    }
-
-    let redacted_text = vault.redact(&req.text);
-
-    if state.store.is_some() && req.session_id.is_some() {
-        if let Some(resp) = flush_session(state, &mut vault, &session_id).await {
+    if state.store.is_some() {
+        if let Some(resp) = flush_session(state, &mut vault, session_id).await {
             return resp;
         }
     }
@@ -197,14 +198,17 @@ async fn perform_rehydrate(state: &AppState, req: TextRequest) -> Response {
         return resp;
     }
 
-    let mut vault = match build_vault(&state.cfg) {
+    let mut vault = match build_vault(state, req.session_id.as_deref()) {
         Ok(v) => v,
-        Err(e) => return internal(&format!("vault init failed: {e}")),
+        Err(e) => {
+            tracing::error!(error = %e, "vault init failed");
+            return internal("vault initialization failed");
+        }
     };
 
-    let session_id = req.session_id.clone().unwrap_or_else(|| "_anon".into());
-    if state.store.is_some() && req.session_id.is_some() {
-        if let Some(resp) = load_session(state, &mut vault, &session_id).await {
+    let session_id = req.session_id.as_deref().unwrap_or("_anon");
+    if state.store.is_some() {
+        if let Some(resp) = load_session(state, &mut vault, session_id).await {
             return resp;
         }
     }
@@ -214,23 +218,29 @@ async fn perform_rehydrate(state: &AppState, req: TextRequest) -> Response {
     Json(json!({"text": text})).into_response()
 }
 
-/// Session IDs are used directly as store keys; reject anything dangerous.
+/// Session IDs are used directly as store keys; reject anything dangerous, and
+/// require `session_id` when Redis backing store is active so tokens are never
+/// emitted without being persisted.
 fn validate_session(state: &AppState, session_id: &Option<String>) -> Option<Response> {
-    if let Some(id) = session_id {
-        if id.is_empty()
-            || id.len() > 128
-            || id
-                .chars()
-                .any(|c| c == ':' || c.is_whitespace() || c.is_control())
-        {
+    match session_id {
+        Some(id) => {
+            if id.is_empty()
+                || id.len() > 128
+                || id
+                    .chars()
+                    .any(|c| c == ':' || c.is_whitespace() || c.is_control())
+            {
+                return Some(invalid_session(
+                    "session_id must be 1-128 chars without ':' or whitespace",
+                ));
+            }
+        }
+        None if state.store.is_some() => {
             return Some(invalid_session(
-                "session_id must be 1-128 chars without ':' or whitespace",
+                "session_id is required when PII_TOKEN_FORMAT=redis",
             ));
         }
-    }
-    if state.store.is_none() && session_id.is_some() {
-        // Session affinity is meaningless without shared state; accept but log.
-        tracing::debug!("session_id provided without a shared store; ignoring");
+        None => {}
     }
     None
 }
@@ -256,7 +266,8 @@ async fn load_session(
         entries.iter().map(|(t, v)| (t.as_str(), v.as_str())),
         session_id,
     ) {
-        return Some(internal(&format!("session import failed: {e:?}")));
+        tracing::warn!(?e, "session import failed");
+        return Some(internal("session load failed"));
     }
     None
 }
@@ -316,6 +327,13 @@ mod tests {
             redis_url: None,
             max_body_bytes: 1_048_576,
             log_format: crate::config::LogFormat::Json,
+            locales: vec![
+                "global".into(),
+                "id".into(),
+                "us".into(),
+                "eu".into(),
+                "sg".into(),
+            ],
         };
         AppState::build(cfg).unwrap()
     }

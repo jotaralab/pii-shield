@@ -1006,3 +1006,92 @@ fn test_child_exit_does_not_deadlock_while_host_stdin_open() {
         Err(_) => panic!("proxy deadlocked after child exit while host stdin stayed open"),
     }
 }
+
+#[test]
+fn test_child_process_does_not_inherit_session_key_or_redis_url() {
+    let proxy_bin = env!("CARGO_BIN_EXE_pii-mcp-proxy");
+
+    // Spawn `/usr/bin/env` (or `sh -c`) as child to verify sensitive env vars are scrubbed.
+    let output = Command::new(proxy_bin)
+        .env(
+            "PII_SHIELD_SESSION_KEY",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .env("PII_SEAL_KEY", "secret-seal-key")
+        .env("PII_REDIS_URL", "redis://:secret@127.0.0.1:6379")
+        .env("PII_SHIELD_STORE_KEY_PREFIX", "pii:custom")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg("env >&2")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run proxy with env inspection child");
+
+    let child_env = String::from_utf8_lossy(&output.stderr);
+    for forbidden in [
+        "PII_SHIELD_SESSION_KEY=",
+        "PII_SHIELD_VALKEY_URL=",
+        "PII_SHIELD_REDIS_URL=",
+        "PII_SHIELD_SESSION_ID=",
+        "PII_SHIELD_STORE_KEY_PREFIX=",
+        "PII_SEAL_KEY=",
+        "PII_REDIS_URL=",
+    ] {
+        assert!(
+            !child_env.contains(forbidden),
+            "child process must not inherit {}, got:\n{}",
+            forbidden,
+            child_env
+        );
+    }
+}
+
+#[test]
+fn test_env_keys_wired_in_main() {
+    let proxy_bin = env!("CARGO_BIN_EXE_pii-mcp-proxy");
+
+    // 1. Invalid PII_SHIELD_MAX_LINE_BYTES must be caught by fn main() (exit code 2).
+    let out_line = Command::new(proxy_bin)
+        .env("PII_SHIELD_MAX_LINE_BYTES", "not-a-number")
+        .arg("--")
+        .arg("/bin/true")
+        .output()
+        .expect("run proxy");
+    assert_eq!(out_line.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out_line.stderr).contains("PII_SHIELD_MAX_LINE_BYTES"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_line.stderr)
+    );
+
+    // 2. Empty PII_SHIELD_STORE_KEY_PREFIX must be caught by fn main() (exit code 2).
+    let out_prefix = Command::new(proxy_bin)
+        .env("PII_SHIELD_STORE_KEY_PREFIX", "   ")
+        .arg("--")
+        .arg("/bin/true")
+        .output()
+        .expect("run proxy");
+    assert_eq!(out_prefix.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out_prefix.stderr).contains("PII_SHIELD_STORE_KEY_PREFIX"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_prefix.stderr)
+    );
+
+    // 3. Invalid PII_SHIELD_STORE_TIMEOUT must be caught by fn main() (exit code 2).
+    let out_timeout = Command::new(proxy_bin)
+        .env("PII_SHIELD_STORE_TIMEOUT", "0")
+        .arg("--")
+        .arg("/bin/true")
+        .output()
+        .expect("run proxy");
+    assert_eq!(out_timeout.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out_timeout.stderr).contains("PII_SHIELD_STORE_TIMEOUT"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_timeout.stderr)
+    );
+}

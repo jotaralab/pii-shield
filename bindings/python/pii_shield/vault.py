@@ -125,20 +125,11 @@ class PiiSessionVault:
         self._handle = ptr
 
     # -- lifecycle --------------------------------------------------------------
-    def _require_handle(self) -> int:
-        self._lock.acquire()
-        try:
-            if self._handle is None:
-                raise ValueError("PiiSessionVault is closed")
-            return self._handle
-        finally:
-            self._lock.release()
-
     def close(self) -> None:
         with self._lock:
             handle, self._handle = self._handle, None
-        if handle:
-            self._lib.cdll.pii_vault_free(handle)
+            if handle:
+                self._lib.cdll.pii_vault_free(handle)
 
     def __enter__(self) -> "PiiSessionVault":
         return self
@@ -156,42 +147,55 @@ class PiiSessionVault:
     def set_token_format(self, fmt: TokenFormat) -> None:
         if isinstance(fmt, bool) or not isinstance(fmt, TokenFormat):
             fmt = TokenFormat(fmt)
-        handle = self._require_handle()
-        self._lib.cdll.pii_vault_set_token_format(handle, int(fmt))
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            self._lib.cdll.pii_vault_set_token_format(self._handle, int(fmt))
 
     def set_stateless_mode(self, enabled: bool) -> None:
-        handle = self._require_handle()
-        self._lib.cdll.pii_vault_set_stateless_mode(handle, bool(enabled))
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            self._lib.cdll.pii_vault_set_stateless_mode(self._handle, bool(enabled))
 
     def is_stateless_mode(self) -> bool:
         """Whether the vault is currently in stateless sealed-token mode."""
-        handle = self._require_handle()
-        return bool(self._lib.cdll.pii_vault_is_stateless_mode(handle))
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            return bool(self._lib.cdll.pii_vault_is_stateless_mode(self._handle))
 
     # -- redaction (write-locked) -------------------------------------------------
     def redact(self, text: str) -> str:
-        handle = self._require_handle()
-        ptr = self._lib.cdll.pii_vault_redact(handle, _encode_cstr(text, "text"))
-        if not ptr:
-            raise RuntimeError("pii-shield native call failed in redact")
-        return read_and_free(self._lib, ptr) or ""
+        encoded = _encode_cstr(text, "text")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            ptr = self._lib.cdll.pii_vault_redact(self._handle, encoded)
+            if not ptr:
+                raise RuntimeError("pii-shield native call failed in redact")
+            return read_and_free(self._lib, ptr) or ""
 
     def redact_json(self, payload: str) -> str:
-        handle = self._require_handle()
-        ptr = self._lib.cdll.pii_vault_redact_json(
-            handle, _encode_cstr(payload, "payload")
-        )
-        if not ptr:
-            raise RuntimeError("pii-shield native call failed in redact_json")
-        return read_and_free(self._lib, ptr) or ""
+        encoded = _encode_cstr(payload, "payload")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            ptr = self._lib.cdll.pii_vault_redact_json(self._handle, encoded)
+            if not ptr:
+                raise RuntimeError("pii-shield native call failed in redact_json")
+            return read_and_free(self._lib, ptr) or ""
 
     # -- rehydration (read-locked) -------------------------------------------------
     def rehydrate(self, text: str) -> str:
-        handle = self._require_handle()
-        ptr = self._lib.cdll.pii_vault_rehydrate(handle, _encode_cstr(text, "text"))
-        if not ptr:
-            raise RuntimeError("pii-shield native call failed in rehydrate")
-        return read_and_free(self._lib, ptr) or ""
+        encoded = _encode_cstr(text, "text")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            ptr = self._lib.cdll.pii_vault_rehydrate(self._handle, encoded)
+            if not ptr:
+                raise RuntimeError("pii-shield native call failed in rehydrate")
+            return read_and_free(self._lib, ptr) or ""
 
     def rehydrate_for_tool(self, payload: str, trusted: ToolTrustLevel | bool) -> str:
         """Rehydrate for a tool call, raising ``ExfiltrationBlockedError`` when
@@ -211,54 +215,68 @@ class PiiSessionVault:
             raise TypeError(
                 f"trusted must be a ToolTrustLevel or bool, got {type(trusted).__name__}"
             )
-        handle = self._require_handle()
-        err_ptr = _VOID_P(0)
-        ptr = self._lib.cdll.pii_vault_rehydrate_for_tool_ex(
-            handle, _encode_cstr(payload, "payload"), is_trusted, ctypes.byref(err_ptr)
-        )
-        if not ptr:
-            if err_ptr.value is not None:
-                token = read_and_free(self._lib, err_ptr.value)
-                if token is not None:
-                    raise ExfiltrationBlockedError(token)
-            raise RuntimeError("pii_vault_rehydrate_for_tool_ex failed")
-        return read_and_free(self._lib, ptr) or ""
+        encoded = _encode_cstr(payload, "payload")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            err_ptr = _VOID_P(0)
+            ptr = self._lib.cdll.pii_vault_rehydrate_for_tool_ex(
+                self._handle, encoded, is_trusted, ctypes.byref(err_ptr)
+            )
+            if not ptr:
+                if err_ptr.value is not None:
+                    token = read_and_free(self._lib, err_ptr.value)
+                    if token is not None:
+                        raise ExfiltrationBlockedError(token)
+                raise RuntimeError("pii_vault_rehydrate_for_tool_ex failed")
+            return read_and_free(self._lib, ptr) or ""
 
     # -- persistence -----------------------------------------------------------------
     def export_sealed_entries_json(self, aad: str) -> str:
-        handle = self._require_handle()
-        ptr = self._lib.cdll.pii_vault_export_sealed_entries_json(
-            handle, _encode_cstr(aad, "aad")
-        )
-        out = read_and_free(self._lib, ptr)
-        if out is None:
-            raise RuntimeError("pii-shield native call failed in export_sealed_entries_json")
-        return out
+        encoded = _encode_cstr(aad, "aad")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            ptr = self._lib.cdll.pii_vault_export_sealed_entries_json(
+                self._handle, encoded
+            )
+            out = read_and_free(self._lib, ptr)
+            if out is None:
+                raise RuntimeError(
+                    "pii-shield native call failed in export_sealed_entries_json"
+                )
+            return out
 
     def drain_dirty_sealed_entries_json(self, aad: str) -> str:
-        handle = self._require_handle()
-        ptr = self._lib.cdll.pii_vault_drain_dirty_sealed_entries_json(
-            handle, _encode_cstr(aad, "aad")
-        )
-        out = read_and_free(self._lib, ptr)
-        if out is None:
-            raise RuntimeError(
-                "pii-shield native call failed in drain_dirty_sealed_entries_json"
+        encoded = _encode_cstr(aad, "aad")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            ptr = self._lib.cdll.pii_vault_drain_dirty_sealed_entries_json(
+                self._handle, encoded
             )
-        return out
+            out = read_and_free(self._lib, ptr)
+            if out is None:
+                raise RuntimeError(
+                    "pii-shield native call failed in drain_dirty_sealed_entries_json"
+                )
+            return out
 
     def seal_dirty_sealed_entries_json(self, aad: str) -> str:
         """Two-phase sync, step 1: snapshot the dirty set without clearing it."""
-        handle = self._require_handle()
-        ptr = self._lib.cdll.pii_vault_seal_dirty_sealed_entries_json(
-            handle, _encode_cstr(aad, "aad")
-        )
-        out = read_and_free(self._lib, ptr)
-        if out is None:
-            raise RuntimeError(
-                "pii-shield native call failed in seal_dirty_sealed_entries_json"
+        encoded = _encode_cstr(aad, "aad")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            ptr = self._lib.cdll.pii_vault_seal_dirty_sealed_entries_json(
+                self._handle, encoded
             )
-        return out
+            out = read_and_free(self._lib, ptr)
+            if out is None:
+                raise RuntimeError(
+                    "pii-shield native call failed in seal_dirty_sealed_entries_json"
+                )
+            return out
 
     def clear_dirty_tokens(self, tokens: "list[str] | str") -> None:
         """Two-phase sync, step 2: clear the dirty tokens after a successful
@@ -268,38 +286,56 @@ class PiiSessionVault:
             import json
 
             tokens = json.dumps(list(tokens))
-        handle = self._require_handle()
-        ok = self._lib.cdll.pii_vault_clear_dirty_tokens(
-            handle, _encode_cstr(tokens, "tokens")
-        )
-        if not ok:
-            raise ValueError("Failed to clear dirty tokens (invalid JSON token array)")
+        encoded = _encode_cstr(tokens, "tokens")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            ok = self._lib.cdll.pii_vault_clear_dirty_tokens(self._handle, encoded)
+            if not ok:
+                raise ValueError(
+                    "Failed to clear dirty tokens (invalid JSON token array)"
+                )
 
     def import_sealed_entries_json(self, json_map: str, aad: str) -> None:
-        handle = self._require_handle()
-        ok = self._lib.cdll.pii_vault_import_sealed_entries_json(
-            handle,
-            _encode_cstr(json_map, "json_map"),
-            _encode_cstr(aad, "aad"),
-        )
-        if not ok:
-            raise ValueError("Failed to import sealed entries (corrupt JSON map or AAD mismatch)")
+        enc_map = _encode_cstr(json_map, "json_map")
+        enc_aad = _encode_cstr(aad, "aad")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            ok = self._lib.cdll.pii_vault_import_sealed_entries_json(
+                self._handle, enc_map, enc_aad
+            )
+            if not ok:
+                raise ValueError(
+                    "Failed to import sealed entries (corrupt JSON map or AAD mismatch)"
+                )
 
     def export_sealed_state(self, aad: str) -> str:
-        handle = self._require_handle()
-        ptr = self._lib.cdll.pii_vault_export_sealed_state(handle, _encode_cstr(aad, "aad"))
-        out = read_and_free(self._lib, ptr)
-        if out is None:
-            raise RuntimeError("pii-shield native call failed in export_sealed_state")
-        return out
+        encoded = _encode_cstr(aad, "aad")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            ptr = self._lib.cdll.pii_vault_export_sealed_state(self._handle, encoded)
+            out = read_and_free(self._lib, ptr)
+            if out is None:
+                raise RuntimeError(
+                    "pii-shield native call failed in export_sealed_state"
+                )
+            return out
 
     def import_sealed_state(self, sealed: str, aad: str) -> None:
-        handle = self._require_handle()
-        ok = self._lib.cdll.pii_vault_import_sealed_state(
-            handle, _encode_cstr(sealed, "sealed"), _encode_cstr(aad, "aad")
-        )
-        if not ok:
-            raise ValueError("Failed to import sealed state (corrupt blob or AAD mismatch)")
+        enc_sealed = _encode_cstr(sealed, "sealed")
+        enc_aad = _encode_cstr(aad, "aad")
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("PiiSessionVault is closed")
+            ok = self._lib.cdll.pii_vault_import_sealed_state(
+                self._handle, enc_sealed, enc_aad
+            )
+            if not ok:
+                raise ValueError(
+                    "Failed to import sealed state (corrupt blob or AAD mismatch)"
+                )
 
 
 class StreamingRehydrator:
@@ -316,8 +352,8 @@ class StreamingRehydrator:
     def close(self) -> None:
         with self._lock:
             handle, self._handle = self._handle, None
-        if handle:
-            self._lib.cdll.pii_stream_free(handle)
+            if handle:
+                self._lib.cdll.pii_stream_free(handle)
 
     def __enter__(self) -> "StreamingRehydrator":
         return self
@@ -331,30 +367,31 @@ class StreamingRehydrator:
         except Exception:
             pass
 
-    def _require_handles(
-        self, vault: PiiSessionVault
-    ) -> "tuple[int, int]":
+    def push_chunk(self, chunk: str, vault: PiiSessionVault) -> str:
+        encoded = _encode_cstr(chunk, "chunk")
         with self._lock:
             if self._handle is None:
                 raise ValueError("StreamingRehydrator is closed")
-            stream_handle = self._handle
-        vault_handle = vault._require_handle()
-        return stream_handle, vault_handle
-
-    def push_chunk(self, chunk: str, vault: PiiSessionVault) -> str:
-        stream_handle, vault_handle = self._require_handles(vault)
-        ptr = self._lib.cdll.pii_stream_push_chunk(
-            stream_handle, vault_handle, _encode_cstr(chunk, "chunk")
-        )
-        out = read_and_free(self._lib, ptr)
-        if out is None:
-            raise RuntimeError("pii-shield native call failed in push_chunk")
-        return out
+            with vault._lock:
+                if vault._handle is None:
+                    raise ValueError("PiiSessionVault is closed")
+                ptr = self._lib.cdll.pii_stream_push_chunk(
+                    self._handle, vault._handle, encoded
+                )
+                out = read_and_free(self._lib, ptr)
+                if out is None:
+                    raise RuntimeError("pii-shield native call failed in push_chunk")
+                return out
 
     def flush(self, vault: PiiSessionVault) -> str:
-        stream_handle, vault_handle = self._require_handles(vault)
-        ptr = self._lib.cdll.pii_stream_flush(stream_handle, vault_handle)
-        out = read_and_free(self._lib, ptr)
-        if out is None:
-            raise RuntimeError("pii-shield native call failed in flush")
-        return out
+        with self._lock:
+            if self._handle is None:
+                raise ValueError("StreamingRehydrator is closed")
+            with vault._lock:
+                if vault._handle is None:
+                    raise ValueError("PiiSessionVault is closed")
+                ptr = self._lib.cdll.pii_stream_flush(self._handle, vault._handle)
+                out = read_and_free(self._lib, ptr)
+                if out is None:
+                    raise RuntimeError("pii-shield native call failed in flush")
+                return out

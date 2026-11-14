@@ -26,8 +26,12 @@ spec:
         app.kubernetes.io/name: pii-shield
         app.kubernetes.io/component: sidecar-example
     spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35
       securityContext:
         runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -40,6 +44,8 @@ spec:
               value: "http://127.0.0.1:8080"
           securityContext:
             runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -58,6 +64,8 @@ spec:
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:

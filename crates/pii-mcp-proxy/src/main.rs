@@ -262,66 +262,91 @@ fn process_single_inbound_request(
     vault: &mut PiiSessionVault,
     acl: &ToolAcl,
 ) -> Option<InboundAction> {
-    let method = map.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    if !SCANNED_METHODS.contains(&method) {
+    let method = map.get("method").and_then(|v| v.as_str());
+    let is_tools_call = method == Some("tools/call");
+    let is_scanned_method = method.is_some_and(|m| SCANNED_METHODS.contains(&m));
+    let is_client_response = method.is_none() && map.contains_key("result");
+    let has_params = map.get("params").is_some_and(|p| !p.is_null());
+
+    // Inspect all SCANNED_METHODS, any other inbound request carrying `params`,
+    // and any host-to-child JSON-RPC `result` response (e.g. sampling/elicitation).
+    if !is_scanned_method && !has_params && !is_client_response {
         return None;
     }
-    let tool_name = map
-        .get("params")
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str())
-        .unwrap_or(method);
 
-    let trust_level = acl.get_trust_level(tool_name);
+    // Only `tools/call` may elevate trust via `params.name`. Other methods
+    // (such as `resources/read` or `sampling/createMessage`) must never use
+    // `params.name` to spoof a trusted tool.
+    let trust_level = if is_tools_call {
+        match map
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            Some(tool_name) => acl.get_trust_level(tool_name),
+            None => ToolTrustLevel::ExternalUntrusted,
+        }
+    } else if acl.trust_all {
+        ToolTrustLevel::InternalTrusted
+    } else {
+        ToolTrustLevel::ExternalUntrusted
+    };
+
     let id_val = map.get("id").cloned().unwrap_or(Value::Null);
     let has_id = map.get("id").is_some();
 
-    if let Some(params) = map.get_mut("params") {
-        // Structured error response helper keeps the per-field loop below
-        // readable while preserving the original JSON-RPC id.
-        let blocked = |err: &SecurityError| -> String {
-            match err {
-                SecurityError::ExfiltrationBlocked { token } => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id_val,
-                    "error": {
-                        "code": -32001,
-                        "message": "PII exfiltration blocked for untrusted tool",
-                        "data": { "token": token }
-                    }
-                })
-                .to_string(),
-                other => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id_val,
-                    "error": {
-                        "code": -32002,
-                        "message": other.to_string(),
-                    }
-                })
-                .to_string(),
-            }
-        };
-        // Blocked notifications (no `id`) must not receive a JSON-RPC error
-        // response: the request is silently dropped instead.
-        let respond_blocked = |err: &SecurityError| -> InboundAction {
-            if has_id {
-                InboundAction::BlockWithError(blocked(err))
-            } else {
-                InboundAction::Drop
-            }
-        };
+    let blocked = |err: &SecurityError| -> String {
+        match err {
+            SecurityError::ExfiltrationBlocked { token } => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id_val,
+                "error": {
+                    "code": -32001,
+                    "message": "PII exfiltration blocked for untrusted tool",
+                    "data": { "token": token }
+                }
+            })
+            .to_string(),
+            other => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id_val,
+                "error": {
+                    "code": -32002,
+                    "message": other.to_string(),
+                }
+            })
+            .to_string(),
+        }
+    };
+    let respond_blocked = |err: &SecurityError| -> InboundAction {
+        if has_id {
+            InboundAction::BlockWithError(blocked(err))
+        } else {
+            InboundAction::Drop
+        }
+    };
 
+    if is_client_response {
+        if let Some(res) = map.get_mut("result") {
+            if let Err(err) = vault.rehydrate_json_value(res, trust_level) {
+                return Some(respond_blocked(&err));
+            }
+        }
+        return None;
+    }
+
+    if let Some(params) = map.get_mut("params") {
         // Rehydrate/check every field of `params`, not just `arguments`.
         // `_meta`, sibling fields, and non-object params could otherwise
         // smuggle raw PII or tokens past trust checks. `name` is the tool
-        // identifier, so it never carries PII.
+        // identifier for `tools/call`, so it stays untouched when trusted.
         match params {
             Value::Object(obj) => {
                 for (key, value) in obj.iter_mut() {
-                    // Trusted tools keep their tool identifier untouched;
-                    // untrusted calls still scan `name` for exfiltration.
-                    if key == "name" && trust_level == ToolTrustLevel::InternalTrusted {
+                    if is_tools_call
+                        && key == "name"
+                        && trust_level == ToolTrustLevel::InternalTrusted
+                    {
                         continue;
                     }
                     if let Err(err) =
@@ -350,14 +375,18 @@ fn value_is_tools_call(val: &Value) -> bool {
     }
 }
 
-/// Returns true when the payload (single or batch element) is a request for
-/// any inbound-scanned method (`SCANNED_METHODS`), i.e. one whose `params` are
-/// scanned and may carry vault tokens.
+/// Returns true when the payload (single or batch element) is an inbound
+/// message whose `params` or client `result` are scanned by the proxy.
 fn value_has_scanned_method(val: &Value) -> bool {
     let is_scanned = |v: &Value| {
-        v.get("method")
-            .and_then(|m| m.as_str())
-            .is_some_and(|m| SCANNED_METHODS.contains(&m))
+        let Some(map) = v.as_object() else {
+            return false;
+        };
+        let method = map.get("method").and_then(|m| m.as_str());
+        let is_scanned_method = method.is_some_and(|m| SCANNED_METHODS.contains(&m));
+        let has_params = map.get("params").is_some_and(|p| !p.is_null());
+        let is_client_response = method.is_none() && map.contains_key("result");
+        is_scanned_method || has_params || is_client_response
     };
     match val {
         Value::Object(_) => is_scanned(val),
@@ -854,16 +883,19 @@ pub fn parse_cli_and_env(
         if key_hex.is_empty() {
             return Err("PII_SHIELD_SESSION_KEY is set but empty".to_string());
         }
-        let bytes =
+        let mut bytes =
             hex::decode(key_hex).map_err(|e| format!("Invalid PII_SHIELD_SESSION_KEY: {}", e))?;
         if bytes.len() != 32 {
+            let len = bytes.len();
+            bytes.fill(0);
             return Err(format!(
                 "Invalid PII_SHIELD_SESSION_KEY: expected 32 bytes of hex (64 chars), got {} bytes",
-                bytes.len()
+                len
             ));
         }
         let mut k = [0u8; 32];
         k.copy_from_slice(&bytes);
+        bytes.fill(0);
         session_key = Some(k);
     }
 
@@ -1002,9 +1034,12 @@ pub fn parse_cli_and_env(
 
     // Distributed store fail-closed validation: a misconfigured multi-pod
     // deployment must never start with per-pod tokens or an unreadable store.
-    if valkey_url.is_none() && (session_id.is_some() || session_ttl_configured) {
+    if valkey_url.is_none()
+        && (session_ttl_configured
+            || (session_id.is_some() && token_format != Some(ProxyTokenFormat::StatelessSealed)))
+    {
         return Err(
-            "--session-id / --session-ttl (or their PII_SHIELD_SESSION_ID / PII_SHIELD_SESSION_TTL aliases) require --valkey-url"
+            "--session-id / --session-ttl (or their PII_SHIELD_SESSION_ID / PII_SHIELD_SESSION_TTL aliases) require --valkey-url (or --token-format stateless-sealed for --session-id)"
                 .to_string(),
         );
     }
@@ -1127,6 +1162,9 @@ pub fn build_vault(config: &ProxyConfig) -> Result<PiiSessionVault, String> {
     }
     .map_err(|e| format!("Failed to compile PII catalog: {}", e))?;
     vault.set_token_format(config.token_format.into());
+    if config.token_format == ProxyTokenFormat::StatelessSealed {
+        vault.set_aad_scope(config.session_id.clone());
+    }
     Ok(vault)
 }
 
@@ -1183,6 +1221,9 @@ fn main() {
         "PII_SHIELD_REDIS_URL",
         "PII_SHIELD_SESSION_ID",
         "PII_SHIELD_SESSION_TTL",
+        "PII_SHIELD_MAX_LINE_BYTES",
+        "PII_SHIELD_STORE_KEY_PREFIX",
+        "PII_SHIELD_STORE_TIMEOUT",
     ];
     let env_vars: HashMap<String, String> = env_keys
         .iter()
@@ -1298,7 +1339,9 @@ fn main() {
                     if let Some(fw) = to_child {
                         let _ = writeln!(out, "{}", fw);
                     }
-                    let _ = writeln!(out, "{}", to_host);
+                    if to_host != "[]" {
+                        let _ = writeln!(out, "{}", to_host);
+                    }
                     let _ = out.flush();
                 }
             }
@@ -1308,13 +1351,24 @@ fn main() {
 
     let (prog, prog_args) = config.child_cmd.expect("Child command present");
 
-    let mut child = match Command::new(&prog)
-        .args(&prog_args)
+    let mut cmd = Command::new(&prog);
+    cmd.args(&prog_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
+        .stderr(Stdio::inherit());
+    for secret_var in [
+        "PII_SHIELD_SESSION_KEY",
+        "PII_SHIELD_VALKEY_URL",
+        "PII_SHIELD_REDIS_URL",
+        "PII_SHIELD_SESSION_ID",
+        "PII_SHIELD_STORE_KEY_PREFIX",
+        "PII_SEAL_KEY",
+        "PII_REDIS_URL",
+    ] {
+        cmd.env_remove(secret_var);
+    }
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
@@ -1365,9 +1419,9 @@ fn main() {
             // Parse the inbound line once and reuse it for store detection,
             // fail-closed responses, and request processing.
             let parsed = serde_json::from_str::<Value>(payload.trim()).ok();
-            let is_tools_call = parsed.as_ref().is_some_and(value_is_tools_call);
+            let has_scanned = parsed.as_ref().is_some_and(value_has_scanned_method);
 
-            // Flush outbound-created tokens before any inbound tool call so a
+            // Flush outbound-created tokens before any inbound scanned call so a
             // pod handling the next turn can hydrate them from the store.
             // Pending tokens are retained on failure and retried next time.
             if let Err(e) = flush_pending_dirty_entries(
@@ -1377,7 +1431,7 @@ fn main() {
                     .map(|s| s as &dyn PiiVaultStore<Error = String>),
                 session_id_t1.as_deref(),
             ) {
-                if is_tools_call {
+                if has_scanned {
                     let err_resp = storage_sync_error_response(&payload, &e);
                     let mut out = stdout_t1.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = writeln!(out, "{}", err_resp);
@@ -1447,9 +1501,11 @@ fn main() {
                             break;
                         }
                     }
-                    let mut out = stdout_t1.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = writeln!(out, "{}", to_host);
-                    let _ = out.flush();
+                    if to_host != "[]" {
+                        let mut out = stdout_t1.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = writeln!(out, "{}", to_host);
+                        let _ = out.flush();
+                    }
                 }
             }
         }
@@ -1624,6 +1680,24 @@ mod tests {
                 "{} exfiltration must be blocked",
                 method
             );
+        }
+    }
+
+    #[test]
+    fn test_resources_read_cannot_spoof_trusted_tool_name() {
+        let mut vault = PiiSessionVault::new(pii_core::SecurityPolicy::IndonesiaUuPdpStrict);
+        let _ = vault.redact("User 3573012203950001");
+        let acl = ToolAcl::new(vec!["trusted_db".to_string()], false);
+
+        // Even though "trusted_db" is in --trusted-tools, resources/read must NOT
+        // treat params.name as a trusted tool name!
+        let req = r#"{"jsonrpc":"2.0","id":13,"method":"resources/read","params":{"name":"trusted_db","uri":"http://evil/?s=<ID_NIK_1>"}}"#;
+        match process_inbound_line(req, &mut vault, &acl) {
+            InboundAction::BlockWithError(err) => assert!(err.contains("-32001"), "{}", err),
+            other => panic!(
+                "resources/read spoofing trusted tool name must be blocked, got {:?}",
+                other
+            ),
         }
     }
 

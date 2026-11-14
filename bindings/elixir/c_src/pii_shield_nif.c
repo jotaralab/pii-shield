@@ -283,8 +283,12 @@ static ERL_NIF_TERM vault_new_with_key_nif(ErlNifEnv *env, int argc,
                                            const ERL_NIF_TERM argv[]) {
     (void)argc;
     char locales[512];
-    if (!get_required_cstring(env, argv[0], locales, sizeof(locales))) {
-        return enif_make_badarg(env);
+    const char *locales_ptr = NULL;
+    if (!enif_is_identical(argv[0], atom_undefined)) {
+        if (!get_required_cstring(env, argv[0], locales, sizeof(locales))) {
+            return enif_make_badarg(env);
+        }
+        locales_ptr = locales;
     }
     ErlNifBinary key_bin;
     if (!enif_inspect_binary(env, argv[1], &key_bin) || key_bin.size != 32) {
@@ -293,7 +297,7 @@ static ERL_NIF_TERM vault_new_with_key_nif(ErlNifEnv *env, int argc,
     unsigned char key[32];
     memcpy(key, key_bin.data, 32);
 
-    PiiVaultHandle *vault = pii_vault_new_with_locales_and_key(locales, key, 32);
+    PiiVaultHandle *vault = pii_vault_new_with_locales_and_key(locales_ptr, key, 32);
     memset(key, 0, sizeof(key));
     if (vault == NULL) {
         return enif_make_tuple2(env, atom_error, atom_invalid_input);
@@ -305,8 +309,12 @@ static ERL_NIF_TERM vault_with_custom_toml_nif(ErlNifEnv *env, int argc,
                                                const ERL_NIF_TERM argv[]) {
     (void)argc;
     char locales[512];
-    if (!get_required_cstring(env, argv[0], locales, sizeof(locales))) {
-        return enif_make_badarg(env);
+    const char *locales_ptr = NULL;
+    if (!enif_is_identical(argv[0], atom_undefined)) {
+        if (!get_required_cstring(env, argv[0], locales, sizeof(locales))) {
+            return enif_make_badarg(env);
+        }
+        locales_ptr = locales;
     }
     char *toml = NULL;
     int trc = get_binary_cstring(env, argv[1], &toml);
@@ -328,7 +336,7 @@ static ERL_NIF_TERM vault_with_custom_toml_nif(ErlNifEnv *env, int argc,
         key_len = 32;
     }
 
-    PiiVaultHandle *vault = pii_vault_with_custom_toml(locales, toml, key_ptr, key_len);
+    PiiVaultHandle *vault = pii_vault_with_custom_toml(locales_ptr, toml, key_ptr, key_len);
     if (key_ptr != NULL) {
         memset(key_copy, 0, sizeof(key_copy));
     }
@@ -463,9 +471,11 @@ static ERL_NIF_TERM vault_rehydrate_for_tool_nif(ErlNifEnv *env, int argc,
             ERL_NIF_TERM token_bin;
             size_t tlen = strlen(err_out);
             unsigned char *tdata = enif_make_new_binary(env, tlen, &token_bin);
-            if (tdata != NULL) {
-                memcpy(tdata, err_out, tlen);
+            if (tdata == NULL) {
+                pii_string_free(err_out);
+                return enif_raise_exception(env, enif_make_atom(env, "out_of_memory"));
             }
+            memcpy(tdata, err_out, tlen);
             pii_string_free(err_out);
             return enif_make_tuple2(
                 env, atom_error,
@@ -617,20 +627,20 @@ static ErlNifFunc nif_funcs[] = {
     {"vault_new_with_locales", 1, vault_new_with_locales_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"vault_new_with_key", 2, vault_new_with_key_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"vault_with_custom_toml", 3, vault_with_custom_toml_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"vault_set_token_format", 2, vault_set_token_format_nif, 0},
-    {"vault_set_stateless_mode", 2, vault_set_stateless_mode_nif, 0},
-    {"vault_is_stateless_mode", 1, vault_is_stateless_mode_nif, 0},
+    {"vault_set_token_format", 2, vault_set_token_format_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"vault_set_stateless_mode", 2, vault_set_stateless_mode_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"vault_is_stateless_mode", 1, vault_is_stateless_mode_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"vault_redact", 2, vault_redact_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"vault_redact_json", 2, vault_redact_json_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"vault_rehydrate", 2, vault_rehydrate_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"vault_rehydrate_for_tool", 3, vault_rehydrate_for_tool_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"vault_export_sealed_entries_json", 2, vault_export_sealed_entries_json_nif, 0},
-    {"vault_drain_dirty_sealed_entries_json", 2, vault_drain_dirty_sealed_entries_json_nif, 0},
-    {"vault_seal_dirty_sealed_entries_json", 2, vault_seal_dirty_sealed_entries_json_nif, 0},
-    {"vault_clear_dirty_tokens", 2, vault_clear_dirty_tokens_nif, 0},
-    {"vault_import_sealed_entries_json", 3, vault_import_sealed_entries_json_nif, 0},
-    {"vault_export_sealed_state", 2, vault_export_sealed_state_nif, 0},
-    {"vault_import_sealed_state", 3, vault_import_sealed_state_nif, 0},
+    {"vault_export_sealed_entries_json", 2, vault_export_sealed_entries_json_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"vault_drain_dirty_sealed_entries_json", 2, vault_drain_dirty_sealed_entries_json_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"vault_seal_dirty_sealed_entries_json", 2, vault_seal_dirty_sealed_entries_json_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"vault_clear_dirty_tokens", 2, vault_clear_dirty_tokens_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"vault_import_sealed_entries_json", 3, vault_import_sealed_entries_json_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"vault_export_sealed_state", 2, vault_export_sealed_state_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"vault_import_sealed_state", 3, vault_import_sealed_state_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"stream_new", 0, stream_new_nif, 0},
     {"stream_push_chunk", 3, stream_push_chunk_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"stream_flush", 2, stream_flush_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},

@@ -207,44 +207,48 @@ module PiiShield
     end
 
     def handle
+      with_handle { |h| h }
+    end
+
+    def with_handle
       @mutex.synchronize do
         raise "vault closed" if @ptr.nil?
 
-        @ptr
+        yield @ptr
       end
     end
 
     def set_token_format(fmt)
       raise ArgumentError, "fmt must be an Integer in 0..2" unless fmt.is_a?(Integer) && (0..2).cover?(fmt)
 
-      FFILib.pii_vault_set_token_format(handle, fmt)
+      with_handle { |h| FFILib.pii_vault_set_token_format(h, fmt) }
       nil
     end
 
     def set_stateless_mode(enabled)
       raise ArgumentError, "enabled must be true or false" unless enabled == true || enabled == false
 
-      FFILib.pii_vault_set_stateless_mode(handle, enabled)
+      with_handle { |h| FFILib.pii_vault_set_stateless_mode(h, enabled) }
       nil
     end
 
     def is_stateless_mode?
-      FFILib.pii_vault_is_stateless_mode(handle)
+      with_handle { |h| FFILib.pii_vault_is_stateless_mode(h) }
     end
 
     def redact(text)
       PiiShield.validate_cstring!(text, "text")
-      result_or_fail(FFILib.take_string(FFILib.pii_vault_redact(handle, text)), "redact")
+      with_handle { |h| result_or_fail(FFILib.take_string(FFILib.pii_vault_redact(h, text)), "redact") }
     end
 
     def redact_json(payload)
       PiiShield.validate_cstring!(payload, "payload")
-      result_or_fail(FFILib.take_string(FFILib.pii_vault_redact_json(handle, payload)), "redact_json")
+      with_handle { |h| result_or_fail(FFILib.take_string(FFILib.pii_vault_redact_json(h, payload)), "redact_json") }
     end
 
     def rehydrate(text)
       PiiShield.validate_cstring!(text, "text")
-      result_or_fail(FFILib.take_string(FFILib.pii_vault_rehydrate(handle, text)), "rehydrate")
+      with_handle { |h| result_or_fail(FFILib.take_string(FFILib.pii_vault_rehydrate(h, text)), "rehydrate") }
     end
 
     # Rehydrates a tool-call payload. Only raises ExfiltrationBlockedError
@@ -255,47 +259,55 @@ module PiiShield
 
       PiiShield.validate_cstring!(payload, "payload")
       is_trusted = trusted == ToolTrustLevel::INTERNAL_TRUSTED
-      err_ptr = FFI::MemoryPointer.new(:pointer)
-      out = FFILib.pii_vault_rehydrate_for_tool_ex(handle, payload, is_trusted, err_ptr)
-      if out.null?
-        token_ptr = err_ptr.read_pointer
-        unless token_ptr.null?
-          token = FFILib.take_string(token_ptr)
-          raise ExfiltrationBlockedError.new(token) if token
+      with_handle do |h|
+        err_ptr = FFI::MemoryPointer.new(:pointer)
+        out = FFILib.pii_vault_rehydrate_for_tool_ex(h, payload, is_trusted, err_ptr)
+        if out.null?
+          token_ptr = err_ptr.read_pointer
+          unless token_ptr.null?
+            token = FFILib.take_string(token_ptr)
+            raise ExfiltrationBlockedError.new(token) if token
 
+            raise "native rehydrate_for_tool_ex call failed"
+          end
           raise "native rehydrate_for_tool_ex call failed"
         end
-        raise "native rehydrate_for_tool_ex call failed"
+        result_or_fail(FFILib.take_string(out), "rehydrate_for_tool")
+      ensure
+        err_ptr&.free
       end
-      result_or_fail(FFILib.take_string(out), "rehydrate_for_tool")
-    ensure
-      err_ptr&.free
     end
 
     def export_sealed_entries_json(aad)
       PiiShield.validate_cstring!(aad, "aad")
-      result_or_fail(
-        FFILib.take_string(FFILib.pii_vault_export_sealed_entries_json(handle, aad)),
-        "export_sealed_entries_json"
-      )
+      with_handle do |h|
+        result_or_fail(
+          FFILib.take_string(FFILib.pii_vault_export_sealed_entries_json(h, aad)),
+          "export_sealed_entries_json"
+        )
+      end
     end
 
     def drain_dirty_sealed_entries_json(aad)
       PiiShield.validate_cstring!(aad, "aad")
-      result_or_fail(
-        FFILib.take_string(FFILib.pii_vault_drain_dirty_sealed_entries_json(handle, aad)),
-        "drain_dirty_sealed_entries_json"
-      )
+      with_handle do |h|
+        result_or_fail(
+          FFILib.take_string(FFILib.pii_vault_drain_dirty_sealed_entries_json(h, aad)),
+          "drain_dirty_sealed_entries_json"
+        )
+      end
     end
 
     # Two-phase sync, step 1: snapshot the dirty entries without clearing
     # them (non-destructive counterpart of drain_dirty_sealed_entries_json).
     def seal_dirty_sealed_entries_json(aad)
       PiiShield.validate_cstring!(aad, "aad")
-      result_or_fail(
-        FFILib.take_string(FFILib.pii_vault_seal_dirty_sealed_entries_json(handle, aad)),
-        "seal_dirty_sealed_entries_json"
-      )
+      with_handle do |h|
+        result_or_fail(
+          FFILib.take_string(FFILib.pii_vault_seal_dirty_sealed_entries_json(h, aad)),
+          "seal_dirty_sealed_entries_json"
+        )
+      end
     end
 
     # Two-phase sync, step 2: clear the given tokens after a successful
@@ -303,25 +315,37 @@ module PiiShield
     # drain helpers, e.g. `["<ID_NIK_A1>"]`.
     def clear_dirty_tokens(tokens_json)
       PiiShield.validate_cstring!(tokens_json, "tokens_json")
-      raise ArgumentError, "failed to clear dirty tokens" unless FFILib.pii_vault_clear_dirty_tokens(handle, tokens_json)
+      with_handle do |h|
+        raise ArgumentError, "failed to clear dirty tokens" unless FFILib.pii_vault_clear_dirty_tokens(h, tokens_json)
+      end
 
       nil
     end
 
     def import_sealed_entries_json(json_map, aad)
-      raise ArgumentError, "failed to import sealed entries" unless FFILib.pii_vault_import_sealed_entries_json(handle, json_map, aad)
+      PiiShield.validate_cstring!(json_map, "json_map")
+      PiiShield.validate_cstring!(aad, "aad")
+      with_handle do |h|
+        raise ArgumentError, "failed to import sealed entries" unless FFILib.pii_vault_import_sealed_entries_json(h, json_map, aad)
+      end
     end
 
     def export_sealed_state(aad)
       PiiShield.validate_cstring!(aad, "aad")
-      result_or_fail(
-        FFILib.take_string(FFILib.pii_vault_export_sealed_state(handle, aad)),
-        "export_sealed_state"
-      )
+      with_handle do |h|
+        result_or_fail(
+          FFILib.take_string(FFILib.pii_vault_export_sealed_state(h, aad)),
+          "export_sealed_state"
+        )
+      end
     end
 
     def import_sealed_state(sealed, aad)
-      raise ArgumentError, "failed to import sealed state" unless FFILib.pii_vault_import_sealed_state(handle, sealed, aad)
+      PiiShield.validate_cstring!(sealed, "sealed")
+      PiiShield.validate_cstring!(aad, "aad")
+      with_handle do |h|
+        raise ArgumentError, "failed to import sealed state" unless FFILib.pii_vault_import_sealed_state(h, sealed, aad)
+      end
     end
 
     private
@@ -359,26 +383,38 @@ module PiiShield
     end
 
     def handle
+      with_handle { |h| h }
+    end
+
+    def with_handle
       @mutex.synchronize do
         raise "stream closed" if @ptr.nil?
 
-        @ptr
+        yield @ptr
       end
     end
 
     def push_chunk(chunk, vault)
       PiiShield.validate_cstring!(chunk, "chunk")
-      result_or_fail(
-        FFILib.take_string(FFILib.pii_stream_push_chunk(handle, vault.handle, chunk)),
-        "push_chunk"
-      )
+      with_handle do |sh|
+        vault.with_handle do |vh|
+          result_or_fail(
+            FFILib.take_string(FFILib.pii_stream_push_chunk(sh, vh, chunk)),
+            "push_chunk"
+          )
+        end
+      end
     end
 
     def flush(vault)
-      result_or_fail(
-        FFILib.take_string(FFILib.pii_stream_flush(handle, vault.handle)),
-        "flush"
-      )
+      with_handle do |sh|
+        vault.with_handle do |vh|
+          result_or_fail(
+            FFILib.take_string(FFILib.pii_stream_flush(sh, vh)),
+            "flush"
+          )
+        end
+      end
     end
 
     private

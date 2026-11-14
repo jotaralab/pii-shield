@@ -248,99 +248,46 @@ impl PiiScanner {
 
             let match_start = mat.start();
 
-            // Evaluate all compiled rules matching at this start position
-            let mut best_match: Option<(EntityMatch, i32)> = None;
+            let best_match = self.best_match_at(text, text_bytes, match_start, key_context);
 
-            for rule in &self.rules {
-                let anchored_input = Input::new(text)
-                    .span(match_start..text.len())
-                    .anchored(Anchored::Yes);
-
-                if let Some(r_mat) = rule.regex.find(anchored_input) {
-                    let slice = &text[r_mat.start()..r_mat.end()];
-
-                    // Stage 3 Checksum Verification
-                    if validate_by_name(&rule.validator, slice) {
-                        // Check ±48 bytes window safely on bytes for ASCII
-                        // context keywords. The window EXCLUDES the matched
-                        // span itself so a candidate can never satisfy its
-                        // own gateway keyword ("CF123..." cannot pass a rule
-                        // whose keyword is "cf").
-                        let win_start = match_start.saturating_sub(48);
-                        let win_end = (r_mat.end() + 48).min(text_bytes.len());
-
-                        let keyword_hit = key_context.is_some_and(|key| {
-                            rule.context_keywords
-                                .iter()
-                                .any(|kw| contains_key_fragment(key.as_bytes(), kw.as_bytes()))
-                        }) || {
-                            let left_hit = rule.context_keywords.iter().any(|kw| {
-                                contains_keyword_in(
-                                    text_bytes,
-                                    win_start,
-                                    match_start,
-                                    kw.as_bytes(),
-                                )
-                            });
-                            left_hit
-                                || rule.context_keywords.iter().any(|kw| {
-                                    contains_keyword_in(
-                                        text_bytes,
-                                        r_mat.end(),
-                                        win_end,
-                                        kw.as_bytes(),
-                                    )
-                                })
-                        };
-
-                        // Stage 2 hard gate: rules flagged require_context are
-                        // rejected outright when no context keyword is present
-                        // (prevents SKU/SHA false positives on low-entropy,
-                        // checksum-less patterns).
-                        if rule.require_context && !keyword_hit {
-                            continue;
-                        }
-
-                        // Stage 2: Context Keyword & Priority Scoring.
-                        // require_context rules do NOT earn the +25 bonus:
-                        // satisfying their keywords is the eligibility
-                        // precondition, not an extra signal — otherwise a
-                        // gated rule outscores stricter checksum rules after
-                        // a separator creates a word boundary (e.g. ES_DNI
-                        // "Y2345678-Z" truncated by gated US_CA_DL).
-                        let mut score = rule.priority as i32;
-                        if keyword_hit && !rule.require_context {
-                            score += 25;
-                        }
-
-                        // Specificity bonus: a valid longer span (the full
-                        // entity, incl. its separators) must outrank a shorter
-                        // prefix match, so length is weighted rather than used
-                        // as a 1-point tiebreaker.
-                        let span_len = (r_mat.end() - r_mat.start()) as i32;
-                        score += span_len * 2;
-
-                        let em = EntityMatch {
-                            entity_type: rule.entity_type.clone(),
-                            start: r_mat.start(),
-                            end: r_mat.end(),
-                        };
-
-                        if let Some((ref best_em, best_score)) = best_match {
-                            let best_len = (best_em.end - best_em.start) as i32;
-                            if score > best_score || (score == best_score && span_len > best_len) {
-                                best_match = Some((em, score));
-                            }
-                        } else {
-                            best_match = Some((em, score));
+            if let Some((winning, winning_score, winning_priority)) = best_match {
+                // Lookahead overlap resolution: if a higher-priority, higher-scoring
+                // rule starts inside `(match_start + 1)..winning.end` (e.g. a
+                // Credit Card or SSN starting after a false prefix match), advance
+                // to that interior start instead of truncating the higher-priority entity.
+                let mut inner_override: Option<usize> = None;
+                let mut probe_pos = match_start + 1;
+                while probe_pos < winning.end {
+                    while probe_pos < winning.end && !text.is_char_boundary(probe_pos) {
+                        probe_pos += 1;
+                    }
+                    if probe_pos >= winning.end {
+                        break;
+                    }
+                    let probe_input = Input::new(text).span(probe_pos..text.len());
+                    let Some(probe_mat) = self.multi_regex.find(probe_input) else {
+                        break;
+                    };
+                    if probe_mat.start() >= winning.end {
+                        break;
+                    }
+                    if let Some((_, inner_score, inner_priority)) =
+                        self.best_match_at(text, text_bytes, probe_mat.start(), key_context)
+                    {
+                        if inner_priority > winning_priority && inner_score > winning_score {
+                            inner_override = Some(probe_mat.start());
+                            break;
                         }
                     }
+                    probe_pos = probe_mat.start() + 1;
                 }
-            }
 
-            if let Some((winning, _)) = best_match {
-                pos = winning.end;
-                results.push(winning);
+                if let Some(next_start) = inner_override {
+                    pos = next_start;
+                } else {
+                    pos = winning.end;
+                    results.push(winning);
+                }
             } else {
                 // If no rule passed checksum at match_start, advance cursor to next char boundary
                 let mut next_pos = match_start + 1;
@@ -352,6 +299,96 @@ impl PiiScanner {
         }
 
         results
+    }
+
+    /// Evaluates all compiled rules anchored at `match_start` and returns the
+    /// highest-scoring valid match `(EntityMatch, score, priority)`, if any.
+    fn best_match_at(
+        &self,
+        text: &str,
+        text_bytes: &[u8],
+        match_start: usize,
+        key_context: Option<&str>,
+    ) -> Option<(EntityMatch, i32, i32)> {
+        let mut best_match: Option<(EntityMatch, i32, i32)> = None;
+
+        for rule in &self.rules {
+            let anchored_input = Input::new(text)
+                .span(match_start..text.len())
+                .anchored(Anchored::Yes);
+
+            if let Some(r_mat) = rule.regex.find(anchored_input) {
+                let slice = &text[r_mat.start()..r_mat.end()];
+
+                // Do not allow PHONE_ID to match a prefix immediately followed by `-[0-9]`.
+                if rule.entity_type.as_tag_prefix() == "PHONE_ID"
+                    && r_mat.end() + 1 < text_bytes.len()
+                    && text_bytes[r_mat.end()] == b'-'
+                    && text_bytes[r_mat.end() + 1].is_ascii_digit()
+                {
+                    continue;
+                }
+
+                // Stage 3 Checksum Verification
+                if validate_by_name(&rule.validator, slice) {
+                    let win_start = match_start.saturating_sub(48);
+                    let win_end = (r_mat.end() + 48).min(text_bytes.len());
+
+                    let keyword_hit = key_context.is_some_and(|key| {
+                        rule.context_keywords
+                            .iter()
+                            .any(|kw| contains_key_fragment(key.as_bytes(), kw.as_bytes()))
+                    }) || {
+                        let left_hit = rule.context_keywords.iter().any(|kw| {
+                            contains_keyword_in(text_bytes, win_start, match_start, kw.as_bytes())
+                        });
+                        left_hit
+                            || rule.context_keywords.iter().any(|kw| {
+                                contains_keyword_in(text_bytes, r_mat.end(), win_end, kw.as_bytes())
+                            })
+                    };
+
+                    if rule.require_context && !keyword_hit {
+                        continue;
+                    }
+
+                    // Contiguous 9-digit US_SSN (without dashes/spaces) has no mathematical
+                    // check digit, so require a context keyword when no separators are present.
+                    if rule.entity_type.as_tag_prefix() == "US_SSN"
+                        && (r_mat.end() - r_mat.start()) == 9
+                        && !keyword_hit
+                    {
+                        continue;
+                    }
+
+                    let priority = rule.priority as i32;
+                    let mut score = priority;
+                    if keyword_hit && !rule.require_context {
+                        score += 25;
+                    }
+
+                    let span_len = (r_mat.end() - r_mat.start()) as i32;
+                    score += span_len * 2;
+
+                    let em = EntityMatch {
+                        entity_type: rule.entity_type.clone(),
+                        start: r_mat.start(),
+                        end: r_mat.end(),
+                    };
+
+                    if let Some((ref best_em, best_score, _)) = best_match {
+                        let best_len = (best_em.end - best_em.start) as i32;
+                        if score > best_score || (score == best_score && span_len > best_len) {
+                            best_match = Some((em, score, priority));
+                        }
+                    } else {
+                        best_match = Some((em, score, priority));
+                    }
+                }
+            }
+        }
+
+        best_match
     }
 }
 

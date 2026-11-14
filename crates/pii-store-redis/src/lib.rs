@@ -177,16 +177,18 @@ impl RedisVaultStore {
         &self,
         op: impl Fn(&mut Connection) -> Result<T, RedisError>,
     ) -> Result<T, RedisStoreError> {
-        // Acquire: pop an idle connection or connect a fresh one.
-        let (mut conn, was_cached) = {
+        // Acquire: pop an idle connection under the lock, then drop the lock
+        // before establishing any fresh TCP/TLS/AUTH connection.
+        let cached = {
             let mut pool = self
                 .pool
                 .lock()
                 .map_err(|_| RedisStoreError::Configuration("connection mutex poisoned".into()))?;
-            match pool.pop() {
-                Some(c) => (c, true),
-                None => (self.connect()?, false),
-            }
+            pool.pop()
+        };
+        let (mut conn, was_cached) = match cached {
+            Some(c) => (c, true),
+            None => (self.connect()?, false),
         };
 
         let first = op(&mut conn);
@@ -408,5 +410,54 @@ mod tests {
         // Prefixes are trimmed before use.
         let ok = RedisVaultStore::new("redis://127.0.0.1:1", " pii ", 60, DEFAULT_TIMEOUT).unwrap();
         assert_eq!(ok.session_key("s"), "pii:s");
+    }
+
+    #[test]
+    fn test_pool_mutex_dropped_before_connect() {
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        // Bind a TCP listener that accepts one connection and stalls without replying.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow listener");
+        let addr = listener.local_addr().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let accept_thread = std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            }
+        });
+
+        let store = Arc::new(
+            RedisVaultStore::new(
+                &format!("redis://127.0.0.1:{}", addr.port()),
+                "pii:v1",
+                60,
+                Duration::from_millis(250),
+            )
+            .unwrap(),
+        );
+
+        let store_bg = Arc::clone(&store);
+        let bg = std::thread::spawn(move || {
+            let _ = store_bg.get_entries("stalled-session");
+        });
+
+        // Wait until the slow listener has accepted the TCP socket inside `connect()` / command execution.
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("background thread must reach slow listener");
+
+        // While the background thread is blocked in network I/O, `store.pool` must NOT be locked.
+        let lock_acquired = store.pool.try_lock().is_ok();
+        let _ = release_tx.send(());
+        let _ = bg.join();
+        let _ = accept_thread.join();
+        assert!(
+            lock_acquired,
+            "pool mutex must not be held across network connect/command I/O"
+        );
     }
 }

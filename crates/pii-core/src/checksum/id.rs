@@ -158,18 +158,55 @@ pub fn validate_indonesian_phone(input: &str) -> bool {
 
     let mut digits = [0u8; 16];
     let mut count = 0usize;
+    let mut saw_space = false;
+    let mut saw_hyphen = false;
+    let mut prev_sep = false;
 
-    for &b in bytes {
-        if b == b'+' || b == b'-' || b == b' ' {
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b == b'+' {
+            if idx != 0 || prev_sep {
+                return false;
+            }
+            continue;
+        }
+        if b == b' ' || b == b'-' {
+            if prev_sep || count == 0 {
+                return false;
+            }
+            if b == b' ' {
+                saw_space = true;
+            } else {
+                saw_hyphen = true;
+            }
+            // Reject mixed space+hyphen separators (e.g. "02 4532-0151" or "03-12-2026 10").
+            if saw_space && saw_hyphen {
+                return false;
+            }
+            // Reject invalid separator placement in the trunk/area-code prefix:
+            // - Leading '0' numbers must have at least 2 area/mobile digits after '0'
+            //   before any separator (rejects "0-21...", "02-4532-0151", "03-12-2026").
+            // - Leading '62' / '+62' numbers may have a separator after '62' (count == 2),
+            //   but not at count == 1 ("+6-2...") or count == 3 ("+62 2-4532...").
+            if digits[0] == 0 && count <= 2 {
+                return false;
+            }
+            if digits[0] == 6 && (count == 1 || count == 3) {
+                return false;
+            }
+            prev_sep = true;
             continue;
         }
         if !b.is_ascii_digit() {
             return false;
         }
+        prev_sep = false;
         if count < 16 {
             digits[count] = b - b'0';
         }
         count += 1;
+    }
+    if prev_sep {
+        return false;
     }
 
     if !(9..=15).contains(&count) {

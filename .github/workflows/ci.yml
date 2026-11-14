@@ -23,23 +23,25 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run Unit Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - name: Run Documentation Tests
-        run: cargo test --doc
+        run: cargo test --doc --locked
       - name: Build Documentation
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
       - name: Run Benchmark Smoke Suite
-        run: cargo test --workspace --benches
+        run: cargo test --workspace --benches --locked
       - name: Verify Wasm Compilation
-        run: cargo check -p pii-wasm --target wasm32-unknown-unknown
+        run: cargo check -p pii-wasm --target wasm32-unknown-unknown --locked
       - name: Run Foreign-Language C-ABI & Python E2E Tests
         run: |
-          cargo build -p pii-ffi
+          cargo build -p pii-ffi --locked
           python3 tests/ffi_python_e2e.py
           gcc -Wall -Wextra -Werror tests/c_abi_e2e.c -Ltarget/debug -lpii_ffi -Icrates/pii-ffi/include -Wl,-rpath,'$ORIGIN/target/debug',-rpath,$PWD/target/debug -o /tmp/c_abi_test
           /tmp/c_abi_test
+      - name: Verify Dockerfile Build
+        run: docker build -t pii-shield:ci .
       - name: Run Python SDK Unit Tests
         run: python3 -m unittest discover -s bindings/python/tests -v
       - name: Run Go SDK Tests

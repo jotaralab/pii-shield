@@ -17,29 +17,35 @@ COPY crates/pii-server/Cargo.toml   crates/pii-server/Cargo.toml
 
 # Stub sources so `cargo build` can link the workspace and populate the
 # dependency cache without compiling project code.
-RUN mkdir -p src && \
-    for crate in pii-core pii-wasm pii-ffi pii-mcp-proxy pii-store-redis pii-server; do \
+RUN for crate in pii-core pii-wasm pii-ffi pii-store-redis pii-server; do \
       mkdir -p crates/$crate/src && \
       echo "" > crates/$crate/src/lib.rs; \
     done && \
+    mkdir -p crates/pii-mcp-proxy/src/bin && \
     echo "fn main() {}" > crates/pii-mcp-proxy/src/main.rs && \
+    echo "fn main() {}" > crates/pii-mcp-proxy/src/bin/mock_mcp_server.rs && \
     echo "fn main() {}" > crates/pii-server/src/main.rs && \
     mkdir -p crates/pii-core/benches && \
     echo "fn main() {}" > crates/pii-core/benches/scanner_bench.rs
 
-RUN cargo build --release -p pii-server
+RUN cargo build --release --locked -p pii-server
 
-# Copy the real sources (invalidates the stub cache from here on).
+# Copy the real sources and clear stub fingerprints so Cargo always recompiles
+# workspace crates regardless of host file mtimes.
 COPY crates/ crates/
 
-RUN cargo build --release --bin pii-server && \
+RUN rm -rf target/release/.fingerprint/pii-* \
+           target/release/deps/libpii_* \
+           target/release/deps/pii_* \
+           target/release/pii-server && \
+    cargo build --release --locked --bin pii-server && \
     strip target/release/pii-server
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /app/target/release/pii-server /usr/local/bin/pii-server
 
-USER nonroot
+USER 65532:65532
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/pii-server"]

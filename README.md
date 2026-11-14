@@ -64,6 +64,7 @@
 - **`crates/pii-ffi`**: C-ABI (`cbindgen`) thread-safe exports for zero-overhead embedding in Go, C/C++, Ruby, Elixir, and Python.
 - **`crates/pii-mcp-proxy`**: Fail-closed bidirectional STDIO wrapper for Model Context Protocol (MCP) servers that automatically rehydrates tool arguments and scrubs tool outputs.
 - **`crates/pii-store-redis`**: Valkey / Redis backed `PiiVaultStore` adapter for distributed multi-pod sessions (atomic `MULTI`/`HSET`/`EXPIRE`/`EXEC` writes and per-session TTLs).
+- **`crates/pii-server`**: Production HTTP/JSON & MCP JSON-RPC sidecar server (`axum`) with `/v1/redact`, `/v1/rehydrate`, `/mcp`, Prometheus `/metrics`, `/healthz`, `/readyz`, and graceful `SIGTERM`/`SIGINT` shutdown.
 
 ---
 
@@ -235,10 +236,15 @@ pii-mcp-proxy \
     --trusted-tools query_db \
     -- npx .../server
 
-PII_SHIELD_VALKEY_URL=   # env alias (`PII_SHIELD_REDIS_URL` also accepted)
-PII_SHIELD_SESSION_ID=   # env alias for --session-id
-PII_SHIELD_SESSION_TTL=  # env alias for --session-ttl (default 3600s)
+PII_SHIELD_VALKEY_URL=          # env alias (`PII_SHIELD_REDIS_URL` / `PII_REDIS_URL` also accepted)
+PII_SHIELD_SESSION_ID=          # env alias for --session-id
+PII_SHIELD_SESSION_TTL=         # env alias for --session-ttl (default 3600s)
+PII_SHIELD_STORE_KEY_PREFIX=    # env alias for --store-key-prefix (default "pii:v1")
+PII_SHIELD_STORE_TIMEOUT=       # env alias for --store-timeout in ms (default 2000ms)
+PII_SHIELD_MAX_LINE_BYTES=      # env alias for --max-line-bytes (default 10485760)
 ```
+
+`pii-server` accepts both `PII_*` and unified `PII_SHIELD_*` environment variables (`PII_SEAL_KEY` / `PII_SHIELD_SESSION_KEY`, `PII_REDIS_URL` / `PII_SHIELD_REDIS_URL` / `PII_SHIELD_VALKEY_URL`, `PII_TOKEN_FORMAT` / `PII_SHIELD_TOKEN_FORMAT`, `PII_LOCALES` defaulting to `global,id,us,eu,sg`, `PII_MAX_BODY_BYTES`, `PII_BIND_ADDR`, `PII_LOG_FORMAT`).
 
 Distributed mode fails closed (exit `2`) unless a non-empty `--session-id` and
 a 32-byte `PII_SHIELD_SESSION_KEY` are set. Tokens default to `compact-hash`;
@@ -251,10 +257,7 @@ failures return JSON-RPC `-32003`, and outbound writes release the vault lock
 during network I/O with dirty tokens retained and retried before the next
 inbound call and on child EOF when the store is unavailable.
 
-> **TLS:** `rediss://` URLs require a TLS feature on the `redis` crate. The
-> dependency is currently built with `default-features = false` (no TLS), so use
-> a trusted private network or enable a TLS feature in `crates/pii-store-redis`
-> before configuring `rediss://`.
+> **TLS:** `rediss://` URLs are supported out of the box via `redis` with the `tls-rustls` feature enabled. Use `rediss://` in production deployments when connecting over untrusted networks.
 
 Run `pii-mcp-proxy --help` / `--version` for the full CLI reference.
 

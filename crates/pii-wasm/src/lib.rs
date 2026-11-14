@@ -67,30 +67,9 @@ impl WasmPiiSession {
     /// Builds a vault from custom TOML rules, optionally with a 32-byte key.
     #[wasm_bindgen(js_name = withCustomToml)]
     pub fn with_custom_toml(toml: &str, key: Option<Vec<u8>>) -> Result<WasmPiiSession, JsError> {
-        let mut catalog = PiiCatalog::new();
-        catalog
-            .merge_toml_str(toml)
-            .map_err(|e| JsError::new(&format!("Invalid TOML rules: {}", e)))?;
-        match key {
-            Some(key) => {
-                if key.len() != 32 {
-                    return Err(JsError::new("Session key must be exactly 32 bytes"));
-                }
-                // Zeroize the heap buffer once the key bytes are copied out.
-                let key = Zeroizing::new(key);
-                let key_arr = Zeroizing::new({
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(&key);
-                    k
-                });
-                PiiSessionVault::try_from_catalog_with_key(catalog, *key_arr)
-                    .map_err(|e| JsError::new(&format!("Failed to compile PII catalog: {}", e)))
-                    .map(|inner| Self { inner })
-            }
-            None => PiiSessionVault::try_from_catalog(catalog)
-                .map_err(|e| JsError::new(&format!("Failed to compile PII catalog: {}", e)))
-                .map(|inner| Self { inner }),
-        }
+        build_custom_toml_vault(toml, key)
+            .map(|inner| Self { inner })
+            .map_err(|msg| JsError::new(&msg))
     }
 
     #[wasm_bindgen(js_name = setStatelessMode)]
@@ -225,5 +204,54 @@ impl WasmStreamingRehydrator {
     #[wasm_bindgen]
     pub fn flush(&mut self, session: &WasmPiiSession) -> String {
         self.inner.flush(&session.inner)
+    }
+}
+
+fn build_custom_toml_vault(toml: &str, key: Option<Vec<u8>>) -> Result<PiiSessionVault, String> {
+    let key = key.map(Zeroizing::new);
+    let mut catalog = PiiCatalog::new();
+    catalog
+        .merge_toml_str(toml)
+        .map_err(|e| format!("Invalid TOML rules: {}", e))?;
+    if catalog.rules.is_empty() {
+        return Err("Catalog Error: catalog contains zero rules (fail-closed)".to_string());
+    }
+    match key {
+        Some(key) => {
+            if key.len() != 32 {
+                return Err("Session key must be exactly 32 bytes".to_string());
+            }
+            let key_arr = Zeroizing::new({
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&key);
+                k
+            });
+            PiiSessionVault::try_from_catalog_with_key(catalog, *key_arr)
+                .map_err(|e| format!("Failed to compile PII catalog: {}", e))
+        }
+        None => PiiSessionVault::try_from_catalog(catalog)
+            .map_err(|e| format!("Failed to compile PII catalog: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_with_custom_toml_rejects_zero_rules() {
+        let empty_rules_toml = r#"
+locale = "custom"
+name = "Empty Custom Catalog"
+rules = []
+"#;
+        let err = match build_custom_toml_vault(empty_rules_toml, None) {
+            Ok(_) => panic!("zero-rule TOML catalog must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("zero rules"),
+            "expected zero-rules error message, got: {err}"
+        );
     }
 }

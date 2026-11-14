@@ -12,4 +12,4 @@ test-support = []
 
 [dependencies]
 pii-core = { path = "../pii-core", version = "0.1.0" }
-redis = { version = "0.27", default-features = false, features = ["acl", "tls-rustls"] }
+redis = { workspace = true }

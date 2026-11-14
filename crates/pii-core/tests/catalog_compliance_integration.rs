@@ -339,3 +339,27 @@ fn test_vault_roundtrip_and_json_key_context() {
         serde_json::from_str::<serde_json::Value>(raw_json).expect("valid raw JSON")
     );
 }
+
+#[test]
+fn test_rule_regex_alignment_and_prefix_overlap_resolution() {
+    let catalog = PiiCatalog::with_locales(&["global", "id", "us", "eu", "sg"]).unwrap();
+    let mut vault = pii_core::PiiSessionVault::from_catalog_with_key(catalog, [0x42u8; 32]);
+
+    // PHONE_ID must not truncate a hyphenated Credit Card starting with "02 ..." or "Phone: 02-..."
+    assert_eq!(
+        vault.redact("Item 02 4532-0151-1283-0366"),
+        "Item 02 <CREDIT_CARD_1>"
+    );
+    assert_eq!(
+        vault.redact("Phone: 02-4532-0151-1283-0366"),
+        "Phone: 02-<CREDIT_CARD_1>"
+    );
+
+    // Spaced IBAN, Amex 4-6-5, Finnish 3-digit CC phone, French multi-group phone, and SSN variants
+    assert_eq!(vault.redact("DE89 3704 0044 0532 0130 00"), "<IBAN_1>");
+    assert_eq!(vault.redact("3782-822463-10005"), "<CREDIT_CARD_2>");
+    assert_eq!(vault.redact("+358 9 1234567"), "<PHONE_EU_1>");
+    assert_eq!(vault.redact("+33 1 42 68 55 00"), "<PHONE_EU_2>");
+    assert_eq!(vault.redact("123 45 6789"), "<US_SSN_1>");
+    assert_eq!(vault.redact("SSN: 123456789"), "SSN: <US_SSN_2>");
+}
