@@ -149,8 +149,7 @@ impl RedisVaultStore {
                 .any(|c| c.is_whitespace() || c.is_control());
         if invalid {
             return Err(RedisStoreError::Configuration(
-                "session id must not contain ':', whitespace, or control characters"
-                    .to_string(),
+                "session id must not contain ':', whitespace, or control characters".to_string(),
             ));
         }
         Ok(())

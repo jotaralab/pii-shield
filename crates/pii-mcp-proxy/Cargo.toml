@@ -11,11 +11,11 @@ name = "pii-mcp-proxy"
 path = "src/main.rs"
 
 [dependencies]
-pii-core = { path = "../pii-core" }
-pii-store-redis = { path = "../pii-store-redis" }
+pii-core = { path = "../pii-core", version = "0.1.0" }
+pii-store-redis = { path = "../pii-store-redis", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
-pii-store-redis = { path = "../pii-store-redis", features = ["test-support"] }
+pii-store-redis = { path = "../pii-store-redis", version = "0.1.0", features = ["test-support"] }

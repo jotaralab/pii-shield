@@ -87,8 +87,7 @@ fn main() {
         match val {
             // JSON-RPC batch: one response element per request element.
             Value::Array(batch) => {
-                let responses: Vec<Value> =
-                    batch.iter().filter_map(respond_to_request).collect();
+                let responses: Vec<Value> = batch.iter().filter_map(respond_to_request).collect();
                 if !responses.is_empty() {
                     let _ = writeln!(stdout, "{}", Value::Array(responses));
                     let _ = stdout.flush();

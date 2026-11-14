@@ -90,10 +90,7 @@ pub fn read_line_bounded<R: BufRead>(
                     reader.consume(take);
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "line exceeds --max-line-bytes ({} bytes)",
-                            max_bytes
-                        ),
+                        format!("line exceeds --max-line-bytes ({} bytes)", max_bytes),
                     ));
                 }
                 buf.extend_from_slice(&available[..take]);
@@ -118,10 +115,7 @@ pub fn read_line_bounded<R: BufRead>(
                     let _ = discard_through_newline(reader)?;
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "line exceeds --max-line-bytes ({} bytes)",
-                            max_bytes
-                        ),
+                        format!("line exceeds --max-line-bytes ({} bytes)", max_bytes),
                     ));
                 }
                 buf.extend_from_slice(available);
@@ -201,25 +195,23 @@ fn process_inbound_value(
             let mut to_host: Vec<Value> = Vec::with_capacity(arr.len());
             for elem in arr {
                 match elem {
-                    Value::Object(map) => {
-                        match process_single_inbound_request(map, vault, acl) {
-                            Some(InboundAction::Drop) => {
-                                any_blocked = true;
-                            }
-                            Some(InboundAction::BlockWithError(err)) => {
-                                any_blocked = true;
-                                match serde_json::from_str::<Value>(&err) {
-                                    Ok(err_val) => to_host.push(err_val),
-                                    Err(_) => to_host.push(elem.take()),
-                                }
-                            }
-                            Some(InboundAction::BlockParseError) => {
-                                any_blocked = true;
-                                to_host.push(parse_error_response(&Value::Null));
-                            }
-                            _ => to_child.push(elem.take()),
+                    Value::Object(map) => match process_single_inbound_request(map, vault, acl) {
+                        Some(InboundAction::Drop) => {
+                            any_blocked = true;
                         }
-                    }
+                        Some(InboundAction::BlockWithError(err)) => {
+                            any_blocked = true;
+                            match serde_json::from_str::<Value>(&err) {
+                                Ok(err_val) => to_host.push(err_val),
+                                Err(_) => to_host.push(elem.take()),
+                            }
+                        }
+                        Some(InboundAction::BlockParseError) => {
+                            any_blocked = true;
+                            to_host.push(parse_error_response(&Value::Null));
+                        }
+                        _ => to_child.push(elem.take()),
+                    },
                     other => to_child.push(other.take()),
                 }
             }
@@ -227,15 +219,11 @@ fn process_inbound_value(
                 // Error responses must go to the host (stdout), not the child;
                 // allowed elements still reach the child so a mixed batch is
                 // split across both channels.
-                let to_host =
-                    serde_json::to_string(&to_host).unwrap_or_else(|_| "[]".to_string());
+                let to_host = serde_json::to_string(&to_host).unwrap_or_else(|_| "[]".to_string());
                 let to_child = if to_child.is_empty() {
                     None
                 } else {
-                    Some(
-                        serde_json::to_string(&to_child)
-                            .unwrap_or_else(|_| "[]".to_string()),
-                    )
+                    Some(serde_json::to_string(&to_child).unwrap_or_else(|_| "[]".to_string()))
                 };
                 return InboundAction::BatchSplit { to_child, to_host };
             }
@@ -810,9 +798,10 @@ pub fn parse_cli_and_env(
             }
             "--max-line-bytes" => {
                 let raw = next_value(args, i)?;
-                let n: usize = raw.trim().parse().map_err(|_| {
-                    format!("Invalid --max-line-bytes '{}': expected bytes", raw)
-                })?;
+                let n: usize = raw
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("Invalid --max-line-bytes '{}': expected bytes", raw))?;
                 if n == 0 {
                     return Err("--max-line-bytes must be greater than zero".to_string());
                 }
@@ -954,8 +943,10 @@ pub fn parse_cli_and_env(
     let session_ttl_configured = session_ttl.is_some();
     let session_ttl = session_ttl.unwrap_or(3600);
     let max_line_bytes = max_line_bytes.unwrap_or(DEFAULT_MAX_LINE_BYTES);
-    let store_key_prefix = store_key_prefix.unwrap_or_else(|| ProxyStore::default_key_prefix().to_string());
-    let store_timeout = Duration::from_millis(store_timeout_ms.unwrap_or(ProxyStore::default_timeout_millis()));
+    let store_key_prefix =
+        store_key_prefix.unwrap_or_else(|| ProxyStore::default_key_prefix().to_string());
+    let store_timeout =
+        Duration::from_millis(store_timeout_ms.unwrap_or(ProxyStore::default_timeout_millis()));
 
     // Env / CLI token format resolution
     if token_format.is_none() {
@@ -1700,16 +1691,28 @@ mod tests {
         assert_eq!(child_val.as_array().expect("array").len(), 1);
         let val: Value = serde_json::from_str(&to_host).expect("valid JSON array");
         let arr = val.as_array().expect("array response");
-        assert!(arr.is_empty(), "blocked notification produces no host response");
+        assert!(
+            arr.is_empty(),
+            "blocked notification produces no host response"
+        );
     }
 
     #[test]
     fn test_next_value_accepts_dash_prefixed_non_flag_values() {
-        let env = test_env(&[("PII_SHIELD_SESSION_KEY", "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb")]);
-        let args: Vec<String> = ["pii-mcp-proxy", "--rules-file", "-weird-name.toml", "--token-format", "stateless-sealed"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let env = test_env(&[(
+            "PII_SHIELD_SESSION_KEY",
+            "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb",
+        )]);
+        let args: Vec<String> = [
+            "pii-mcp-proxy",
+            "--rules-file",
+            "-weird-name.toml",
+            "--token-format",
+            "stateless-sealed",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         // Should parse the value rather than erroring on the leading '-'.
         let result = parse_cli_and_env(&args, &env);
         match result {
@@ -1723,7 +1726,10 @@ mod tests {
 
     #[test]
     fn test_max_line_bytes_config() {
-        let env = test_env(&[("PII_SHIELD_SESSION_KEY", "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb")]);
+        let env = test_env(&[(
+            "PII_SHIELD_SESSION_KEY",
+            "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb",
+        )]);
         let args: Vec<String> = [
             "pii-mcp-proxy",
             "--max-line-bytes",
@@ -1742,15 +1748,20 @@ mod tests {
         }
 
         // Env alias.
-        let mut env = test_env(&[("PII_SHIELD_SESSION_KEY", "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb")]);
-        env.insert(
-            "PII_SHIELD_MAX_LINE_BYTES".to_string(),
-            "4096".to_string(),
-        );
-        let args: Vec<String> = ["pii-mcp-proxy", "--stdio-filter", "--token-format", "stateless-sealed"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let mut env = test_env(&[(
+            "PII_SHIELD_SESSION_KEY",
+            "0123456789abcdeffedcba9876543210feedface00112233445566778899aabb",
+        )]);
+        env.insert("PII_SHIELD_MAX_LINE_BYTES".to_string(), "4096".to_string());
+        let args: Vec<String> = [
+            "pii-mcp-proxy",
+            "--stdio-filter",
+            "--token-format",
+            "stateless-sealed",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         match parse_cli_and_env(&args, &env).expect("valid config") {
             ProxyAction::Run(cfg) => assert_eq!(cfg.max_line_bytes, 4096),
             _ => panic!("expected Run"),

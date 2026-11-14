@@ -10,7 +10,7 @@ description = "C-ABI FFI bindings for embedding pii-shield in Go, C, Ruby, and E
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-pii-core = { path = "../pii-core" }
+pii-core = { path = "../pii-core", version = "0.1.0" }
 serde_json.workspace = true
 getrandom.workspace = true
 toml.workspace = true

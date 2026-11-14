@@ -141,7 +141,7 @@ pub fn validate_indonesian_npwp(input: &str) -> bool {
         return false;
     }
 
-    true
+    branch <= 999
 }
 
 /// Validates Indonesian mobile and landline phone numbers.

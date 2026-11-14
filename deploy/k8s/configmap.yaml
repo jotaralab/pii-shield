@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pii-server-config
+  namespace: pii-shield
+  labels:
+    app.kubernetes.io/name: pii-shield
+data:
+  PII_BIND_ADDR: "0.0.0.0:8080"
+  PII_TOKEN_FORMAT: "stateless-sealed"
+  PII_LOG_FORMAT: "json"
