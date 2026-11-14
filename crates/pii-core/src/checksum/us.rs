@@ -49,7 +49,7 @@ pub fn validate_us_ssn(input: &str) -> bool {
         return false;
     }
 
-    true
+    serial != 0
 }
 
 /// Validates an Individual Taxpayer Identification Number (ITIN).
