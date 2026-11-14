@@ -5,6 +5,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use pii_core::{PiiCatalog, PiiScanner, PiiSessionVault, TokenFormat};
 use pii_store_redis::RedisVaultStore;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 /// Immutable state shared by all handlers.
 pub struct AppState {
@@ -15,6 +16,11 @@ pub struct AppState {
     pub store: Option<Arc<RedisVaultStore>>,
     /// Prometheus registry handle for `GET /metrics`.
     pub prometheus: PrometheusHandle,
+    /// Fired when the process is shutting down; long-lived SSE streams
+    /// observe this so graceful shutdown can complete promptly.
+    pub shutdown: watch::Receiver<bool>,
+    /// Sender half of the shutdown signal, wired to the signal handler.
+    pub shutdown_tx: watch::Sender<bool>,
 }
 
 impl AppState {
@@ -24,7 +30,7 @@ impl AppState {
 
         let store = match &cfg.redis_url {
             Some(url) => {
-                tracing::info!(%url, "initializing redis vault store");
+                tracing::info!(url = %redact_url(url), "initializing redis vault store");
                 Some(Arc::new(
                     RedisVaultStore::with_default_timeout(url, "pii:v1", 3600)
                         .map_err(|e| format!("failed to initialize redis store: {e:?}"))?,
@@ -33,12 +39,30 @@ impl AppState {
             None => None,
         };
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
         Ok(AppState {
             cfg: Arc::new(cfg),
             scanner,
             store,
             prometheus: crate::metrics::install(),
+            shutdown: shutdown_rx,
+            shutdown_tx,
         })
+    }
+}
+
+/// Removes credentials (anything between `scheme://` and the last `@`)
+/// before a connection URL may appear in logs.
+pub fn redact_url(url: &str) -> String {
+    match url.find("://") {
+        Some(scheme_end) => match url.rfind('@') {
+            Some(at) if at > scheme_end => {
+                format!("{}<redacted>@{}", &url[..scheme_end + 3], &url[at + 1..])
+            }
+            _ => url.to_string(),
+        },
+        None => url.to_string(),
     }
 }
 
@@ -64,4 +88,23 @@ pub fn build_vault(cfg: &Config) -> Result<PiiSessionVault, String> {
         vault.set_stateless_mode(true);
     }
     Ok(vault)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_url_hides_credentials() {
+        assert_eq!(
+            redact_url("redis://:s3cret@redis:6379"),
+            "redis://<redacted>@redis:6379"
+        );
+        assert_eq!(
+            redact_url("rediss://user:pass@host:6380/2"),
+            "rediss://<redacted>@host:6380/2"
+        );
+        assert_eq!(redact_url("redis://redis:6379"), "redis://redis:6379");
+        assert_eq!(redact_url("plain-value"), "plain-value");
+    }
 }

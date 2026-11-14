@@ -53,7 +53,8 @@ async fn run() -> Result<(), String> {
     tracing::info!(addr = %cfg.bind_addr, "pii-server listening");
 
     // Graceful shutdown on SIGTERM (Kubernetes) or SIGINT.
-    let shutdown = async {
+    let shutdown_tx = state.shutdown_tx.clone();
+    let shutdown = async move {
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("failed to install SIGTERM handler");
@@ -62,6 +63,8 @@ async fn run() -> Result<(), String> {
             _ = sigterm.recv() => tracing::info!("SIGTERM received; draining"),
             _ = sigint => tracing::info!("SIGINT received; draining"),
         }
+        // Signal long-lived SSE streams so graceful shutdown can complete.
+        let _ = shutdown_tx.send(true);
     };
 
     axum::serve(listener, app)

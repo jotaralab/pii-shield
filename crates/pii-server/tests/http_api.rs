@@ -196,6 +196,24 @@ async fn mcp_initialize_and_tool_call_round_trip() {
 }
 
 #[tokio::test]
+async fn mcp_rejects_invalid_session_id() {
+    let (status, body) = post_json(
+        "/mcp",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "redact_text",
+                       "arguments": {"text": "email ada@example.com",
+                                     "session_id": "bad: id\n"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["error"]["code"], -32001);
+}
+
+#[tokio::test]
 async fn mcp_unknown_method_returns_json_rpc_error() {
     let (status, body) = post_json("/mcp", json!({"jsonrpc": "2.0", "id": 9, "method": "bogus/method"})).await;
     assert_eq!(status, StatusCode::OK);

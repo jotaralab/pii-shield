@@ -22,10 +22,15 @@ use pii_core::PiiVaultStore;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::watch;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/mcp", post(handle_post).get(handle_get))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            state.cfg.max_body_bytes,
+        ))
         .with_state(state)
 }
 
@@ -93,6 +98,16 @@ async fn handle_post(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    let started = Instant::now();
+    let response = perform_request(state, headers, body).await;
+    let status = response.status().as_u16().to_string();
+    metrics::counter!("pii_requests_total", "endpoint" => "mcp", "status" => status).increment(1);
+    metrics::histogram!("pii_request_duration_seconds", "endpoint" => "mcp")
+        .record(started.elapsed().as_secs_f64());
+    response
+}
+
+async fn perform_request(state: Arc<AppState>, headers: HeaderMap, body: Value) -> Response {
     let Some(req) = parse_request(&body) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -156,6 +171,10 @@ async fn call_tool(
         .map(|s| s.to_string())
         .or_else(|| session_id.map(|s| s.to_string()));
 
+    if let Err(msg) = validate_session(state, session_id.as_deref()) {
+        return Err(msg);
+    }
+
     let mut vault =
         build_vault(&state.cfg).map_err(|e| format!("vault init failed: {e}"))?;
 
@@ -193,6 +212,25 @@ async fn call_tool(
     }))
 }
 
+/// Session IDs are used directly as store keys; reject anything dangerous.
+fn validate_session(state: &AppState, session_id: Option<&str>) -> Result<(), String> {
+    if let Some(id) = session_id {
+        if id.is_empty()
+            || id.len() > 128
+            || id.chars().any(|c| c == ':' || c.is_whitespace() || c.is_control())
+        {
+            return Err(
+                "session_id must be 1-128 chars without ':' or whitespace".to_string(),
+            );
+        }
+        if state.store.is_none() {
+            // Session affinity is meaningless without shared state; log only.
+            tracing::debug!("session_id provided without a shared store; ignoring");
+        }
+    }
+    Ok(())
+}
+
 async fn flush(
     state: &AppState,
     vault: &mut pii_core::PiiSessionVault,
@@ -204,26 +242,36 @@ async fn flush(
         return Ok(());
     }
     let sid = session_id.to_string();
-    store
-        .put_entries(&sid, sealed)
+    // Redis I/O must not block the Tokio runtime worker threads.
+    tokio::task::spawn_blocking(move || store.put_entries(&sid, sealed))
+        .await
+        .map_err(|e| format!("session flush task failed: {e}"))?
         .map_err(|e| format!("session flush failed: {e:?}"))?;
     Ok(())
 }
 
 /// `GET /mcp`: opens an SSE stream, sends the `endpoint` event pointing at
-/// `/mcp`, then stays open (keep-alives keep the connection alive until the
-/// client disconnects).
-async fn handle_get() -> Sse<impl Stream<Item = Result<Event, Infallible>> + Send> {
-    Sse::new(endpoint_event_stream()).keep_alive(KeepAlive::default())
+/// `/mcp`, then stays open until the client disconnects or the process
+/// begins shutting down (so graceful shutdown never stalls on open streams).
+async fn handle_get(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>> + Send> {
+    Sse::new(endpoint_event_stream(state.shutdown.clone()))
+        .keep_alive(KeepAlive::default())
 }
 
-fn endpoint_event_stream() -> impl Stream<Item = Result<Event, Infallible>> + Send {
+fn endpoint_event_stream(
+    shutdown: watch::Receiver<bool>,
+) -> impl Stream<Item = Result<Event, Infallible>> + Send {
     async_stream::stream! {
+        let mut shutdown = shutdown;
         yield Ok(Event::default().event("endpoint").data("/mcp"));
-        // Stream intentionally never completes: the transport keeps it open
-        // and axum tears it down when the client disconnects.
+        // Keep the transport open until the client disconnects or shutdown.
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                _ = shutdown.changed() => break,
+            }
         }
     }
 }

@@ -26,6 +26,10 @@ spec:
         app.kubernetes.io/name: pii-shield
         app.kubernetes.io/component: sidecar-example
     spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         # ---- The application (placeholder) ----
         - name: app
@@ -35,10 +39,18 @@ spec:
             - name: PII_SIDECAR_ENDPOINT
               value: "http://127.0.0.1:8080"
           securityContext:
+            runAsNonRoot: true
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
 
         # ---- pii-server bound to loopback only ----
         - name: pii-server
