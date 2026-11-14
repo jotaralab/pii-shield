@@ -1,0 +1,34 @@
+[package]
+name = "pii-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "HTTP/JSON + MCP Streamable HTTP server exposing pii-core redaction and rehydration for Kubernetes deployments."
+
+[dependencies]
+pii-core = { path = "../pii-core" }
+pii-store-redis = { path = "../pii-store-redis" }
+
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "limit"] }
+tower = { version = "0.5", features = ["util"] }
+futures-core = "0.3"
+async-stream = "0.3"
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+
+[dev-dependencies]
+libc = "0.2"

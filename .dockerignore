@@ -1,0 +1,14 @@
+# Build context exclusions — keep the image build fast and the context small.
+target/
+.git/
+.github/
+.plans/
+bindings/
+docs/
+scripts/
+tests/
+deploy/
+crates/pii-wasm/target/
+crates/pii-ffi/target/
+Dockerfile
+.dockerignore

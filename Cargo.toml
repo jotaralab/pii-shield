@@ -6,6 +6,7 @@ members = [
     "crates/pii-ffi",
     "crates/pii-mcp-proxy",
     "crates/pii-store-redis",
+    "crates/pii-server",
 ]
 
 [workspace.package]
